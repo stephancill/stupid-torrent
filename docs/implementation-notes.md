@@ -167,6 +167,11 @@ Track the offset locally (follow `currentOffset` only if the player jumps ahead)
 - **Completed torrents**: list row and detail "Status" section hide progress/stats when `status.isComplete`; only the name (list) and Files (detail) remain.
 - **Dev aid**: app sets `TorrentLog.verbose = true` (remove for release if noisy).
 
+## 2026-08-06 — Repo released + debugging skill
+
+- **Published** to GitHub as `stephancill/stupid-torrent` (public); added `README.md` + MIT `LICENSE`.
+- **Added `skills/stupid-torrent-debug/`** — a repo-local opencode skill capturing this session's debugging knowledge: simulator workflow (preferred UDID, install/launch/log/screenshot), checking app state (data container, `.verified` sidecar bit counts via `scripts/check_app_state.sh`), `torrent-cli` commands, hermetic seeding with aria2 (tracker-less torrents, seeding flags), live-swarm tips (BBB hash, flaky opentrackr, poison-peers), and the gotchas to not "fix" (BSD sockets, Data-slice traps, `#if os(iOS)` AVKit).
+
 ## Unreleased
 
 (New entries go here as work progresses.)
