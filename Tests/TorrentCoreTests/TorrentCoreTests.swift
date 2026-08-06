@@ -377,3 +377,41 @@ extension Data {
         #expect(closest.first?.id == near.id)
     }
 }
+
+@Suite struct MSETests {
+    @Test func rc4RoundTrips() {
+        let key = Data((1...32).map { UInt8($0) })
+        let plain = Data("The quick brown fox jumps over the lazy dog".utf8)
+        let cipher = RC4(key: key)
+        let encrypted = cipher.update(plain)
+        let decrypted = RC4(key: key).update(encrypted)
+        #expect(decrypted == plain)
+    }
+
+    @Test func rc4MatchesPythonReference() {
+        // First byte of RC4(key=1..32) after the 1024-byte keystream drop encrypting "A" (0x41).
+        let key = Data((1...32).map { UInt8($0) })
+        let out = RC4(key: key).update(Data("A".utf8))
+        #expect(out.first == 0x3e)
+    }
+
+    @Test func dhPublicKeyMatchesPython() {
+        // priv = 0x0123456789abcdef0123456789abcdef01234567
+        let privateBytes: [UInt8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67]
+        let priv = BigUInt(bytes: Data(privateBytes.reversed()))
+        let pub = DH.publicKey(for: priv)
+        let expected = "6fd4bc7aa649593205ec30348a3ccc737b61fa01e9e1762c2c53eb69033afecbdf7c13b8ac3643af78d0760b0f42db009f2b96c970f009d060faf617f117d0f1c221cea0561b9a86e852fc70a6f09ad0f82378603aa5e56b811deb3f534bf276"
+        #expect(pub.map { String(format: "%02x", $0) }.joined() == expected)
+    }
+
+    @Test func dhSharedSecretMatchesPython() {
+        let privateBytes: [UInt8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67]
+        let priv = BigUInt(bytes: Data(privateBytes.reversed()))
+        let peerPublic: [UInt8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44]
+        var peerBytes = Data(repeating: 0, count: 76)
+        peerBytes.append(contentsOf: peerPublic)
+        let shared = DH.sharedSecret(privateKey: priv, peerPublic: peerBytes)
+        let expected = "4d51a0f2a2454332ddc6b13a082f1aae8befbba7342d9286c93eb72bfefad8d52e9d3571227ac05325d52e3e4194d0ad8ff76ec40293c860479072880c57b369237a2a587c5bf19ea4fc64d14e4d57e7cdcb6487f7fc452d757019daee1c9682"
+        #expect(shared.map { String(format: "%02x", $0) }.joined() == expected)
+    }
+}

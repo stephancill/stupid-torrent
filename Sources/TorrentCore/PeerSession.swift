@@ -50,7 +50,21 @@ public final class PeerSession: @unchecked Sendable {
     }
 
     private func performHandshake() async throws {
-        let local = Handshake.make(extensionEnabled: false, infoHash: infoHash, peerID: peerID)
+        // MSE/PE (BEP 10): obfuscate the handshake + payload. Some peers answer in plaintext
+        // (they don't support MSE) — fall back and continue unencrypted.
+        let mse = MSEHandshake(stream: stream)
+        do {
+            if isInitiator {
+                try await mse.performAsInitiator(infoHash: infoHash)
+            } else {
+                try await mse.performAsResponder(infoHash: infoHash)
+            }
+            TorrentLog.log("\(address.host): MSE handshake ok (method \(mse.method == .rc4 ? "rc4" : "plaintext"))")
+        } catch MSEError.plaintextFallback {
+            TorrentLog.log("\(address.host): peer doesn't support MSE, using plaintext")
+        }
+
+        let local = Handshake.make(extensionEnabled: true, infoHash: infoHash, peerID: peerID)
         if isInitiator {
             try await stream.send(local.encode())
             let data = try await stream.read(exactly: Handshake.length)

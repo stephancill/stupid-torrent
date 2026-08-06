@@ -17,6 +17,10 @@ public final class PeerStream: @unchecked Sendable {
     private var pendingRead: (count: Int, continuation: CheckedContinuation<Data, Error>)?
     private var closed = false
     private var readerThread: Thread?
+    /// Encrypt/decrypt transforms installed after the MSE/PE handshake (BEP 10).
+    private var encryptTransform: ((Data) -> Data)?
+    private var decryptTransform: ((Data) -> Data)?
+    private var transformLock = NSLock()
 
     public init(host: String, port: UInt16) throws {
         self.socket = try TCPSocket()
@@ -28,6 +32,31 @@ public final class PeerStream: @unchecked Sendable {
         self.socket = TCPSocket(fd: fd)
         self.host = "accepted"
         self.port = 0
+    }
+
+    /// Installs encryption for the payload stream. After this, all bytes sent are encrypted and
+    /// all bytes received are decrypted before being buffered. Any bytes already buffered (sent by
+    /// the peer right after the MSE handshake) are decrypted in place.
+    public func enableEncryption(encrypt: @escaping (Data) -> Data, decrypt: @escaping (Data) -> Data) {
+        transformLock.lock()
+        decryptTransform = decrypt
+        encryptTransform = encrypt
+        // Re-process anything already buffered (it arrived before the transforms were installed).
+        lock.lock()
+        if !buffer.isEmpty {
+            buffer = decrypt(buffer)
+            if let pending = pendingRead, buffer.count >= pending.count {
+                pendingRead = nil
+                let chunk = Data(buffer.prefix(pending.count))
+                buffer.removeFirst(pending.count)
+                lock.unlock()
+                transformLock.unlock()
+                pending.continuation.resume(returning: chunk)
+                return
+            }
+        }
+        lock.unlock()
+        transformLock.unlock()
     }
 
     public func connect(timeout: TimeInterval = 10) async throws {
@@ -54,6 +83,7 @@ public final class PeerStream: @unchecked Sendable {
     }
 
     public func send(_ data: Data) async throws {
+        let payload = currentEncryptTransform?(data) ?? data
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             Task.detached(priority: .utility) { [weak self] in
                 guard let self else {
@@ -61,13 +91,27 @@ public final class PeerStream: @unchecked Sendable {
                     return
                 }
                 do {
-                    try self.socket.send(data)
+                    try self.socket.send(payload)
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)
                 }
             }
         }
+    }
+
+    /// Synchronous accessor for the encrypt transform (avoids NSLock calls in async contexts).
+    private var currentEncryptTransform: ((Data) -> Data)? {
+        transformLock.lock()
+        defer { transformLock.unlock() }
+        return encryptTransform
+    }
+
+    /// Synchronous accessor for the decrypt transform.
+    private var currentDecryptTransform: ((Data) -> Data)? {
+        transformLock.lock()
+        defer { transformLock.unlock() }
+        return decryptTransform
     }
 
     public func read(exactly count: Int) async throws -> Data {
@@ -103,6 +147,43 @@ public final class PeerStream: @unchecked Sendable {
         socket.close()
     }
 
+    /// Reads bytes one at a time until `pattern` appears at the tail, consuming it. The bytes
+    /// before the pattern are discarded (used for MSE/PE sync). Throws if more than `maxBytes`
+    /// are consumed without finding the pattern.
+    public func readUntil(pattern: Data, maxBytes: Int) async throws {
+        var accumulated = Data()
+        while accumulated.count < maxBytes + pattern.count {
+            let byte = try await read(exactly: 1)
+            accumulated.append(byte)
+            if accumulated.count >= pattern.count, accumulated.suffix(pattern.count) == pattern {
+                return
+            }
+        }
+        throw PeerStreamError.closed
+    }
+
+    /// Puts `data` back at the front of the read buffer (for MSE plaintext fallback detection).
+    public func unread(_ data: Data) {
+        lock.lock()
+        buffer = data + buffer
+        lock.unlock()
+    }
+
+    /// Injects already-decrypted bytes into the read buffer (used for the MSE IA payload).
+    public func injectDecrypted(_ data: Data) {
+        lock.lock()
+        buffer.append(data)
+        if let pending = pendingRead, buffer.count >= pending.count {
+            pendingRead = nil
+            let chunk = Data(buffer.prefix(pending.count))
+            buffer.removeFirst(pending.count)
+            lock.unlock()
+            pending.continuation.resume(returning: chunk)
+        } else {
+            lock.unlock()
+        }
+    }
+
     private func startReader() {
         let thread = Thread { [weak self] in
             self?.readerLoop()
@@ -133,8 +214,10 @@ public final class PeerStream: @unchecked Sendable {
     }
 
     private func appendData(_ data: Data) {
+        let transform = currentDecryptTransform
+        let decrypted = transform?(data) ?? data
         lock.lock()
-        buffer.append(data)
+        buffer.append(decrypted)
         if let pending = pendingRead, buffer.count >= pending.count {
             pendingRead = nil
             let chunk = Data(buffer.prefix(pending.count))

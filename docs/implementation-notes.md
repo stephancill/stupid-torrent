@@ -267,4 +267,24 @@ Verified: after the fix, the statuses received by the UI on reopen are `seeding 
 
 **Note**: this pulls DHT (BEP 5) out of the deferred list (planning.md line 10/134). MSE/PE encryption, µTP, WebRTC, and web seeds remain deferred — they are why some reachable peers still close our plaintext TCP connection.
 
+### 2026-08-06 — MSE/PE protocol encryption (BEP 10)
+
+**Why**: some reachable peers close our plaintext TCP connection the moment we send a handshake (`write(9)` EBADF / `read(54)` after connect) — they require protocol encryption. WebTorrent reaches them because it speaks MSE/PE; we couldn't. This was the last big transport gap for real-world swarm reachability.
+
+**Changes**:
+- New `Sources/TorrentCore/BigUInt.swift`: dependency-free 768-bit big integer with Montgomery multiplication for modular exponentiation (verified against Python's `pow` for public keys, shared secrets, and 2^(2^k) squarings).
+- New `Sources/TorrentCore/DH.swift`: Diffie-Hellman over the BEP 10 768-bit MODP prime, random 160-bit private keys, 96-byte big-endian public keys, shared-secret derivation.
+- New `Sources/TorrentCore/RC4.swift`: RC4 stream cipher (KSA + PRGA) with the 1024-byte keystream drop BEP 10 requires (verified against Python).
+- New `Sources/TorrentCore/MSEHandshake.swift`: full MSE/PE handshake state machine — initiator (outgoing) and responder (incoming): DH exchange, `req1`/`req2`/`req3` sync + XOR'd info-hash recovery, VC verification, crypto provide/select (plaintext 0x01 + RC4 0x02), padding, and install of the payload encrypt/decrypt ciphers. Plaintext fallback when a peer answers with a bare handshake.
+- `PeerStream.swift`: `enableEncryption(encrypt:decrypt:)` installs stream transforms (sends encrypted, received bytes decrypted before buffering, already-buffered bytes re-decrypted); `readUntil(pattern:maxBytes:)` for MSE sync, `unread(_:)` for plaintext-fallback detection.
+- `PeerSession.swift`: runs the MSE handshake before the BitTorrent handshake in `performHandshake` (both initiator and responder paths); enables the extension bit on our handshake now that extended messaging is supported.
+- Added `MSETests`: RC4 round-trip + Python-reference first-byte check, DH public key + shared secret against Python values. 42 tests green.
+
+**Verification (independent Python MSE reference implementation over loopback)**:
+- Swift initiator → Python responder: method=rc4, encrypted payload round-trip (`hello-payload` → `server-reply!`), select=2/RC4.
+- Python initiator → Swift responder: method=rc4, `hello-from-py` received, `swift-reply!!` returned.
+- Live swarm: `torrent-cli add <Odyssey magnet>` now completes MSE handshakes with peers (previously plaintext-only), and the download starts; data transfer remains limited by the swarm's near-total lack of usable seeders, not by the client.
+
+**Note**: this pulls MSE/PE (BEP 10) out of the deferred list (planning.md line 10/134). µTP (BEP 29), WebRTC, and web seeds remain deferred.
+
 (New entries go here as work progresses.)
