@@ -1,0 +1,14 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+
+/xtool
+
+# reference clones + hermetic seeder cache (see docs/planning.md)
+/third-party/
+/seeder-cache/
