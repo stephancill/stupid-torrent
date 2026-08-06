@@ -32,6 +32,7 @@ public actor Torrent {
     private var listenPort: UInt16 = 0
 
     private var announceTask: Task<Void, Never>?
+    private var dhtTask: Task<Void, Never>?
     private var tickerTask: Task<Void, Never>?
     private var isRunning = false
     private var firstAnnounce = true
@@ -98,6 +99,9 @@ public actor Torrent {
         announceTask = Task { [weak self] in
             await self?.announceLoop()
         }
+        dhtTask = Task { [weak self] in
+            await self?.dhtLoop()
+        }
         startListener()
         tickerTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -118,6 +122,7 @@ public actor Torrent {
 
         announceTask?.cancel()
         tickerTask?.cancel()
+        dhtTask?.cancel()
         disconnectAllPeers()
         try? await storage.saveVerified()
         let _ = await announceAll(event: picker.verified.allSet ? .completed : .none)
@@ -129,6 +134,7 @@ public actor Torrent {
     public func stop() async {
         announceTask?.cancel()
         tickerTask?.cancel()
+        dhtTask?.cancel()
         listener?.close()
         listenerThread?.cancel()
         disconnectAllPeers()
@@ -309,6 +315,27 @@ public actor Torrent {
             // fresh (dead peers drop quickly). Cap between 60 and 90s.
             let sleep = min(max(interval, 60), 90)
             try? await Task.sleep(for: .seconds(sleep))
+        }
+    }
+
+    /// Periodically queries the DHT for new peers; the tracker pool is mostly NAT'd peers, but
+    /// DHT returns live, reachable ones (mirrors webtorrent's discovery sources).
+    private func dhtLoop() async {
+        while !Task.isCancelled {
+            do {
+                let dht = try DHTClient()
+                let start = ContinuousClock.now
+                if let dhtPeers = try? await dht.lookup(infoHash: metainfo.infoHash, timeout: 10) {
+                    TorrentLog.log("DHT: found \(dhtPeers.count) peers in \(ContinuousClock.now - start)")
+                    for peer in dhtPeers {
+                        considerPeer(peer)
+                    }
+                }
+                dht.stop()
+            } catch {
+                // DHT is best-effort; skip and retry later.
+            }
+            try? await Task.sleep(for: .seconds(120))
         }
     }
 

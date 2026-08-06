@@ -70,10 +70,13 @@ struct TorrentCLI {
         }
         do {
             let metainfo: Metainfo
+            var metadataPeer: PeerAddress? = nil
             if path.lowercased().hasPrefix("magnet:") {
                 let magnet = try MagnetLinkParser.parse(path)
                 print("Fetching metadata for \(magnet.displayName ?? magnet.infoHash.hexString)...")
-                metainfo = try await MagnetBootstrapper.metainfo(from: magnet, injectedPeer: injectedPeer)
+                let result = try await MagnetBootstrapper.metainfoAndPeer(from: magnet, injectedPeer: injectedPeer)
+                metainfo = result.metainfo
+                metadataPeer = result.metadataPeer
             } else {
                 let data = try Data(contentsOf: URL(fileURLWithPath: path))
                 metainfo = try Metainfo(data: data)
@@ -83,10 +86,23 @@ struct TorrentCLI {
             print("  size:  \(metainfo.totalLength) bytes, \(metainfo.pieceCount) pieces")
             if let stopAt { print("  stopping after \(stopAt) bytes") }
 
+            // Persist the resolved magnet as a .torrent so later runs skip bootstrapping.
+            if path.lowercased().hasPrefix("magnet:") {
+                let torrentDir = URL(fileURLWithPath: dir)
+                try FileManager.default.createDirectory(at: torrentDir, withIntermediateDirectories: true)
+                let torrentURL = torrentDir.appendingPathComponent(metainfo.name).appendingPathExtension("torrent")
+                try metainfo.torrentData().write(to: torrentURL)
+                print("  saved:  \(torrentURL.lastPathComponent)")
+            }
+
             let dirURL = URL(fileURLWithPath: dir)
             let torrent = Torrent(directory: dirURL, metainfo: metainfo, stopAfterBytes: stopAt)
             if let injectedPeer {
                 await torrent.addPeer(host: injectedPeer.host, port: injectedPeer.port)
+            }
+            if let metadataPeer {
+                print("  seeding from known-good peer \(metadataPeer.host):\(metadataPeer.port)")
+                await torrent.addPeer(host: metadataPeer.host, port: metadataPeer.port)
             }
             let printer = Task {
                 for await status in await torrent.statusBroadcast.subscribe() {

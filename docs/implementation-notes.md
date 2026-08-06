@@ -245,4 +245,26 @@ Verified: after the fix, the statuses received by the UI on reopen are `seeding 
 - Added a native loading spinner to AVPlayer's content overlay until initial playback starts or loading fails.
 - Rebuilt and exercised each UI revision in the `NoFeedSocial iOS 26.3` simulator.
 
+### 2026-08-06 — DHT (BEP 5) peer discovery + magnet bootstrap robustness
+
+**Why**: `torrent-cli add <magnet>` was timing out on the Odyssey UIndex TELESYNC release while WebTorrent resolved it instantly. Diagnosis (verified with independent Python probes): the trackers are fine and the swarm is huge (~8k seeders reported), but the tracker-returned peer pool is ~99% NAT'd/unreachable, and of the few reachable peers, most are leechers advertising `ut_metadata` with no data, or they close our plaintext connection (`write(9)` EBADF = accept-then-close). WebTorrent works because it discovers peers over **DHT (BEP 5)** — live peers *announced for that infohash* — plus WebRTC/µTP/MSE, all of which were deferred in planning.md.
+
+**Changes**:
+- New `Sources/TorrentCore/KRPC.swift`: BEP 5 KRPC wire codec (ping/find_node/get_peers/announce_peer query + response/error), compact node + compact peer encode/parse, over the existing `Bencode` module.
+- New `Sources/TorrentCore/RoutingTable.swift`: k-bucket table keyed by XOR common-prefix length; `closest(to:count:)` via lexicographic XOR compare; full-bucket evicts least-recently-seen.
+- New `Sources/TorrentCore/DHTClient.swift`: UDP socket, transaction-matched pending queries with timeouts, parallel bootstrap from router nodes, iterative `get_peers` closest-node lookup returning `[PeerAddress]`, and a **persisted node cache** (`~/Library/Caches/stupid-torrent-dht.nodes`, mirrors bittorrent-dht's disk persistence) so repeat lookups start from a warm table.
+- `MetadataExchange.swift` (`MagnetBootstrapper`): discovery now runs DHT lookup and tracker announces **concurrently**; DHT peers are swept for metadata *first* (they're live/announced), then tracker rounds. Candidate sweep keeps DHT order (no Set shuffle), reduced concurrency 30→12 (peers close under connection hammering), and retries a `closed`/`write(9)` peer once (fresh connection to a live peer usually works).
+- `MetadataFetcher.fetch` timeouts reduced 15s→8s metadata / 5s→4s connect so dead peers cycle fast.
+- `PeerStream.connect(timeout:)`: configurable connect timeout (default 10s preserved).
+- `Torrent.swift`: new `dhtLoop()` task that periodically queries DHT for fresh peers (runs alongside `announceLoop`), feeding them into `considerPeer`.
+- `torrent-cli add`: uses `MagnetBootstrapper.metainfoAndPeer` — returns the metadata-serving peer and injects it straight into the download — and **saves the resolved magnet as a `.torrent`** in the download dir so later runs skip bootstrapping.
+- Added `DHTTests` (KRPC round-trips, compact node, routing table XOR closeness). 38 tests green.
+
+**Verification**:
+- Isolated `MetadataFetcher` harness fetches Odyssey metadata from a live DHT peer in ~1s.
+- Standalone DHT harness: warm-cache lookup returns 100–488 peers for the Odyssey infohash; cold bootstrap populates 100+ nodes via `dht.transmissionbt.com` (router.bittorrent.com/utorrent.com are filtered from this network — added fallback nodes).
+- End-to-end `torrent-cli add <Odyssey magnet>`: with the warm cache + DHT-first sweep + retry, metadata resolves in ~90s (was: never), the `.torrent` is saved, and the download starts (peers unchoke; data transfer is limited by the swarm's near-total lack of usable seeders, not by the client).
+
+**Note**: this pulls DHT (BEP 5) out of the deferred list (planning.md line 10/134). MSE/PE encryption, µTP, WebRTC, and web seeds remain deferred — they are why some reachable peers still close our plaintext TCP connection.
+
 (New entries go here as work progresses.)

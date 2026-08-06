@@ -250,6 +250,23 @@ extension Data {
         #expect(hosts.contains("explodie.org"))
     }
 
+    @Test func persistedMagnetMetadataRoundTrips() throws {
+        let fixture = try Fixtures.bigBuckBunnyTorrentData
+        let source = try Metainfo(data: fixture)
+        let metadata = try Metainfo(
+            infoDict: source.infoDict,
+            trackers: source.trackerTiers,
+            displayName: "Big Buck Bunny Magnet"
+        )
+        let restored = try Metainfo(data: metadata.torrentData())
+
+        #expect(restored.infoHash == source.infoHash)
+        #expect(restored.name == source.name)
+        #expect(restored.displayName == "Big Buck Bunny Magnet")
+        #expect(restored.pieceCount == source.pieceCount)
+        #expect(restored.trackerTiers == source.trackerTiers)
+    }
+
     @Test func mapsPiecesToFilesAcrossBoundaries() throws {
         let info = try Metainfo(data: try Fixtures.bigBuckBunnyTorrentData)
         // srt occupies bytes 0..140, which is inside piece 0; mp4 starts at 140.
@@ -287,5 +304,76 @@ extension Data {
     @Test func rejectsInvalidMagnets() {
         #expect(throws: MagnetError.self) { try MagnetLinkParser.parse("http://example.com") }
         #expect(throws: MagnetError.self) { try MagnetLinkParser.parse("magnet:?dn=noinfohash") }
+    }
+}
+
+@Suite struct DHTTests {
+    @Test func pingRoundTrips() throws {
+        let id = Data(repeating: 0x42, count: 20)
+        let txn = Data([0xAB, 0xCD])
+        let packet = KRPCWire.encode(query: .ping(id: id), transaction: txn)
+        let message = try KRPCWire.decode(packet)
+        guard case .query(let transaction, let name, let args) = message else {
+            Issue.record("expected query")
+            return
+        }
+        #expect(transaction == txn)
+        #expect(name == "ping")
+        #expect(args["id"]?.stringValue == id)
+    }
+
+    @Test func getPeersRoundTrips() throws {
+        let id = Data(repeating: 0x11, count: 20)
+        let infoHash = Data(repeating: 0x22, count: 20)
+        let txn = Data([0x01, 0x02])
+        let packet = KRPCWire.encode(query: .getPeers(id: id, infoHash: infoHash), transaction: txn)
+        let message = try KRPCWire.decode(packet)
+        guard case .query(_, let name, let args) = message else {
+            Issue.record("expected query")
+            return
+        }
+        #expect(name == "get_peers")
+        #expect(args["info_hash"]?.stringValue == infoHash)
+    }
+
+    @Test func responseRoundTrips() throws {
+        let txn = Data([0x07, 0x08])
+        let nodeID = Data(repeating: 0x33, count: 20)
+        let peer = Data([192, 168, 1, 10, 0x1A, 0xE1])
+        let packet = KRPCWire.encodeResponse(transaction: txn, reply: [
+            "id": .string(nodeID),
+            "token": .string(Data([0x01, 0x02, 0x03])),
+            "values": .list([.string(peer)]),
+        ])
+        let message = try KRPCWire.decode(packet)
+        guard case .response(let transaction, let reply) = message else {
+            Issue.record("expected response")
+            return
+        }
+        #expect(transaction == txn)
+        #expect(reply["id"]?.stringValue == nodeID)
+        guard case .list(let values)? = reply["values"], let first = values.first?.stringValue else {
+            Issue.record("missing values")
+            return
+        }
+        #expect(CompactPeer.parse(first) == [PeerAddress(host: "192.168.1.10", port: 6881)])
+    }
+
+    @Test func compactNodeRoundTrip() {
+        let node = KRPCNodeInfo(id: Data(repeating: 0x55, count: 20), host: "10.0.0.1", port: 51413)
+        let parsed = CompactNode.parse(CompactNode.encode([node]))
+        #expect(parsed == [node])
+    }
+
+    @Test func routingTableClosestByXorDistance() {
+        let localID = Data(repeating: 0x00, count: 20)
+        let table = RoutingTable(localID: localID, k: 2)
+        let far = KRPCNodeInfo(id: Data([0x80] + Array(repeating: 0x00, count: 19)), host: "a", port: 1)
+        let near = KRPCNodeInfo(id: Data([0x01] + Array(repeating: 0x00, count: 19)), host: "b", port: 2)
+        table.add(far)
+        table.add(near)
+        let target = Data([0x02] + Array(repeating: 0x00, count: 19))
+        let closest = table.closest(to: target, count: 1)
+        #expect(closest.first?.id == near.id)
     }
 }

@@ -7,7 +7,7 @@ An xtool iOS app (SwiftPM + SwiftUI) where you paste a **magnet link** or import
 ## Decisions (locked in)
 
 1. **Engine: from scratch, pure Swift.** No libtorrent/C++, no vendored frameworks, no binary targets. Zero build/link risk under xtool's cross SDK, and the streaming model (priority-window piece picking) is native to our own picker. Closely modeled on two MIT references.
-2. **Scope v1: full** — magnet links + `.torrent` files, sequential/priority-window download, seeding, per-file selection and priorities, AVPlayer streaming. **No DHT (BEP 5)**, no µTP (BEP 29), no protocol encryption (MSE/PE), no web seeds (BEP 19) — all explicitly deferred.
+2. **Scope v1: full** — magnet links + `.torrent` files, sequential/priority-window download, seeding, per-file selection and priorities, AVPlayer streaming, DHT (BEP 5) peer discovery. **No µTP (BEP 29)**, no protocol encryption (MSE/PE), no web seeds (BEP 19) — deferred.
 3. **Streaming: AVPlayer + `AVAssetResourceLoaderDelegate`** over a custom `stream://` scheme, fed from our own `Storage` once pieces are verified. `UIBackgroundModes: audio` for background audio streaming.
 4. **Validation-first: macOS `torrent-cli`** headless harness gates every engine phase against the live Big Buck Bunny torrent before any iOS UI work.
 5. **Concurrency: Swift 6 strict concurrency** with actors; networking over Network.framework `NWConnection`, bridged to `async`/`AsyncStream`. Engine status is fanned out through a `StatusBroadcast` (multi-subscriber, current-value); SwiftUI observes a main-actor `@Observable` `TorrentStore` snapshot.
@@ -131,4 +131,4 @@ Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
 
 ## Out of scope (v1)
 
-DHT (BEP 5), µTP (BEP 29), MSE/PE encryption, web seeds (BEP 19), background downloads, IPv6 peer support (decode-ignore). Note: encryption-less + TCP-only means some peers won't connect; acceptable.
+µTP (BEP 29), MSE/PE encryption, web seeds (BEP 19), background downloads, IPv6 peer support (decode-ignore). Note: encryption-less + TCP-only means some peers won't connect; acceptable.

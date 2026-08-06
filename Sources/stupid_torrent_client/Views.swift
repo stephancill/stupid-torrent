@@ -15,8 +15,11 @@ struct ContentView: View {
     var body: some View {
         NavigationStack {
             List {
-                if !downloadingItems.isEmpty {
+                if !store.resolvingItems.isEmpty || !downloadingItems.isEmpty {
                     Section {
+                        ForEach(store.resolvingItems) { item in
+                            ResolvingTorrentRow(item: item)
+                        }
                         ForEach(downloadingItems) { item in
                             row(item)
                         }
@@ -68,18 +71,15 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showAdd) {
                 AddTorrentView { source in
-                    Task {
-                        switch source {
-                        case .magnet(let string):
-                            await store.addMagnet(string)
-                        case .file(let url):
-                            await store.addFile(url)
-                        }
-                        showAdd = false
+                    switch source {
+                    case .magnet(let string):
+                        try store.addMagnet(string)
+                    case .file(let url):
+                        try store.addFile(url)
                     }
                 }
             }
-            .alert("Error", isPresented: Binding(
+            .alert("Could Not Add Torrent", isPresented: Binding(
                 get: { store.addError != nil },
                 set: { if !$0 { store.addError = nil } }
             )) {
@@ -105,44 +105,51 @@ struct ContentView: View {
     }
 }
 
+struct ResolvingTorrentRow: View {
+    let item: ResolvingTorrentItem
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 16, height: 16)
+            Text(item.name)
+                .font(.headline)
+                .lineLimit(1)
+            Spacer()
+            Text(relativeTime(item.addedAt))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
 struct TorrentRow: View {
     let item: TorrentItem
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                if let status = item.status, status.isComplete {
+        HStack(spacing: 8) {
+            if let status = item.status {
+                if status.isComplete {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.secondary)
-                }
-                Text(item.name)
-                    .font(.headline)
-                    .lineLimit(1)
-                Spacer()
-                Text(relativeTime(item.addedAt))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if let status = item.status {
-                if !status.isComplete {
-                    HStack(spacing: 8) {
-                        PieProgressView(progress: status.progress)
-                            .frame(width: 16, height: 16)
-                        Text("\(Int(status.progress * 100))%")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Text("↓ \(byteString(status.downloadRate)) · ↑ \(byteString(status.uploadRate))")
-                        Text("\(status.peers) peers")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                } else {
+                    PieProgressView(progress: status.progress)
+                        .frame(width: 20, height: 20)
                 }
             } else {
-                Text("starting…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 16, height: 16)
             }
+            Text(item.name)
+                .font(.headline)
+                .lineLimit(1)
+            Spacer()
+            Text(relativeTime(item.addedAt))
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
     }
@@ -155,22 +162,25 @@ enum AddSource {
 
 struct AddTorrentView: View {
     @Environment(\.dismiss) private var dismiss
-    let onAdd: (AddSource) -> Void
+    let onAdd: (AddSource) throws -> Void
 
     @State private var magnet = ""
     @State private var showingImporter = false
+    @State private var addError: String?
 
     var body: some View {
         NavigationStack {
             Form {
                 Section("Magnet link") {
-                    TextField("magnet:?xt=urn:btih:…", text: $magnet, axis: .vertical)
+                    TextField("magnet:?xt=urn:btih:…", text: $magnet)
+                        .lineLimit(1)
                         .autocorrectionDisabled()
-                    Button("Add") {
-                        onAdd(.magnet(magnet))
-                        dismiss()
+                    Button {
+                        add(.magnet(magnet))
+                    } label: {
+                        Text("Add")
                     }
-                    .disabled(magnet.isEmpty)
+                    .disabled(magnet.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
                 Section("Torrent file") {
                     Button("Choose .torrent…") {
@@ -181,9 +191,26 @@ struct AddTorrentView: View {
             .navigationTitle("Add torrent")
             .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.data]) { result in
                 if case .success(let url) = result {
-                    onAdd(.file(url))
+                    add(.file(url))
                 }
             }
+            .alert("Could Not Add Torrent", isPresented: Binding(
+                get: { addError != nil },
+                set: { if !$0 { addError = nil } }
+            )) {
+                Button("OK", role: .cancel) { addError = nil }
+            } message: {
+                Text(addError ?? "")
+            }
+        }
+    }
+
+    private func add(_ source: AddSource) {
+        do {
+            try onAdd(source)
+            dismiss()
+        } catch {
+            addError = error.localizedDescription
         }
     }
 }

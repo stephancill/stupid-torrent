@@ -30,7 +30,7 @@ public final class PeerStream: @unchecked Sendable {
         self.port = 0
     }
 
-    public func connect() async throws {
+    public func connect(timeout: TimeInterval = 10) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             Task.detached(priority: .utility) { [weak self] in
                 guard let self else {
@@ -38,7 +38,7 @@ public final class PeerStream: @unchecked Sendable {
                     return
                 }
                 do {
-                    try self.socket.connect(host: self.host, port: self.port, timeout: 10)
+                    try self.socket.connect(host: self.host, port: self.port, timeout: timeout)
                     continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)

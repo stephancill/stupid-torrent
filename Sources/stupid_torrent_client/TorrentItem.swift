@@ -21,7 +21,7 @@ final class TorrentItem: Identifiable, Hashable {
         self.addedAt = addedAt
         if metainfo.pieceCount > 0 {
             status = TorrentStatus(
-                name: metainfo.name,
+                name: metainfo.displayName,
                 infoHash: metainfo.infoHash,
                 state: initialVerifiedCount == metainfo.pieceCount ? .seeding : .downloading,
                 verifiedCount: initialVerifiedCount,
@@ -36,7 +36,7 @@ final class TorrentItem: Identifiable, Hashable {
         }
     }
 
-    nonisolated var name: String { metainfo.name }
+    nonisolated var name: String { metainfo.displayName }
 
     var isComplete: Bool { status?.isComplete ?? false }
 

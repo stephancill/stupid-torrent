@@ -20,6 +20,7 @@ public struct Metainfo: Sendable, Equatable {
     public let infoHash: Data
     public let infoDict: Data
     public let name: String
+    public let displayName: String
     public let pieceLength: Int
     public let pieceHashes: [Data]
     public let files: [TorrentFile]
@@ -47,13 +48,16 @@ public struct Metainfo: Sendable, Equatable {
     }
 
     /// Re-encodes this metainfo as a `.torrent` file (info dict + trackers), for persistence.
-    public func torrentData() -> Data {
-        var dict: [String: BValue] = ["info": .string(infoDict)]
+    public func torrentData() throws -> Data {
+        var dict: [String: BValue] = ["info": try Bencode.decode(infoDict)]
         if !trackerTiers.isEmpty {
             let tiers = trackerTiers.map { tier in
                 BValue.list(tier.map { .string(Data($0.absoluteString.utf8)) })
             }
             dict["announce-list"] = .list(tiers)
+        }
+        if displayName != name {
+            dict["stupid-torrent-display-name"] = .string(Data(displayName.utf8))
         }
         return Bencode.encode(.dictionary(dict))
     }
@@ -98,20 +102,21 @@ extension Metainfo {
         try self.init(
             info: info,
             infoRaw: Bencode.rawValue(forKey: "info", in: data),
-            trackers: Self.parseTrackerTiers(from: dict)
+            trackers: Self.parseTrackerTiers(from: dict),
+            displayName: dict["stupid-torrent-display-name"]?.stringValueUTF8
         )
     }
 
     /// Builds metainfo from a raw bencoded info dict (e.g. fetched via ut_metadata from a magnet link).
-    public init(infoDict: Data, trackers: [[URL]] = []) throws {
+    public init(infoDict: Data, trackers: [[URL]] = [], displayName: String? = nil) throws {
         let root = try Bencode.decode(infoDict)
         guard case .dictionary(let info) = root else {
             throw MetainfoError.notATorrent
         }
-        try self.init(info: info, infoRaw: infoDict, trackers: trackers)
+        try self.init(info: info, infoRaw: infoDict, trackers: trackers, displayName: displayName)
     }
 
-    private init(info: [String: BValue], infoRaw: Data, trackers: [[URL]]) throws {
+    private init(info: [String: BValue], infoRaw: Data, trackers: [[URL]], displayName: String?) throws {
         self.infoHash = Data(Insecure.SHA1.hash(data: infoRaw))
         self.infoDict = infoRaw
 
@@ -135,6 +140,7 @@ extension Metainfo {
             name = try stringValue("name")
         }
         self.name = name
+        self.displayName = displayName ?? name
         self.pieceLength = try intValue("piece length")
         guard pieceLength > 0 else { throw MetainfoError.invalidValue("piece length") }
 
