@@ -14,17 +14,24 @@ public extension Torrent {
     }
 
     /// Prioritize the pieces covering a byte range of a file so the streamer's window and
-    /// moov tail download ahead of the sequential cursor. A range well ahead of the sequential
-    /// frontier (moov tail, seek target) is a high-priority jump; the current window is a
-    /// low-priority lookahead served before the in-order cursor but after any jumps.
+    /// moov tail download ahead of the sequential cursor. A range ahead of the sequential
+    /// progress (seek target, moov tail) is a high-priority jump that also moves the sequential
+    /// frontier there; the current window (which tracks the playhead and stays at or behind the
+    /// progress) is a low-priority lookahead served after any jumps.
     func streamPriority(fileIndex: Int, range: Range<Int>) async {
         guard metainfo.files.indices.contains(fileIndex) else { return }
         let fileStart = metainfo.fileOffsets[fileIndex]
         let absolute = (fileStart + range.lowerBound)..<(fileStart + range.upperBound)
         let pieces = metainfo.pieceRange(forByteRange: absolute)
         guard !pieces.isEmpty else { return }
-        let jumpAhead = 4
-        let isJump = pieces.lowerBound > picker.cursor + jumpAhead
+        var progress = 0
+        while progress < picker.pieceCount && picker.verified[progress] { progress += 1 }
+        let isJump = pieces.lowerBound > progress
+        if isJump {
+            // Jumps (seek targets, moov tail) download first and move the sequential frontier
+            // so the in-order stream resumes from the target once the jump window drains.
+            picker.cursor = pieces.lowerBound
+        }
         for piece in pieces {
             picker.setPriority(piece, level: isJump ? 10 : 0)
         }

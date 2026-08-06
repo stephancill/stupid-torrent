@@ -183,6 +183,23 @@ extension Data {
         picker.markRequested(0)
         #expect(picker.nextPiece() == 3)
     }
+
+    @Test func setPriorityKeepsHighestLevel() {
+        var picker = PiecePicker(pieceCount: 5, verified: [false, false, false, false, false])
+        picker.setPriority(2, level: 0)
+        picker.setPriority(2, level: 10) // seek/jump re-prioritizes
+        #expect(picker.priority[2] == 10)
+        picker.setPriority(2, level: 0) // window request must not downgrade
+        #expect(picker.priority[2] == 10)
+        #expect(picker.nextPiece() == 2)
+    }
+
+    @Test func setPrioritySkipsVerifiedPieces() {
+        var picker = PiecePicker(pieceCount: 5, verified: [false, true, false, false, false])
+        picker.setPriority(1, level: 10)
+        #expect(picker.priority[1] == nil)
+        #expect(picker.nextPiece() == 0)
+    }
 }
 
 @Suite struct MetainfoTests {

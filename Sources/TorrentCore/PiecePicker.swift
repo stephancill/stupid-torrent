@@ -46,7 +46,8 @@ public struct PiecePicker: Sendable {
     }
 
     public mutating func setPriority(_ piece: Int, level: Int) {
-        priority[piece] = level
+        guard !verified[piece] else { return }
+        priority[piece] = max(priority[piece] ?? 0, level)
     }
 
     public mutating func markRequested(_ piece: Int) {

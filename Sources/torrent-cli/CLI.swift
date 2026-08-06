@@ -232,13 +232,14 @@ struct TorrentCLI {
 
     static func streamPlay(_ args: [String]) async {
         guard let path = args.first else {
-            print("usage: torrent-cli stream-play <file.torrent> [--dir <dir>] [--file <index>] [--seed-until <bytes>] [--peer host:port] [--seconds <n>]")
+            print("usage: torrent-cli stream-play <file.torrent> [--dir <dir>] [--file <index>] [--seed-until <bytes>] [--peer host:port] [--seconds <n>] [--seek-to <seconds>]")
             return
         }
         var dir = FileManager.default.currentDirectoryPath + "/downloads"
         var fileIndex: Int?
         var seedUntil: Int64 = 3 * 1024 * 1024
         var seconds = 30
+        var seekTo: Double?
         var injectedPeer: PeerAddress?
         var index = 1
         while index < args.count {
@@ -251,6 +252,8 @@ struct TorrentCLI {
                 if index + 1 < args.count { seedUntil = Int64(args[index + 1]) ?? seedUntil; index += 2 } else { index += 1 }
             case "--seconds":
                 if index + 1 < args.count { seconds = Int(args[index + 1]) ?? seconds; index += 2 } else { index += 1 }
+            case "--seek-to":
+                if index + 1 < args.count { seekTo = Double(args[index + 1]); index += 2 } else { index += 1 }
             case "--peer":
                 if index + 1 < args.count {
                     let parts = args[index + 1].split(separator: ":")
@@ -259,6 +262,9 @@ struct TorrentCLI {
                     }
                     index += 2
                 } else { index += 1 }
+            case "--verbose":
+                TorrentLog.verbose = true
+                index += 1
             default:
                 index += 1
             }
@@ -289,20 +295,33 @@ struct TorrentCLI {
             player.play()
 
             var maxTime: Double = 0
+            var didSeek = false
+            var postSeekMax: Double = 0
             for tick in 1...seconds {
                 try? await Task.sleep(for: .seconds(1))
                 let time = CMTimeGetSeconds(player.currentTime())
                 maxTime = max(maxTime, time)
+                if didSeek { postSeekMax = max(postSeekMax, time) }
                 let verified = await stream.verifiedCount
                 print("t=\(tick)s playhead=\(String(format: "%.1f", time))s verified=\(verified)/\(metainfo.pieceCount)")
-                if time > 0 && time >= maxTime && tick > 5 && verified >= metainfo.pieceCount {
+                if !didSeek, let seekTo, tick == 6 {
+                    print("SEEKING to \(seekTo)s...")
+                    await player.seek(to: CMTime(seconds: seekTo, preferredTimescale: 600))
+                    didSeek = true
+                }
+                if time > 0 && time >= maxTime && tick > 5 && verified >= metainfo.pieceCount && seekTo == nil {
                     break
                 }
             }
             let item = player.currentItem
             let duration = item?.duration.isNumeric == true ? CMTimeGetSeconds(item!.duration) : -1
             print("MAX PLAYHEAD: \(String(format: "%.1f", maxTime))s  (duration \(String(format: "%.1f", duration))s)")
-            print(maxTime > 5 ? "STREAM-PLAY OK: played past 5s" : "STREAM-PLAY FAIL: stalled early")
+            if let seekTo {
+                print("POST-SEEK PLAYHEAD: \(String(format: "%.1f", postSeekMax))s (target \(seekTo)s)")
+                print(postSeekMax > seekTo + 2 ? "SEEK OK: playback continued after seek" : "SEEK FAIL: stalled after seek")
+            } else {
+                print(maxTime > 5 ? "STREAM-PLAY OK: played past 5s" : "STREAM-PLAY FAIL: stalled early")
+            }
             player.pause()
             streamTask.cancel()
             await stream.stop()

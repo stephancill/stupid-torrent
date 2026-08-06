@@ -187,4 +187,22 @@ Added Sintel (`08ada5a7...`) as a second torrent in the sim. Its `Sintel.mp4` is
 
 **Verification**: hermetic repro with a generated non-faststart mp4 (ffmpeg, moov after mdat) + aria2 seeder throttled to 30 KB/s. Before: `asset load ... timed out` with the moov piece never prioritized. After: `piece 12 verified (2/13)` — the moov piece downloads second — then `duration=30.0s playable=true` at ~15% download. Faststart regression still playable at 1/13. Added 4 `PiecePickerTests` (levels jump, window order, verify-removes-priority, level fallthrough). 29 tests green.
 
+### 2026-08-06 — Seeking support (streaming jumps + sequential frontier follows playhead)
+
+AVPlayer seeking in the app stalled at the target once the buffered jump window drained: the seek target was not treated as a jump, and the in-order download never followed the playhead.
+
+**Root causes found via `stream-play --seek-to` + loader/picker tracing:**
+1. The picker cursor starts at 0 even when the resume bitfield already has pieces 0..n verified, so the initial streaming window was misclassified as a jump (`2 > 0`), pinned at priority 10 forever (max-level), and drained before the real seek target.
+2. The old jump threshold (`> cursor + 4`) missed a seek only a few pieces ahead of the frontier.
+
+**Fix:**
+- `setPriority` now keeps the *max* level (a window request can't downgrade a jump) and skips verified pieces.
+- `streamPriority` classifies a range as a **jump** (level 10 + moves the sequential cursor to the target) when its start piece is ahead of the *sequential progress* (first unverified piece from 0), not the allocation cursor. The streaming window tracks the playhead and stays at/below progress, so it is correctly a low-priority lookahead; a seek or the moov tail is ahead of progress and jumps.
+
+**Verification (hermetic, aria2 seeder):**
+- 30 s faststart file, `--seed-until 524288`, seek to 25 s: before, `SEEK FAIL` (playhead stuck at 26.9 s); after, `SEEK OK` — playhead resumes and reaches 30.0 s, `13/13` verified.
+- 120 s faststart file (51 pieces), seek to 60 s mid-file: playhead jumps to 60 s and advances 1 s/s to 94.9 s with no stall, verified climbing 10 → 50 as the in-order stream resumes from the seek position.
+- Moov-at-end regression still passes (`stream-test` playable at 1/13 pieces).
+- Added 2 `PiecePickerTests` (max-level retention, verified-skip). 31 tests green.
+
 (New entries go here as work progresses.)
