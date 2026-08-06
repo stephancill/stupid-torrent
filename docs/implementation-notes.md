@@ -205,4 +205,44 @@ AVPlayer seeking in the app stalled at the target once the buffered jump window 
 - Moov-at-end regression still passes (`stream-test` playable at 1/13 pieces).
 - Added 2 `PiecePickerTests` (max-level retention, verified-skip). 31 tests green.
 
+### 2026-08-06 — Show complete/restored state immediately (skip "starting…")
+
+Completed torrents flashed "starting…" on launch because `item.status` stayed `nil` until `Torrent.run()` loaded the resume sidecar and published the first status. For a torrent that is already complete (or partially downloaded), the verified state is known before the engine starts — it's in the `.verified` sidecar.
+
+**Changes:**
+- `Storage.loadVerifiedCount(directory:infoHash:pieceCount:)` — public static, reads the resume sidecar synchronously and returns the verified piece count.
+- `TorrentStatus` gained a public `init` (was internal; the app builds initial snapshots).
+- `TorrentStore.add` reads the sidecar count and passes it to `TorrentItem`; `TorrentItem` seeds its initial `status` from it — `.seeding` when complete, else `.downloading` at the resumed progress — so the row never shows "starting…" for a torrent with existing data.
+- `TorrentRow` marks complete torrents with a `checkmark.circle.fill` + "Complete" caption (previously a complete row showed only the name).
+
+**Verification**: 32 tests green (added `StorageTests.loadVerifiedCountReadsSidecar`). Simulator: both BBB (1055/1055) and Sintel (987/987) restore and display as complete immediately.
+
+### 2026-08-06 — Persist completed state the moment it's reached
+
+A torrent that finished downloading could briefly linger in the Downloading section / reappear as downloading after a relaunch: the resume sidecar was only saved on the 1s ticker or at the very end of `run()` — *after* the two slow tracker announces (`completed` + `stopped`). Killing the app in that window lost the completed state.
+
+**Fix** (`Torrent.swift`):
+- `completePiece` now saves the verified sidecar immediately when the last piece makes the torrent `allSet` (persisting completion the instant it's reached), instead of waiting for the end-of-`run()` save.
+- `run()` reordered to `saveVerified()` right after the download loop breaks, before `disconnectAllPeers()` and the tracker announces.
+
+Verified end-to-end in the simulator with a local mock HTTP tracker + aria2 seeder: the app announced, downloaded 10/10, and the sidecar read 10/10 at completion. UI status sequence observed via temporary logging was already correct (`downloading 9/10 → seeding 10/10` — the section move was instant); this change makes the completed state durable.
+
+### 2026-08-06 — Root cause: completed torrents flashed into Downloading on open
+
+Still not showing as completed on reopen. Root cause found by logging every status the UI received on launch:
+
+`Torrent.init` created the `StatusBroadcast` with an initial `currentValue` of `.downloading 0/N`. The app's `TorrentItem.statusTask` subscribes on `start()` and `StatusBroadcast.subscribe()` replays that initial value, **overwriting the app's correct `.seeding` INIT status** — so every restored torrent appeared in the Downloading section at 0% until `run()` loaded the bitfield and published `.seeding`.
+
+**Fix** (`Torrent.swift`): seed the broadcast with the restored state — `Torrent.init` synchronously reads the resume sidecar via `Storage.loadVerifiedCount` and sets the initial `currentValue` to `.seeding` (complete) or `.downloading` at the resumed progress. Now the subscribe replay matches the app's INIT status, so completed torrents stay in the Completed section from the moment the UI first renders.
+
+Verified: after the fix, the statuses received by the UI on reopen are `seeding N/N` only — the `downloading 0/N` flash is gone.
+
+### 2026-08-06 — Torrent list, file detail, and player polish
+
+- Split the torrent list into Downloading and Completed sections; Completed is expanded by default and uses a Mail-style trailing disclosure chevron with a smooth in-place rotation.
+- Added persisted torrent-added dates and compact relative timestamps, a pie progress indicator, and an immediate completed-state checkmark.
+- Sorted detail files largest-first while retaining their original playback indexes, and aligned file-row separators consistently.
+- Added a native loading spinner to AVPlayer's content overlay until initial playback starts or loading fails.
+- Rebuilt and exercised each UI revision in the `NoFeedSocial iOS 26.3` simulator.
+
 (New entries go here as work progresses.)

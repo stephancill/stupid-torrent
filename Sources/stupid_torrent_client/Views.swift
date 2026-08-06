@@ -7,16 +7,51 @@ import Streaming
 struct ContentView: View {
     @State private var store = TorrentStore()
     @State private var showAdd = false
+    @State private var showCompleted = true
+
+    private var downloadingItems: [TorrentItem] { store.items.filter { !$0.isComplete } }
+    private var completedItems: [TorrentItem] { store.items.filter { $0.isComplete } }
 
     var body: some View {
         NavigationStack {
-            List(store.items) { item in
-                NavigationLink(value: item) {
-                    TorrentRow(item: item)
+            List {
+                if !downloadingItems.isEmpty {
+                    Section {
+                        ForEach(downloadingItems) { item in
+                            row(item)
+                        }
+                    } header: {
+                        Text("Downloading")
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .textCase(nil)
+                    }
                 }
-                .swipeActions {
-                    Button("Delete", role: .destructive) {
-                        store.remove(item)
+                if !completedItems.isEmpty {
+                    Section {
+                        if showCompleted {
+                            ForEach(completedItems) { item in
+                                row(item)
+                            }
+                        }
+                    } header: {
+                        Button {
+                            showCompleted.toggle()
+                        } label: {
+                            HStack {
+                                Text("Completed")
+                                    .font(.headline)
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .foregroundStyle(.tint)
+                                    .rotationEffect(.degrees(showCompleted ? 90 : 0))
+                                    .animation(.easeInOut(duration: 0.2), value: showCompleted)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .textCase(nil)
                     }
                 }
             }
@@ -57,6 +92,17 @@ struct ContentView: View {
             store.restore()
         }
     }
+
+    private func row(_ item: TorrentItem) -> some View {
+        NavigationLink(value: item) {
+            TorrentRow(item: item)
+        }
+        .swipeActions {
+            Button("Delete", role: .destructive) {
+                store.remove(item)
+            }
+        }
+    }
 }
 
 struct TorrentRow: View {
@@ -64,14 +110,27 @@ struct TorrentRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text(item.name)
-                .font(.headline)
-                .lineLimit(1)
+            HStack(spacing: 6) {
+                if let status = item.status, status.isComplete {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                Text(item.name)
+                    .font(.headline)
+                    .lineLimit(1)
+                Spacer()
+                Text(relativeTime(item.addedAt))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if let status = item.status {
                 if !status.isComplete {
-                    ProgressView(value: status.progress)
-                    HStack {
+                    HStack(spacing: 8) {
+                        PieProgressView(progress: status.progress)
+                            .frame(width: 16, height: 16)
                         Text("\(Int(status.progress * 100))%")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         Spacer()
                         Text("↓ \(byteString(status.downloadRate)) · ↑ \(byteString(status.uploadRate))")
                         Text("\(status.peers) peers")
@@ -135,6 +194,12 @@ struct TorrentDetailView: View {
     @State private var streamSession: TorrentStreamSession?
     @State private var showPlayer = false
 
+    private var fileIndicesBySize: [Int] {
+        item.metainfo.files.indices.sorted {
+            item.metainfo.files[$0].length > item.metainfo.files[$1].length
+        }
+    }
+
     var body: some View {
         List {
             if let status = item.status, !status.isComplete {
@@ -147,7 +212,7 @@ struct TorrentDetailView: View {
                 }
             }
             Section("Files") {
-                ForEach(item.metainfo.files.indices, id: \.self) { index in
+                ForEach(fileIndicesBySize, id: \.self) { index in
                     let file = item.metainfo.files[index]
                     let isStreamable = Torrent.contentType(forFileNamed: file.name) != nil
                     Button {
@@ -168,6 +233,7 @@ struct TorrentDetailView: View {
                         }
                     }
                     .disabled(!isStreamable)
+                    .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
                 }
             }
         }
@@ -217,7 +283,25 @@ struct AVPlayerControllerRepresentable: UIViewControllerRepresentable {
         controller.player = player
         // System PiP button appears automatically when supported and content allows it.
         controller.allowsPictureInPicturePlayback = true
+        let loadingIndicator = UIActivityIndicatorView(style: .large)
+        loadingIndicator.color = .white
+        loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
+        loadingIndicator.startAnimating()
+        let overlayView = controller.contentOverlayView ?? controller.view!
+        overlayView.addSubview(loadingIndicator)
+        NSLayoutConstraint.activate([
+            loadingIndicator.centerXAnchor.constraint(equalTo: overlayView.centerXAnchor),
+            loadingIndicator.centerYAnchor.constraint(equalTo: overlayView.centerYAnchor),
+        ])
         player.play()
+        Task { @MainActor [weak loadingIndicator, weak player] in
+            while let player,
+                  player.timeControlStatus != .playing,
+                  player.currentItem?.status != .failed {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            loadingIndicator?.stopAnimating()
+        }
         return controller
     }
 
@@ -251,4 +335,45 @@ func byteString(_ bytes: Double) -> String {
     if bytes >= 1_000_000 { return String(format: "%.1f MB", bytes / 1_000_000) }
     if bytes >= 1_000 { return String(format: "%.1f KB", bytes / 1_000) }
     return "\(Int(bytes)) B"
+}
+
+struct PieProgressView: View {
+    let progress: Double
+
+    var body: some View {
+        Canvas { context, size in
+            let center = CGPoint(x: size.width / 2, y: size.height / 2)
+            let radius = min(size.width, size.height) / 2
+            let rect = CGRect(x: 1, y: 1, width: size.width - 2, height: size.height - 2)
+            context.fill(Path(ellipseIn: rect), with: .color(.secondary.opacity(0.25)))
+            let clamped = min(max(progress, 0), 1)
+            guard clamped > 0 else { return }
+            let pie = Path { path in
+                path.move(to: center)
+                path.addArc(
+                    center: center,
+                    radius: radius - 1,
+                    startAngle: .degrees(-90),
+                    endAngle: .degrees(-90 + clamped * 360),
+                    clockwise: false
+                )
+                path.closeSubpath()
+            }
+            context.fill(pie, with: .color(.blue))
+        }
+    }
+}
+
+func relativeTime(_ date: Date) -> String {
+    let seconds = max(0, Int(Date().timeIntervalSince(date)))
+    if seconds < 60 { return "now" }
+    let minutes = seconds / 60
+    if minutes < 60 { return "\(minutes)m" }
+    let hours = minutes / 60
+    if hours < 24 { return "\(hours)h" }
+    let days = hours / 24
+    if days < 30 { return "\(days)d" }
+    let months = days / 30
+    if months < 12 { return "\(months)mo" }
+    return "\(months / 12)y"
 }

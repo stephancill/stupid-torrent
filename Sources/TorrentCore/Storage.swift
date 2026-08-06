@@ -121,6 +121,16 @@ public actor Storage {
         verified = Bitfield.from(Data(data.dropFirst(4)), count: count)
     }
 
+    /// Synchronously reads the verified-piece count from the resume sidecar, so callers can
+    /// show the restored state (e.g. a torrent already complete) before the engine loads it.
+    public static func loadVerifiedCount(directory: URL, infoHash: Data, pieceCount: Int) -> Int {
+        let url = directory.appendingPathComponent(".\(infoHash.hexString).verified")
+        guard let data = try? Data(contentsOf: url), data.count >= 4 else { return 0 }
+        let count = Int(data.readUInt32BE(at: 0))
+        guard count == pieceCount else { return 0 }
+        return Bitfield.from(Data(data.dropFirst(4)), count: count).setCount
+    }
+
     public func saveVerified() throws {
         var data = Data()
         data.appendUInt32BE(UInt32(metainfo.pieceCount))

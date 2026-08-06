@@ -144,6 +144,33 @@ extension Data {
     }
 }
 
+@Suite struct StorageTests {
+    @Test func loadVerifiedCountReadsSidecar() throws {
+        let metainfo = try Metainfo(data: try Fixtures.bigBuckBunnyTorrentData)
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // No sidecar yet -> 0.
+        #expect(Storage.loadVerifiedCount(directory: dir, infoHash: metainfo.infoHash, pieceCount: metainfo.pieceCount) == 0)
+
+        // Full sidecar -> complete.
+        var full = Data()
+        full.appendUInt32BE(UInt32(metainfo.pieceCount))
+        full.append(Bitfield(bits: [Bool](repeating: true, count: metainfo.pieceCount)).data())
+        try full.write(to: dir.appendingPathComponent(".\(metainfo.infoHash.hexString).verified"))
+        #expect(Storage.loadVerifiedCount(directory: dir, infoHash: metainfo.infoHash, pieceCount: metainfo.pieceCount) == metainfo.pieceCount)
+
+        // Half sidecar -> half.
+        var half = Data()
+        let halfCount = metainfo.pieceCount / 2
+        half.appendUInt32BE(UInt32(metainfo.pieceCount))
+        half.append(Bitfield(bits: (0..<metainfo.pieceCount).map { $0 < halfCount }).data())
+        try half.write(to: dir.appendingPathComponent(".\(metainfo.infoHash.hexString).verified"))
+        #expect(Storage.loadVerifiedCount(directory: dir, infoHash: metainfo.infoHash, pieceCount: metainfo.pieceCount) == halfCount)
+    }
+}
+
 @Suite struct PiecePickerTests {
     @Test func walksPiecesInOrder() {
         var picker = PiecePicker(pieceCount: 5, verified: [false, false, false, false, false])

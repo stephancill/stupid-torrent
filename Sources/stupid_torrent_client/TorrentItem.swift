@@ -8,18 +8,37 @@ final class TorrentItem: Identifiable, Hashable {
     nonisolated let id: String
     nonisolated let torrent: Torrent
     nonisolated let metainfo: Metainfo
+    nonisolated let addedAt: Date
     var status: TorrentStatus?
 
     private var statusTask: Task<Void, Never>?
     private var runTask: Task<Void, Never>?
 
-    init(torrent: Torrent) {
+    init(torrent: Torrent, initialVerifiedCount: Int = 0, addedAt: Date = .now) {
         self.torrent = torrent
         self.metainfo = torrent.metainfo
         self.id = torrent.metainfo.infoHash.hexString
+        self.addedAt = addedAt
+        if metainfo.pieceCount > 0 {
+            status = TorrentStatus(
+                name: metainfo.name,
+                infoHash: metainfo.infoHash,
+                state: initialVerifiedCount == metainfo.pieceCount ? .seeding : .downloading,
+                verifiedCount: initialVerifiedCount,
+                pieceCount: metainfo.pieceCount,
+                peers: 0,
+                seeds: 0,
+                downloadRate: 0,
+                uploadRate: 0,
+                downloadedBytes: 0,
+                uploadedBytes: 0
+            )
+        }
     }
 
     nonisolated var name: String { metainfo.name }
+
+    var isComplete: Bool { status?.isComplete ?? false }
 
     func start() {
         guard statusTask == nil else { return }

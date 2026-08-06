@@ -53,11 +53,18 @@ public actor Torrent {
         self.stopAfterBytes = stopAfterBytes
         self.storage = Storage(directory: directory, metainfo: metainfo)
         self.picker = PiecePicker(pieceCount: metainfo.pieceCount, verified: [Bool](repeating: false, count: metainfo.pieceCount))
+        // Seed the broadcast with the restored state (from the resume sidecar) so subscribers
+        // don't briefly see a fresh `.downloading 0/N` before run() loads the bitfield.
+        let initialVerified = Storage.loadVerifiedCount(
+            directory: directory,
+            infoHash: metainfo.infoHash,
+            pieceCount: metainfo.pieceCount
+        )
         self.statusBroadcast = StatusBroadcast(TorrentStatus(
             name: metainfo.name,
             infoHash: metainfo.infoHash,
-            state: .downloading,
-            verifiedCount: 0,
+            state: initialVerified == metainfo.pieceCount ? .seeding : .downloading,
+            verifiedCount: initialVerified,
             pieceCount: metainfo.pieceCount,
             peers: 0,
             seeds: 0,
@@ -112,9 +119,9 @@ public actor Torrent {
         announceTask?.cancel()
         tickerTask?.cancel()
         disconnectAllPeers()
+        try? await storage.saveVerified()
         let _ = await announceAll(event: picker.verified.allSet ? .completed : .none)
         let _ = await announceAll(event: .stopped)
-        try? await storage.saveVerified()
         await storage.close()
         isRunning = false
     }
@@ -263,6 +270,12 @@ public actor Torrent {
             blockSenders.removeValue(forKey: key)
         }
         verifiedDirty = true
+        // Persist completion the moment it's reached, so a relaunch never shows a finished
+        // torrent as downloading again (the end-of-run save below runs after slow announces).
+        if picker.verified.allSet {
+            try? await storage.saveVerified()
+            verifiedDirty = false
+        }
     }
 
     private func requeuePiece(_ piece: Int) {

@@ -21,6 +21,32 @@ public struct TorrentStatus: Sendable {
     public let downloadedBytes: Int64
     public let uploadedBytes: Int64
 
+    public init(
+        name: String,
+        infoHash: Data,
+        state: State,
+        verifiedCount: Int,
+        pieceCount: Int,
+        peers: Int,
+        seeds: Int,
+        downloadRate: Double,
+        uploadRate: Double,
+        downloadedBytes: Int64,
+        uploadedBytes: Int64
+    ) {
+        self.name = name
+        self.infoHash = infoHash
+        self.state = state
+        self.verifiedCount = verifiedCount
+        self.pieceCount = pieceCount
+        self.peers = peers
+        self.seeds = seeds
+        self.downloadRate = downloadRate
+        self.uploadRate = uploadRate
+        self.downloadedBytes = downloadedBytes
+        self.uploadedBytes = uploadedBytes
+    }
+
     public var progress: Double {
         pieceCount == 0 ? 0 : Double(verifiedCount) / Double(pieceCount)
     }
