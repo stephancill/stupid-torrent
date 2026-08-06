@@ -174,4 +174,17 @@ Track the offset locally (follow `currentOffset` only if the player jumps ahead)
 
 ## Unreleased
 
+### 2026-08-06 — Streaming fix: moov-tail playback for non-faststart MP4s (Sintel)
+
+Added Sintel (`08ada5a7...`) as a second torrent in the sim. Its `Sintel.mp4` is a **non-faststart MP4** (ftyp + mdat only; `moov` at the very end). AVPlayer could not play it while downloading — only after the file completed.
+
+**Root cause**: the loader called `streamPriority(offset..<fileLength)` for *every* request, including AVPlayer's all-to-end progressive request. That flooded the whole file into the picker's priority set; since `PiecePicker.nextPiece()` served priority pieces in ascending index order, the tail `moov` piece downloaded *last*, so playback could not begin until ~100%.
+
+**Fix** (mirrors webtorrent's `file.select(range, priority)`):
+- `PiecePicker.priority` is now `[Int: Int]` (piece -> level). `nextPiece()` serves highest level first, then lowest index within a level, then the sequential cursor.
+- `Torrent.streamPriority` assigns level 10 ("jump") to ranges well ahead of the sequential cursor (moov tail, seek targets), level 0 to the current window.
+- The loader prioritizes bounded requests' exact range, and for all-to-end requests only a 2 MB lookahead window — never the whole file.
+
+**Verification**: hermetic repro with a generated non-faststart mp4 (ffmpeg, moov after mdat) + aria2 seeder throttled to 30 KB/s. Before: `asset load ... timed out` with the moov piece never prioritized. After: `piece 12 verified (2/13)` — the moov piece downloads second — then `duration=30.0s playable=true` at ~15% download. Faststart regression still playable at 1/13. Added 4 `PiecePickerTests` (levels jump, window order, verify-removes-priority, level fallthrough). 29 tests green.
+
 (New entries go here as work progresses.)

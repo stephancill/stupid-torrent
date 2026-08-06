@@ -73,6 +73,7 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
         var offset = startOffset
         var served = 0
 
+        TorrentLog.log("stream req start=\(startOffset) len=\(requestedLength) allToEnd=\(allToEnd) fileLen=\(fileLength)")
         while true {
             // Follow the player if it jumped its offset on its own.
             let current = Int(dataRequest.currentOffset)
@@ -80,7 +81,15 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
 
             guard offset >= 0, offset < fileLength, served < limit else { break }
 
-            await torrent.streamPriority(fileIndex: fileIndex, range: offset..<fileLength)
+            // Prioritize what AVPlayer needs to make progress, without flooding the whole file
+            // into the priority set (which would defeat the moov-tail/seek jump). All-to-end
+            // requests get a bounded lookahead window; bounded requests get their exact range.
+            if allToEnd {
+                let window = 2 * 1024 * 1024
+                await torrent.streamPriority(fileIndex: fileIndex, range: offset..<min(offset + window, fileLength))
+            } else if requestedLength > 0 {
+                await torrent.streamPriority(fileIndex: fileIndex, range: offset..<min(offset + requestedLength, fileLength))
+            }
 
             let available = await torrent.streamingAvailability(fileIndex: fileIndex, offset: offset)
             if available > 0 {
@@ -88,6 +97,7 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
                 guard length > 0 else { break }
                 if let data = await torrent.streamingRead(fileIndex: fileIndex, offset: offset, length: length) {
                     dataRequest.respond(with: data)
+                    TorrentLog.log("stream served \(data.count) bytes at \(offset)")
                     offset += data.count
                     served += data.count
                     continue
@@ -108,6 +118,7 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
             // Bounded request with no data right now: give what we have; AVPlayer re-requests.
             break
         }
+        TorrentLog.log("stream finish start=\(startOffset) served=\(served) allToEnd=\(allToEnd)")
         request.finishLoading()
     }
 }

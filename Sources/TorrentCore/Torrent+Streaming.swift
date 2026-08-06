@@ -14,12 +14,20 @@ public extension Torrent {
     }
 
     /// Prioritize the pieces covering a byte range of a file so the streamer's window and
-    /// moov tail download ahead of the sequential cursor.
+    /// moov tail download ahead of the sequential cursor. A range well ahead of the sequential
+    /// frontier (moov tail, seek target) is a high-priority jump; the current window is a
+    /// low-priority lookahead served before the in-order cursor but after any jumps.
     func streamPriority(fileIndex: Int, range: Range<Int>) async {
         guard metainfo.files.indices.contains(fileIndex) else { return }
         let fileStart = metainfo.fileOffsets[fileIndex]
         let absolute = (fileStart + range.lowerBound)..<(fileStart + range.upperBound)
-        picker.priority.formUnion(metainfo.pieceRange(forByteRange: absolute))
+        let pieces = metainfo.pieceRange(forByteRange: absolute)
+        guard !pieces.isEmpty else { return }
+        let jumpAhead = 4
+        let isJump = pieces.lowerBound > picker.cursor + jumpAhead
+        for piece in pieces {
+            picker.setPriority(piece, level: isJump ? 10 : 0)
+        }
     }
 
     /// Number of contiguous verified bytes in a file starting at `offset`.

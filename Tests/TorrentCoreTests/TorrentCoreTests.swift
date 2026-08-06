@@ -144,6 +144,47 @@ extension Data {
     }
 }
 
+@Suite struct PiecePickerTests {
+    @Test func walksPiecesInOrder() {
+        var picker = PiecePicker(pieceCount: 5, verified: [false, false, false, false, false])
+        #expect(picker.nextPiece() == 0)
+        #expect(picker.nextPiece() == 1)
+        picker.markVerified(1)
+        #expect(picker.nextPiece() == 2)
+    }
+
+    @Test func higherPriorityLevelJumpsAheadOfLowerIndexPieces() {
+        var picker = PiecePicker(pieceCount: 13, verified: [false, false, false, false, false, false, false, false, false, false, false, false, false])
+        picker.setPriority(12, level: 10) // moov tail piece
+        picker.setPriority(0, level: 0)   // current window
+        picker.setPriority(1, level: 0)
+        // Level 10 is served before level 0, even though piece 12 has a higher index.
+        #expect(picker.nextPiece() == 12)
+        picker.markRequested(12)
+        // Then the window, lowest index first.
+        #expect(picker.nextPiece() == 0)
+        picker.markRequested(0)
+        #expect(picker.nextPiece() == 1)
+    }
+
+    @Test func verifiedPieceLeavesPriority() {
+        var picker = PiecePicker(pieceCount: 3, verified: [false, false, false])
+        picker.setPriority(2, level: 10)
+        picker.markRequested(2)
+        picker.markVerified(2)
+        // With the priority piece gone, the sequential cursor walk takes over.
+        #expect(picker.nextPiece() == 0)
+    }
+
+    @Test func lowerLevelUsedWhenHigherLevelExhausted() {
+        var picker = PiecePicker(pieceCount: 5, verified: [false, false, false, false, false])
+        picker.setPriority(0, level: 10)
+        picker.setPriority(3, level: 5)
+        picker.markRequested(0)
+        #expect(picker.nextPiece() == 3)
+    }
+}
+
 @Suite struct MetainfoTests {
     @Test func parsesBigBuckBunnyFixture() throws {
         let info = try Metainfo(data: try Fixtures.bigBuckBunnyTorrentData)

@@ -2,12 +2,14 @@ import Foundation
 
 /// Sequential piece picker. Walks pieces in order (wrapping), skipping pieces that are verified
 /// or already requested, so multiple peers end up on different pieces of the same sequential stream.
-/// Priority pieces (e.g. the streamer's current window / moov tail) are served first.
+/// Prioritized pieces (e.g. the streamer's current window / moov tail / seek targets) are served
+/// first: highest priority level first, then lowest piece index within a level.
 public struct PiecePicker: Sendable {
     public let pieceCount: Int
     public var verified: Bitfield
     public var requested: Bitfield
-    public var priority: Set<Int>
+    /// Piece -> priority level. Higher levels are picked before lower ones.
+    public var priority: [Int: Int]
     public var cursor: Int
 
     public init(pieceCount: Int, verified: [Bool], requested: [Bool] = []) {
@@ -18,17 +20,19 @@ public struct PiecePicker: Sendable {
         } else {
             self.requested = Bitfield(bits: requested)
         }
-        self.priority = []
+        self.priority = [:]
         self.cursor = 0
     }
 
     public mutating func nextPiece() -> Int? {
         guard pieceCount > 0 else { return nil }
-        // Priority pieces first, lowest index first.
-        for piece in priority.sorted() {
-            if !verified[piece] && !requested[piece] {
-                cursor = (piece + 1) % pieceCount
-                return piece
+        // Prioritized pieces first: highest level, then lowest index within the level.
+        for level in Set(priority.values).sorted(by: >) {
+            for piece in priority.keys.filter({ priority[$0] == level }).sorted() {
+                if !verified[piece] && !requested[piece] {
+                    cursor = (piece + 1) % pieceCount
+                    return piece
+                }
             }
         }
         for offset in 0..<pieceCount {
@@ -41,6 +45,10 @@ public struct PiecePicker: Sendable {
         return nil
     }
 
+    public mutating func setPriority(_ piece: Int, level: Int) {
+        priority[piece] = level
+    }
+
     public mutating func markRequested(_ piece: Int) {
         requested[piece] = true
     }
@@ -48,7 +56,7 @@ public struct PiecePicker: Sendable {
     public mutating func markVerified(_ piece: Int) {
         verified[piece] = true
         requested[piece] = false
-        priority.remove(piece)
+        priority.removeValue(forKey: piece)
     }
 
     public mutating func clearRequested(_ piece: Int) {
