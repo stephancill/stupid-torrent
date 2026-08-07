@@ -7,7 +7,7 @@ An xtool iOS app (SwiftPM + SwiftUI) where you paste a **magnet link** or import
 ## Decisions (locked in)
 
 1. **Engine: from scratch, pure Swift.** No libtorrent/C++, no vendored frameworks, no binary targets. Zero build/link risk under xtool's cross SDK, and the streaming model (priority-window piece picking) is native to our own picker. Closely modeled on two MIT references.
-2. **Scope v1: full** — magnet links + `.torrent` files, sequential/priority-window download, seeding, per-file selection and priorities, AVPlayer streaming, DHT (BEP 5) peer discovery, MSE/PE protocol encryption (BEP 10). **No µTP (BEP 29)**, no web seeds (BEP 19) — deferred.
+2. **Scope v1: full** — magnet links + `.torrent` files, sequential/priority-window download, seeding, per-file selection and priorities, AVPlayer streaming, DHT (BEP 5) peer discovery, MSE/PE protocol encryption (BEP 10), µTP transport (BEP 29). **No web seeds (BEP 19)** — deferred.
 3. **Streaming: AVPlayer + `AVAssetResourceLoaderDelegate`** over a custom `stream://` scheme, fed from our own `Storage` once pieces are verified. `UIBackgroundModes: audio` for background audio streaming.
 4. **Validation-first: macOS `torrent-cli`** headless harness gates every engine phase against the live Big Buck Bunny torrent before any iOS UI work.
 5. **Concurrency: Swift 6 strict concurrency** with actors; networking over Network.framework `NWConnection`, bridged to `async`/`AsyncStream`. Engine status is fanned out through a `StatusBroadcast` (multi-subscriber, current-value); SwiftUI observes a main-actor `@Observable` `TorrentStore` snapshot.
@@ -33,7 +33,7 @@ Secondary alternatives: Sintel (`08ada5a7a6183aae1e09d831df6748d566095a10`), Cos
 
 - `webtorrent/webtorrent` (JS, MIT) — module structure + streaming orchestration. Mirror its `wire/tracker/dht/file/torrent` decomposition and its magnet -> metadata -> sequential/priority download flow.
 - `anacrolix/torrent` (Go, MIT) — correctness reference for peer-wire edge cases, sparse storage, rarest-first/endgame, tracker behavior, BEP handling.
-- Spec source of truth: BEP 3 (metainfo), BEP 9 (ut_metadata), BEP 10 (extensions), BEP 23 (compact peer lists), BEP 5 (DHT, deferred), BEP 29 (µTP, deferred).
+- Spec source of truth: BEP 3 (metainfo), BEP 9 (ut_metadata), BEP 10 (extensions), BEP 23 (compact peer lists), BEP 5 (DHT), BEP 29 (µTP).
 
 ## Hermetic testing (deterministic, offline)
 
@@ -69,6 +69,7 @@ Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
 | `PeerID` | 20-byte peer id, `-ST0001-` + random |
 | `PeerWire` | length-prefixed message codec; IDs 0-9 + extended (20); keepalive; block encode/decode; BEP 10 extended handshake; BEP 9 ut_metadata (16 KiB chunk assembly, SHA-1 against info hash) |
 | `Peer` | `NWConnection` state machine: TCP connect, handshake (extension bit), choke/unchoke/interested, request pipeline (16 KiB blocks, ~16-32 outstanding), keepalive timer, stall detection |
+| `UTP`/`UTPConnection`/`UTPTransport` | µTP (BEP 29): wire codec (20-byte header, extensions), per-connection seq/ack + retransmit + reorder buffering, shared UDP demux socket + retransmit ticker. Modeled on libutp; peers connect over µTP first with TCP fallback |
 | `Tracker` | HTTP(S) announce via `URLSession` (bencoded response, `compact=1`, `peers`/`peers6`, interval/numwant, started/completed/stopped); UDP announce via `NWConnection` (.udp, connect -> announce, spec retries). Aggregates peer lists |
 | `PiecePicker` | sequential mode + priority window (primary); jump-to-requested-range for streaming; optional endgame; per-file priority honoring piece-spanning |
 | `Storage` | sparse multi-file writes via `pwrite`; verified-piece bitfield; SHA-1 via `CryptoKit.Insecure.SHA1`; resume sidecars; disk-space guard (check `volumeAvailableCapacityForImportantUsage` before allocating; on ENOSPC fail loudly — pause the torrent and surface an error) |
@@ -131,4 +132,4 @@ Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
 
 ## Out of scope (v1)
 
-µTP (BEP 29), web seeds (BEP 19), background downloads, IPv6 peer support (decode-ignore). Note: MSE/PE now implemented; TCP-only still means some peers won't connect; acceptable.
+Web seeds (BEP 19), background downloads, IPv6 peer support (decode-ignore). Note: MSE/PE and µTP (BEP 29) are now implemented; outbound connections try µTP first (reaching µTP-only peers, e.g. WebTorrent's) and fall back to TCP, and the shared UDP socket also accepts inbound µTP on the announced port. WebRTC (for WebTorrent's browser-only peers) remains out of scope.

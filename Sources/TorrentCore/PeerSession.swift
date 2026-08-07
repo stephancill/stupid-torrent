@@ -15,25 +15,34 @@ public final class PeerSession: @unchecked Sendable {
     private let torrent: Torrent
     private let infoHash: Data
     private let peerID: Data
-    private let stream: PeerStream
+    private let stream: any PeerTransport
     private let isInitiator: Bool
+    /// Whether to attempt the MSE/PE (BEP 10) handshake first. TCP uses it; µTP connects plaintext.
+    private let supportsMSE: Bool
+    /// Set once the BitTorrent handshake completes (used by `Torrent` for µTP-after-TCP fallback).
+    public private(set) var completedHandshake = false
 
     private var peerChoked = true
     private var outstanding: Set<BlockKey> = []
     private let maxOutstanding = 48
 
-    public init(torrent: Torrent, address: PeerAddress, infoHash: Data, peerID: Data, stream: PeerStream, isInitiator: Bool) {
+    public init(torrent: Torrent, address: PeerAddress, infoHash: Data, peerID: Data, stream: any PeerTransport, isInitiator: Bool, supportsMSE: Bool = true) {
         self.torrent = torrent
         self.address = address
         self.infoHash = infoHash
         self.peerID = peerID
         self.stream = stream
         self.isInitiator = isInitiator
+        self.supportsMSE = supportsMSE
     }
 
-    public func run() async {
+    public func run(handshakeBudget: Duration? = nil) async {
         do {
-            try await performHandshake()
+            if let budget = handshakeBudget {
+                try await runHandshakeWithin(budget: budget)
+            } else {
+                try await performHandshake()
+            }
             TorrentLog.log("handshake ok with \(address.host)")
             try await stream.send(PeerMessage.interested.encode())
             try await receiveLoop()
@@ -44,6 +53,29 @@ public final class PeerSession: @unchecked Sendable {
         await torrent.peerDisconnected(self)
     }
 
+    /// Runs the handshake but gives up (closing the stream, which unblocks any in-flight read)
+    /// once `budget` elapses without completion — used so a µTP attempt that stalls before the BT
+    /// handshake can fall back to TCP.
+    private func runHandshakeWithin(budget: Duration) async throws {
+        let deadline = ContinuousClock.now + budget
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await self.performHandshake()
+            }
+            group.addTask {
+                while !self.completedHandshake {
+                    if ContinuousClock.now > deadline {
+                        self.stream.close()
+                        throw PeerStreamError.timeout
+                    }
+                    try await Task.sleep(for: .milliseconds(250))
+                }
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
+    }
+
     /// Closes the underlying stream, causing `run()` to unwind.
     public func disconnect() {
         stream.close()
@@ -51,17 +83,19 @@ public final class PeerSession: @unchecked Sendable {
 
     private func performHandshake() async throws {
         // MSE/PE (BEP 10): obfuscate the handshake + payload. Some peers answer in plaintext
-        // (they don't support MSE) — fall back and continue unencrypted.
-        let mse = MSEHandshake(stream: stream)
-        do {
-            if isInitiator {
-                try await mse.performAsInitiator(infoHash: infoHash)
-            } else {
-                try await mse.performAsResponder(infoHash: infoHash)
+        // (they don't support MSE) — fall back and continue unencrypted. µTP is plaintext.
+        if supportsMSE, let stream = stream as? PeerStream {
+            let mse = MSEHandshake(stream: stream)
+            do {
+                if isInitiator {
+                    try await mse.performAsInitiator(infoHash: infoHash)
+                } else {
+                    try await mse.performAsResponder(infoHash: infoHash)
+                }
+                TorrentLog.log("\(address.host): MSE handshake ok (method \(mse.method == .rc4 ? "rc4" : "plaintext"))")
+            } catch MSEError.plaintextFallback {
+                TorrentLog.log("\(address.host): peer doesn't support MSE, using plaintext")
             }
-            TorrentLog.log("\(address.host): MSE handshake ok (method \(mse.method == .rc4 ? "rc4" : "plaintext"))")
-        } catch MSEError.plaintextFallback {
-            TorrentLog.log("\(address.host): peer doesn't support MSE, using plaintext")
         }
 
         let local = Handshake.make(extensionEnabled: true, infoHash: infoHash, peerID: peerID)
@@ -76,6 +110,7 @@ public final class PeerSession: @unchecked Sendable {
             guard remote.infoHash == infoHash else { throw PeerWireError.wrongInfoHash }
             try await stream.send(local.encode())
         }
+        completedHandshake = true
     }
 
     private func receiveLoop() async throws {

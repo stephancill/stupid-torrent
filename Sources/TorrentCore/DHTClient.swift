@@ -212,23 +212,33 @@ public final class DHTClient: @unchecked Sendable {
     }
 
     private func query(_ query: KRPCQuery, to node: KRPCNodeInfo) async throws -> [String: BValue] {
-        let transaction = Self.randomTransactionID()
-        let packet = KRPCWire.encode(query: query, transaction: transaction)
-        let hex = transaction.map { String(format: "%02x", $0) }.joined()
+        // A 2-byte transaction id collides within minutes under sustained query load; the old
+        // `pending[hex] = ...` would silently overwrite the earlier entry, orphaning its
+        // continuation forever ("TASK CONTINUATION MISUSE ... leaked"). Use 4 bytes and re-roll
+        // on collision so every registered continuation is guaranteed to be resumed.
+        var transaction = Self.randomTransactionID()
+        var packet = KRPCWire.encode(query: query, transaction: transaction)
+        var hex = transaction.map { String(format: "%02x", $0) }.joined()
+        while pendingContains(hex) {
+            transaction = Self.randomTransactionID()
+            packet = KRPCWire.encode(query: query, transaction: transaction)
+            hex = transaction.map { String(format: "%02x", $0) }.joined()
+        }
 
         return try await withCheckedThrowingContinuation { continuation in
+            let txnHex = hex
             let timeoutTask = Task {
                 try? await Task.sleep(for: .seconds(queryTimeout))
-                if let pendingQuery = removePending(hex) {
+                if let pendingQuery = removePending(txnHex) {
                     pendingQuery.continuation.resume(throwing: DHTError.timeout)
                 }
             }
-            addPending(hex, PendingQuery(node: node, continuation: continuation, timeoutTask: timeoutTask))
+            addPending(txnHex, PendingQuery(node: node, continuation: continuation, timeoutTask: timeoutTask))
             do {
                 try socket.send(packet, to: node.host, port: node.port)
             } catch {
                 timeoutTask.cancel()
-                if let pendingQuery = removePending(hex) {
+                if let pendingQuery = removePending(txnHex) {
                     pendingQuery.continuation.resume(throwing: error)
                 }
             }
@@ -239,6 +249,12 @@ public final class DHTClient: @unchecked Sendable {
         lock.lock()
         pending[hex] = pendingQuery
         lock.unlock()
+    }
+
+    private func pendingContains(_ hex: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pending[hex] != nil
     }
 
     private func removePending(_ hex: String) -> PendingQuery? {
@@ -288,6 +304,6 @@ public final class DHTClient: @unchecked Sendable {
     }
 
     private static func randomTransactionID() -> Data {
-        Data((0..<2).map { _ in UInt8.random(in: 0...255) })
+        Data((0..<4).map { _ in UInt8.random(in: 0...255) })
     }
 }

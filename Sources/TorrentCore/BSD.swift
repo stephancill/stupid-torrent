@@ -129,6 +129,33 @@ public final class UDPSocket: @unchecked Sendable {
         guard fd >= 0 else { throw SocketError.create(errno) }
     }
 
+    /// The port the socket is bound to after `bind(port:)` (0 until bound).
+    public private(set) var localPort: UInt16 = 0
+
+    /// Binds the socket to a local UDP port so it can receive datagrams (µTP responder / listener).
+    public func bind(port requestedPort: UInt16) throws {
+        var reuse: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = INADDR_ANY
+        addr.sin_port = requestedPort.bigEndian
+        let rc = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard rc == 0 else { throw SocketError.bind(errno) }
+        var bound = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &bound) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(fd, $0, &length)
+            }
+        }
+        localPort = UInt16(bigEndian: bound.sin_port)
+    }
+
     public func send(_ data: Data, to host: String, port: UInt16) throws {
         var addr = try BSD.resolveIPv4(host, port: port)
         try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
@@ -154,6 +181,30 @@ public final class UDPSocket: @unchecked Sendable {
             throw SocketError.read(errno)
         }
         return Data(buffer.prefix(n))
+    }
+
+    /// Receives a datagram and the address it came from (µTP needs the sender for demux).
+    public func receiveFrom(timeout: TimeInterval) throws -> (data: Data, host: String, port: UInt16)? {
+        var tv = timeval(tv_sec: Int(timeout), tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        var addr = sockaddr_in()
+        var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let n = buffer.withUnsafeMutableBytes { raw -> Int in
+            withUnsafeMutablePointer(to: &addr) { addrPtr in
+                addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                    recvfrom(fd, raw.baseAddress!, raw.count, 0, sockPtr, &addrLen)
+                }
+            }
+        }
+        if n < 0 {
+            if errno == EAGAIN || errno == EWOULDBLOCK { return nil }
+            throw SocketError.read(errno)
+        }
+        let ipBytes = withUnsafeBytes(of: &addr.sin_addr.s_addr) { Array($0) }
+        let host = ipBytes.map { String($0) }.joined(separator: ".")
+        let port = UInt16(bigEndian: addr.sin_port)
+        return (Data(buffer.prefix(n)), host, port)
     }
 
     public func close() {

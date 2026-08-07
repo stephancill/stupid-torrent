@@ -101,6 +101,17 @@ public final class MetadataFetcher: @unchecked Sendable {
             try await stream.connect(timeout: seconds)
         TorrentLog.log("metadata: connected to \(address.host)")
 
+        // MSE/PE (BEP 10): obfuscate the handshake + payload. Many metadata servers (and most of
+        // this swarm) close plaintext connections, so encrypt first; peers without MSE answer in
+        // plaintext, which falls back and continues unencrypted.
+        let mse = MSEHandshake(stream: stream)
+        do {
+            try await mse.performAsInitiator(infoHash: infoHash)
+            TorrentLog.log("metadata: MSE handshake ok (method \(mse.method == .rc4 ? "rc4" : "plaintext"))")
+        } catch MSEError.plaintextFallback {
+            TorrentLog.log("metadata: peer doesn't support MSE, using plaintext")
+        }
+
         let local = Handshake.make(extensionEnabled: true, infoHash: infoHash, peerID: peerID)
         try await stream.send(local.encode())
         let remote = try Handshake.parse(try await stream.read(exactly: Handshake.length))

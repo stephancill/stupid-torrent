@@ -30,6 +30,10 @@ public actor Torrent {
     private var listener: TCPListener?
     private var listenerThread: Thread?
     private var listenPort: UInt16 = 0
+    private var utpTransport: UTPTransport?
+    /// Transports replaced by the listener's bound transport (pre-listener injected peers); stopped
+    /// on `stop()` so their sockets/tasks don't leak.
+    private var retiredUTPTransports: [UTPTransport] = []
 
     private var announceTask: Task<Void, Never>?
     private var dhtTask: Task<Void, Never>?
@@ -46,7 +50,7 @@ public actor Torrent {
     private var uploadRate: Double = 0
     private var lastSeeders = 0
 
-    public init(directory: URL, metainfo: Metainfo, peerID: Data = PeerID.generate(), maxActivePeers: Int = 30, stopAfterBytes: Int64? = nil) {
+    public init(directory: URL, metainfo: Metainfo, peerID: Data = PeerID.generate(), maxActivePeers: Int = 50, stopAfterBytes: Int64? = nil) {
         self.directory = directory
         self.metainfo = metainfo
         self.peerID = peerID
@@ -102,7 +106,7 @@ public actor Torrent {
         dhtTask = Task { [weak self] in
             await self?.dhtLoop()
         }
-        startListener()
+        await startListener()
         tickerTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
@@ -137,6 +141,11 @@ public actor Torrent {
         dhtTask?.cancel()
         listener?.close()
         listenerThread?.cancel()
+        await utpTransport?.stop()
+        for transport in retiredUTPTransports {
+            await transport.stop()
+        }
+        retiredUTPTransports.removeAll()
         disconnectAllPeers()
         let _ = await announceAll(event: .stopped)
         try? await storage.saveVerified()
@@ -401,12 +410,72 @@ public actor Torrent {
         defer {
             pendingPeerAddresses.remove(address)
         }
+        // µTP first (reaches µTP-only peers — webtorrent's advantage on swarms like The Odyssey),
+        // then TCP. A µTP session that stalls before the BT handshake falls through to TCP.
+        if await connectUTP(to: address) {
+            return
+        }
+        await connectTCP(to: address)
+        await publishStatus()
+    }
+
+    private func connectUTP(to address: PeerAddress) async -> Bool {
+        let transport: UTPTransport?
+        if let existing = utpTransport {
+            transport = existing
+        } else {
+            transport = await ensureUTPTransport()
+        }
+        guard let transport else { return false }
+        let connection = await transport.connect(to: address)
+        do {
+            try await connection.startAsInitiator(timeout: .seconds(2))
+            let stream = UTPStream(connection: connection)
+            let session = PeerSession(
+                torrent: self,
+                address: address,
+                infoHash: metainfo.infoHash,
+                peerID: peerID,
+                stream: stream,
+                isInitiator: true,
+                supportsMSE: false
+            )
+            activePeerIDs.insert(session.id)
+            peerSessions[session.id] = session
+            TorrentLog.log("µTP connected to \(address.host):\(address.port)")
+            await session.run(handshakeBudget: .seconds(6))
+            return session.completedHandshake
+        } catch {
+            TorrentLog.log("µTP connect to \(address.host):\(address.port) failed: \(error)")
+            await connection.unregister()
+            return false
+        }
+    }
+
+    /// Creates an outbound-only µTP transport when the listener hasn't started yet (injected peers
+    /// can be considered before `run()` calls `startListener()`). The listener's transport (with
+    /// inbound accept) replaces this one once started.
+    private func ensureUTPTransport() async -> UTPTransport? {
+        guard utpTransport == nil else { return utpTransport }
+        do {
+            let udp = try UDPSocket()
+            let transport = UTPTransport(socket: udp)
+            await transport.start()
+            utpTransport = transport
+            return transport
+        } catch {
+            TorrentLog.log("µTP transport failed: \(error)")
+            return nil
+        }
+    }
+
+    private func connectTCP(to address: PeerAddress) async {
         do {
             let stream = try PeerStream(host: address.host, port: address.port)
             try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask { try await stream.connect() }
+                group.addTask { try await stream.connect(timeout: 5) }
                 group.addTask {
-                    try await Task.sleep(for: .seconds(10))
+                    try await Task.sleep(for: .seconds(5))
                     stream.close()
                     throw PeerStreamError.timeout
                 }
@@ -429,12 +498,11 @@ public actor Torrent {
         } catch {
             TorrentLog.log("connect to \(address.host):\(address.port) failed: \(error)")
         }
-        await publishStatus()
     }
 
     // MARK: - Inbound listener
 
-    private func startListener() {
+    private func startListener() async {
         do {
             let listener = try TCPListener(port: 0)
             self.listener = listener
@@ -455,10 +523,49 @@ public actor Torrent {
             thread.name = "stupid-torrent.listener"
             listenerThread = thread
             thread.start()
+
+            // µTP (BEP 29) on the same announced port: peers can reach us over UDP as well as TCP.
+            // Accepts create plaintext BitTorrent sessions (µTP is its own transport). If binding
+            // to the announced port fails, keep an unbound transport so outbound µTP still works.
+            let udp = try UDPSocket()
+            var inbound = false
+            if (try? udp.bind(port: listenPort)) != nil {
+                inbound = true
+            }
+            let transport = UTPTransport(socket: udp) { [weak self] connection, remote in
+                guard let self else { return }
+                await self.runAcceptedUTP(connection, remote: remote)
+            }
+            await transport.start()
+            if let previous = utpTransport {
+                retiredUTPTransports.append(previous)
+            }
+            utpTransport = transport
+            TorrentLog.log(inbound ? "µTP listening on port \(listenPort)" : "µTP outbound only (bind to \(listenPort) failed)")
         } catch {
             TorrentLog.log("listener failed: \(error)")
             listenPort = 0
         }
+    }
+
+    private func runAcceptedUTP(_ connection: UTPConnection, remote: PeerAddress) async {
+        guard activePeerIDs.count < maxActivePeers else {
+            await connection.close()
+            return
+        }
+        let stream = UTPStream(connection: connection)
+        let session = PeerSession(
+            torrent: self,
+            address: remote,
+            infoHash: metainfo.infoHash,
+            peerID: peerID,
+            stream: stream,
+            isInitiator: false,
+            supportsMSE: false
+        )
+        activePeerIDs.insert(session.id)
+        peerSessions[session.id] = session
+        await session.run()
     }
 
     private func runAccepted(_ stream: PeerStream) async {

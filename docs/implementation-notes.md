@@ -299,4 +299,65 @@ Verified: after the fix, the statuses received by the UI on reopen are `seeding 
 - Files (uncommitted): `UTP.swift` (wire codec), `UTPConnection.swift` (per-connection state machine), `UTPTransport.swift` (UDP demux + retransmit ticker), and a `UDPSocket.receiveFrom` addition.
 - Known blocker: `UTPTransport` receive loop runs on a raw `Thread` but its handlers are actor-isolated, so inbound packets aren't processed (the Node libutp server received our SYN, proving the codec + SYN are correct). Fix is to run the receive loop as a detached `Task`.
 
-(New entries go here as work progresses.)
+### 2026-08-07 — µTP (BEP 29) transport landed (handover completed, end-to-end verified)
+
+Completed the uncommitted µTP work from `docs/utp-handover.md` and landed it. The engine now reaches µTP-only peers (WebTorrent's remaining advantage on swarms like The Odyssey) in addition to TCP+MSE.
+
+**Files**: `UTP.swift` (codec), `UTPConnection.swift` (per-connection actor), `UTPTransport.swift` (shared UDP demux + ticker), `UTPStream.swift` (new, `PeerTransport` adapter), plus `UDPSocket.bind(port:)`/`receiveFrom` in `BSD.swift`.
+
+**Bugs fixed** (all against libutp `utp_internal.cpp`):
+1. **Receive loop never ran** (the handover blocker): `UTPTransport.start()` used a raw `Thread` calling actor-isolated `receiveLoop()`. Now a detached `Task` runs a `nonisolated` loop that does the blocking `socket.receiveFrom` off the actor and hops in via `await handleIncoming(...)`.
+2. **Stale acks** (found via interop): `ackNr` was never advanced when delivering in-order data, so our acks stayed at `seq-1` and libutp peers retransmitted packet 1 forever (multi-packet echo hung). `deliverData` now sets `ackNr = nextRecvSeq &- 1` after each in-order delivery/drain.
+3. **`nextRecvSeq` not seeded from the handshake**: responder now sets `nextRecvSeq = SYN.seq + 1`; initiator sets `nextRecvSeq = SYNACK.seq` on connection. Previously random, so the first DATA was misclassified as out-of-order and buffered/dropped.
+4. **SYN consumes a sequence number**: initiator's first DATA is now `SYN.seq + 1` (libutp `utp_connect`), matching the responder's expected window.
+5. **Codec extension chain**: the extension-bits header's "next type" byte now names the following SACK extension; SACK parsing maps bit i to `ack + (i+2)` (bit 0 = the hole at `ack+1`), per libutp `send_ack`/`selective_ack`.
+6. **Cleaned dead members**: removed `flush()`/`nudge()` overlap (now `flushData` = send-unsent, `nudge` = RTO retransmit + pending ack), unused `markConnected`, `readBytesAvailable`, and the `packetSource` remnants.
+
+**Integration** (`PeerSession`/`Torrent`):
+- `PeerTransport` protocol (send/read(exactly:)/close) lets `PeerSession` run over TCP (`PeerStream`) or µTP (`UTPStream`). µTP sessions do a plaintext BT handshake (µTP is its own transport; MSE stays TCP-only), with a bounded handshake budget so a stalled µTP session falls back to TCP.
+- Outbound: µTP first (4 s SYN budget — mirrors webtorrent's "if the utp connection fails, replace with a tcp connection"), TCP fallback.
+- Inbound: the shared UDP socket binds the announced listen port (falling back to outbound-only if the bind fails) and accepts µTP connections as plaintext PeerSessions.
+
+**Verification**:
+- **Interop vs libutp (`utp-native`) over loopback, both directions**: Swift initiator → libutp responder (17 B and 5000 B multi-packet echo both pass), and libutp initiator → Swift responder (echo passes). The 5000 B case caught bug #2.
+- **Unit tests**: 7 new `UTPTests` (codec round-trip incl. SACK + extension-bits chains, 16-bit seq wrap, `receiveFrom` address byte order, Swift↔Swift loopback handshake+echo, responder connection-id scheme). 49 tests total, all green.
+- **Live Odyssey magnet** (`torrent-cli add <48aeb057… magnet> --verbose`): metadata fetched, 9 real µTP connections to swarm peers (BT handshakes completed over µTP, e.g. 191.243.36.164, 181.91.87.192, 78.26.50.47), 152 µTP SYN timeouts fell back to TCP (one TCP peer seeded the download), 11 pieces verified. Download pace is limited by the swarm's near-total lack of usable seeders, not the transport.
+
+**Notes**: the handover's `utp-echo`/`utp-listen` CLI commands and `third-party/utp-echo-server.js`/`utp-echo-client.js` (gitignored) remain as repeatable interop harnesses. planning.md updated: µTP moved out of the deferred list.
+
+### 2026-08-07 — Magnet resolution: MSE for the metadata fetch
+
+Follow-up from a simulator session where a freshly-added magnet took ~7 min to resolve (and looked stuck, sweeping hundreds of dead peers). Two causes: the app's DHT node cache was reset by a reinstall (cold discovery), and `MetadataFetcher` only spoke plaintext — peers that require MSE close plaintext metadata connections (`write(9)`/`connect(61)` floods in the log).
+
+**Change** (`MetadataExchange.swift`): `MetadataFetcher.fetch` now runs the MSE/PE initiator handshake (`MSEHandshake.performAsInitiator`) before the BitTorrent handshake, with the existing `plaintextFallback` path — exactly mirroring what `PeerSession` already does for the data path. The BT handshake + extended handshake + ut_metadata requests are then encrypted when the peer supports it.
+
+**Verification**:
+- Live CLI `add <Odyssey magnet>`: `metadata: MSE handshake ok (method rc4|plaintext)` on many peers; the 14.5 KB info dict resolved as one chunk and the `.torrent` saved at ~50 s; download then started.
+- Full suite still green (49 tests).
+- Deployed to the simulator; the previously-stalled Odyssey download resumed and ran 21 MB → 312 MB (2 → 29/712 pieces) before the swarm's seeders dropped again (swarm quality, not the client).
+
+### 2026-08-07 — DHT continuation-leak fix (transaction-id collision)
+
+A `SWIFT TASK CONTINUATION MISUSE: query(_:to:) leaked its continuation` appeared in the simulator log during swarm churn. Root cause: `DHTClient.randomTransactionID()` returned only **2 bytes** (16 bits), and `addPending` did `pending[hex] = ...`, silently overwriting an earlier pending query on a txn collision. The overwritten query's continuation was orphaned and never resumed — under sustained query load (3 torrents × dhtLoop + bootstraps) collisions are guaranteed within an hour (birthday bound), leaking suspended `lookup`/bootstrap tasks that can hang future magnet bootstraps.
+
+**Fix** (`DHTClient.swift`): transaction ids are now **4 bytes**, and `query` re-rolls the id if the hex is already pending (`pendingContains`), so every registered continuation is guaranteed exactly-once resume. Full suite green (49 tests); redeployed to the simulator.
+
+### 2026-08-07 — Odyssey swarm investigation + peer-cycling tuning
+
+User reported the Odyssey magnet download not progressing while WebTorrent succeeded. Full diagnosis:
+
+- **The client works**: pointed directly at a reachable seeder (`torrent-cli add <Odyssey.torrent> --peer 46.164.54.202:52123`), the CLI downloaded at 620-720 KB/s and verified 3/712 pieces in 80 s (512/512 blocks each, clean SHA-1). Piece assembly/verify is correct.
+- **The swarm is the bottleneck**: trackers report ~7k seeds but ~all are NAT'd/unreachable or leechers that handshake/unchoke and send 0 bytes. Reachable seeders come and go (the app's 21 → 312 MB burst was one such window).
+- **WebTorrent's edge is parallelism**: a side-by-side run showed WebTorrent pulling ~0.6-1.6 MB/s from ~10 serving peers via `utpOutgoing` wires (default `secure:1` = MSE over µTP, but `secure:0` plaintext also worked — so encryption over µTP is NOT required). Our client reached the same peers (46.164.54.202:52123 in both) but with far fewer concurrent connections, so it caught fewer seeder windows. No PEX events observed in WebTorrent's run.
+
+**Tuning** (`Torrent.swift`): µTP SYN timeout 4 s → 2 s, TCP connect timeout 10 s → 5 s, µTP handshake budget 10 s → 6 s, `maxActivePeers` 30 → 50 — cycling the peer pool ~2-3× faster like WebTorrent so we find seeder windows sooner. Also confirmed the two real fixes that matter for the user's magnet flow: `MetadataFetcher` now does MSE (lands faster, see earlier entry) and the DHT txn-collision leak is fixed.
+
+**Re-verification on a healthy swarm (BB B live)**: `torrent-cli add Fixtures/big-buck-bunny.torrent` downloaded the full 276 MB to 100% — `verify: ok=1055 bad=0 missing=0` — with **30 µTP connections** and ~0.8-1.3 MB/s. Confirms the engine (µTP transport + MSE + tuning) still passes the Phase 3 gate.
+
+### 2026-08-07 — µTP data path proven against a real BitTorrent µTP peer
+
+Hermetic end-to-end test: a **WebTorrent (node) µTP seeder** (5 MB file, `client.seed` + `client.listen(0)`, `utp:true secure:0`) on loopback, our CLI pointed at it via `--peer 127.0.0.1:PORT`. Result: `µTP connected` → BT handshake over µTP → unchoke → 48-block pipeline → **320/320 pieces verified**, file byte-exact. This proves the µTP transport carries real BitTorrent data (not just the utp-native echo), isolating the Odyssey "stuck at 4%" to the swarm (reachable seeders are scarce and slot-constrained — peers unchoke us, we request, then they re-choke, consistent with the user's active WebTorrent session holding upload slots).
+
+**Bug fixed en route**: injected peers (`--peer`) are considered before `run()` starts the listener, so `utpTransport` was nil and µTP was skipped, and a lazy-transport fallback raced `startListener` (which stopped it → `write(9)`/EBADF on the in-flight SYN). Now `connectUTP` lazily creates an outbound-only transport when needed and `startListener` retires (rather than destroys) a pre-existing one, stopping it only in `Torrent.stop()`.
+
+

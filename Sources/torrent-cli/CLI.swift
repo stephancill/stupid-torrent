@@ -24,6 +24,10 @@ struct TorrentCLI {
             await streamTest(Array(args.dropFirst(2)))
         case "stream-play":
             await streamPlay(Array(args.dropFirst(2)))
+        case "utp-echo":
+            await utpEcho(Array(args.dropFirst(2)))
+        case "utp-listen":
+            await utpListen(Array(args.dropFirst(2)))
         default:
             printUsage()
         }
@@ -37,7 +41,62 @@ struct TorrentCLI {
           torrent-cli verify <file.torrent> [--dir <dir>]
           torrent-cli tracker <announce-url> --info-hash <hex40> [--verbose]
           torrent-cli stream-test <file.torrent> [--dir <dir>] [--file <index>] [--seed-until <bytes>] [--peer host:port]
+          torrent-cli utp-echo <host> <port> [payload]
+          torrent-cli utp-listen <port>
         """)
+    }
+
+    /// µTP echo server: accepts µTP connections and echoes a 5-byte payload back. Used to validate
+    /// the responder path against a libutp (`utp-native`) initiator.
+    static func utpListen(_ args: [String]) async {
+        guard let port = args.first.flatMap({ UInt16($0) }) else {
+            print("usage: torrent-cli utp-listen <port>")
+            return
+        }
+        do {
+            let socket = try UDPSocket()
+            try socket.bind(port: port)
+            let transport = UTPTransport(socket: socket) { connection, remote in
+                let stream = UTPStream(connection: connection)
+                print("UTP accepted from \(remote.host):\(remote.port)")
+                if let data = try? await stream.read(exactly: 5) {
+                    print("UTP responder got: \(String(decoding: data, as: UTF8.self))")
+                    try? await stream.send(data)
+                    print("UTP responder echoed")
+                }
+            }
+            await transport.start()
+            print("UTP listening on \(port)")
+            try await Task.sleep(for: .seconds(20))
+            await transport.stop()
+        } catch {
+            print("FAILED: \(error)")
+        }
+    }
+
+    /// Interop check against a libutp (`utp-native`) echo server: connects over µTP, sends a
+    /// payload, reads the echoed bytes back.
+    static func utpEcho(_ args: [String]) async {
+        guard args.count >= 2, let port = UInt16(args[1]) else {
+            print("usage: torrent-cli utp-echo <host> <port> [payload]")
+            return
+        }
+        let host = args[0]
+        let payload = args.count >= 3 ? args[2] : "hello-utp"
+        do {
+            let socket = try UDPSocket()
+            let transport = UTPTransport(socket: socket)
+            await transport.start()
+            defer { Task { await transport.stop() } }
+            let connection = await transport.connect(to: PeerAddress(host: host, port: port))
+            try await connection.startAsInitiator(timeout: .seconds(5))
+            print("UTP connected to \(host):\(port)")
+            _ = try await connection.write(Data(payload.utf8))
+            let echo = try await connection.read(exactly: payload.utf8.count)
+            print("ECHO: \(String(decoding: echo, as: UTF8.self))")
+        } catch {
+            print("FAILED: \(error)")
+        }
     }
 
     static func add(_ args: [String]) async {

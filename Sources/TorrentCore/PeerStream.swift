@@ -5,10 +5,18 @@ public enum PeerStreamError: Error, Sendable {
     case timeout
 }
 
+/// A byte-stream transport for a peer connection (TCP via `PeerStream`, µTP via `UTPStream`).
+/// `PeerSession` runs the BitTorrent protocol over whichever transport it's given.
+public protocol PeerTransport: AnyObject, Sendable {
+    func send(_ data: Data) async throws
+    func read(exactly count: Int) async throws -> Data
+    func close()
+}
+
 /// A length-buffered byte stream over a BSD TCP socket. Reads are sequential and
 /// `read(exactly:)` blocks until the requested byte count is available. A background reader
 /// thread fills the buffer so `read(exactly:)` can suspend until enough bytes arrive.
-public final class PeerStream: @unchecked Sendable {
+public final class PeerStream: @unchecked Sendable, PeerTransport {
     private let socket: TCPSocket
     private let host: String
     private let port: UInt16
