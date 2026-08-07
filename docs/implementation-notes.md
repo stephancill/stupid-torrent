@@ -428,4 +428,13 @@ User reported a torrent (John Wilson S03) reappearing every launch after being d
 
 **Fix** (`TorrentStore.remove`): scan `torrentsURL` for any `.torrent` whose parsed `Metainfo.infoHash` equals the item's id and delete that — robust to displayName/name divergences. Data files + `.verified` sidecar were already deleted by info-hash-derived paths (unaffected). 49 tests green.
 
+### 2026-08-08 — Torrent list & detail polish: ETA, fonts, section rename
+
+- **List rows** (`Views.swift`): torrent titles are now `.body` (were `.headline`), and the trailing timestamp is `.body` (was `.caption`).
+- **Section rename**: the download section header is now "In Progress" (was "Downloading").
+- **ETA in the list**: in-progress rows show `ETA <1m`/`ETA 12m`/`ETA 3h`… (remaining bytes ÷ download rate) instead of the added timestamp; complete/no-status rows still show the added time.
+- **ETA in the detail view**: the Status section gained a persistent `ETA` row — it always renders, showing `-` when it can't be computed (stalled/zero rate), rather than hiding.
+- Refactored the remaining-time math into shared helpers `remainingSeconds(_:metainfo:)` and `durationString(_:)`, used by both the row and the detail view.
+- Built + installed to the `NoFeedSocial iOS 26.3` simulator.
+
 

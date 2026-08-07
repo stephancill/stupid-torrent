@@ -32,7 +32,7 @@ struct ContentView: View {
                                     row(item)
                                 }
                             } header: {
-                                Text("Downloading")
+                                Text("In Progress")
                                     .font(.headline)
                                     .foregroundStyle(.primary)
                                     .textCase(nil)
@@ -132,11 +132,11 @@ struct ResolvingTorrentRow: View {
                 .controlSize(.small)
                 .frame(width: 16, height: 16)
             Text(item.name)
-                .font(.headline)
+                .font(.body)
                 .lineLimit(1)
             Spacer()
             Text(relativeTime(item.addedAt))
-                .font(.caption)
+                .font(.body)
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
@@ -162,14 +162,20 @@ struct TorrentRow: View {
                     .frame(width: 16, height: 16)
             }
             Text(item.name)
-                .font(.headline)
+                .font(.body)
                 .lineLimit(1)
             Spacer()
-            Text(relativeTime(item.addedAt))
-                .font(.caption)
+            Text(eta ?? relativeTime(item.addedAt))
+                .font(.body)
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
+    }
+
+    private var eta: String? {
+        guard let status = item.status,
+              let seconds = remainingSeconds(status, metainfo: item.metainfo) else { return nil }
+        return "ETA \(durationString(seconds))"
     }
 }
 
@@ -253,6 +259,7 @@ struct TorrentDetailView: View {
                     LabeledContent("Progress", value: "\(Int(status.progress * 100))%")
                     LabeledContent("Pieces", value: "\(status.verifiedCount)/\(status.pieceCount)")
                     LabeledContent("Download", value: byteRateString(status.downloadRate))
+                    LabeledContent("ETA", value: remainingSeconds(status, metainfo: item.metainfo).map(durationString) ?? "-")
                     LabeledContent("Peers", value: "\(status.peers) (\(status.seeds) seeds)")
                 }
             }
@@ -454,6 +461,28 @@ func relativeTime(_ date: Date) -> String {
     let seconds = max(0, Int(Date().timeIntervalSince(date)))
     if seconds < 60 { return "now" }
     let minutes = seconds / 60
+    if minutes < 60 { return "\(minutes)m" }
+    let hours = minutes / 60
+    if hours < 24 { return "\(hours)h" }
+    let days = hours / 24
+    if days < 30 { return "\(days)d" }
+    let months = days / 30
+    if months < 12 { return "\(months)mo" }
+    return "\(months / 12)y"
+}
+
+func remainingSeconds(_ status: TorrentStatus, metainfo: Metainfo) -> Double? {
+    guard !status.isComplete, status.downloadRate > 0 else { return nil }
+    let total = metainfo.files.reduce(Int64(0)) { $0 + Int64($1.length) }
+    let remaining = Double(total) * (1 - status.progress)
+    guard remaining > 0 else { return nil }
+    return remaining / status.downloadRate
+}
+
+func durationString(_ seconds: Double) -> String {
+    let s = max(0, Int(seconds))
+    if s < 60 { return "<1m" }
+    let minutes = s / 60
     if minutes < 60 { return "\(minutes)m" }
     let hours = minutes / 60
     if hours < 24 { return "\(hours)h" }
