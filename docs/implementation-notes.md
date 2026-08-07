@@ -382,4 +382,8 @@ The recurring symptom across marginal swarms (Odyssey/Incredibles/John Wilson: d
 - **Peer idle timeout** (`PeerSession.swift`): a peer that sends nothing for 30 s is disconnected (closing its stream, which unblocks the read) so its pool slot frees up for a live seeder. On marginal swarms the reachable peers frequently stop delivering after a few blocks; without this they held slots forever while we kept requesting. The read loop's `readWithTimeout` wraps each length read in a task-group race with a 30 s timer.
 - **Empty state** (`Views.swift`): when there are no torrents (and nothing resolving), the list is replaced by a plain `ContentUnavailableView` ("No Torrents" / arrow-down icon / "Add a magnet link or a .torrent file to start downloading.") inside a `Group` — matching `stupid-authenticator`'s empty state. Adding stays on the toolbar + button.
 
+### 2026-08-07 — Handle `magnet://` deep links
+
+Safari offered to open the app for magnet links (the `magnet` URL scheme was registered in Info.plist) but nothing happened — there was no `onOpenURL` handler, so the URL was dropped. **Fix** (`Views.swift`): `.onOpenURL` calls `store.addMagnet(url.absoluteString)` for `magnet`-scheme URLs, mirroring `stupid-authenticator`'s `importOTPAUTH`. Verified on the simulator with `simctl openurl "magnet:?xt=urn:btih:c9e15763..."` — the app immediately started `bootstrap: querying DHT for peers`.
+
 

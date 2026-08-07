@@ -101,6 +101,14 @@ struct ContentView: View {
         .onAppear {
             store.restore()
         }
+        .onOpenURL { url in
+            guard url.scheme?.lowercased() == "magnet" else { return }
+            do {
+                try store.addMagnet(url.absoluteString)
+            } catch {
+                store.addError = error.localizedDescription
+            }
+        }
     }
 
     private func row(_ item: TorrentItem) -> some View {
