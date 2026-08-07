@@ -422,4 +422,10 @@ Observed in the app: on every launch, **completed** torrents (restored from thei
 - **Download field units** (`Views.swift`): added `byteRateString` and the Download row now shows e.g. "1.4 MB/s" instead of the raw `byteString` (which is for file sizes, no `/s`).
 - **Backrooms not streamable — expected**: the release is `.mkv`; `Torrent.contentType(forFileNamed:)` whitelists only AVPlayer-demuxable containers (mp4/m4v/mov/m4a/mp3/aac/wav), so mkv rows are `.disabled`. AVFoundation can't demux MKV even though the x265 stream inside is HEVC — this is the documented mkv/webm/avi limitation (QuickLook fallback; VLCKit future work).
 
+### 2026-08-08 — Deletion fix: `.torrent` removal must match by info hash, not displayName
+
+User reported a torrent (John Wilson S03) reappearing every launch after being deleted 3 times. Root cause: `TorrentStore.remove` deleted the persisted `.torrent` by reconstructing its filename from `item.name` (= `metainfo.displayName`), but the file on disk was saved under a *different* name. John Wilson was imported as a `.torrent` file (file `name` `...x264[eztv.re]`), then its persisted copy gained a `stupid-torrent-display-name` of `...x264[eztv.re][eztvx.to]` (the magnet `dn`). So `remove` tried to delete `...x264[eztv.re][eztvx.to].torrent` — which never existed — the `try?` swallowed the failure, and `restore()` re-added the torrent from the surviving file on every launch.
+
+**Fix** (`TorrentStore.remove`): scan `torrentsURL` for any `.torrent` whose parsed `Metainfo.infoHash` equals the item's id and delete that — robust to displayName/name divergences. Data files + `.verified` sidecar were already deleted by info-hash-derived paths (unaffected). 49 tests green.
+
 

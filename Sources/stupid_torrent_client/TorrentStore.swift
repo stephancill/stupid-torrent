@@ -145,8 +145,21 @@ final class TorrentStore {
         items.removeAll { $0.id == item.id }
         addedDates.removeValue(forKey: item.id)
         saveDates()
-        let url = torrentsURL.appendingPathComponent(item.name.replacingOccurrences(of: "/", with: "-") + ".torrent")
-        try? FileManager.default.removeItem(at: url)
+        // Delete the persisted .torrent by matching its info hash, not by reconstructing the
+        // filename from displayName: a magnet-resolved torrent's displayName (the `dn` param, e.g.
+        // "...x264[eztv.re][eztvx.to]") can differ from the filename it was saved under (e.g.
+        // "...x264[eztv.re].torrent"), so a name-based delete silently misses the file and the
+        // torrent is re-added by restore() on the next launch.
+        if let files = try? FileManager.default.contentsOfDirectory(atPath: torrentsURL.path) {
+            for name in files where name.hasSuffix(".torrent") {
+                let url = torrentsURL.appendingPathComponent(name)
+                guard let data = try? Data(contentsOf: url),
+                      let metainfo = try? Metainfo(data: data),
+                      metainfo.infoHash.hexString == item.id else { continue }
+                try? FileManager.default.removeItem(at: url)
+                break
+            }
+        }
         // Also remove the downloaded data and the resume sidecar so nothing is orphaned.
         for file in item.metainfo.files {
             var fileURL = downloadsURL
