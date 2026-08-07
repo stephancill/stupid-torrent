@@ -287,4 +287,16 @@ Verified: after the fix, the statuses received by the UI on reopen are `seeding 
 
 **Note**: this pulls MSE/PE (BEP 10) out of the deferred list (planning.md line 10/134). µTP (BEP 29), WebRTC, and web seeds remain deferred.
 
+### 2026-08-06 — Simulator diagnosis + block-request diagnostics
+
+- Deployed to the `NoFeedSocial iOS 26.3` simulator. Debugged "struggling to find peers" on The Odyssey: MSE/PE now connects to RC4 peers and DHT finds 100+ peers, but data stalled at 0 pieces.
+- **Root cause investigation**: added verbose diagnostics to `refillPipeline` (`PeerSession`) and `nextBlockRequest` (`Torrent`) logging whether we request blocks and the picker state. Confirmed the engine's data path works end-to-end (BBB downloads to 1055/1055 on the same simulator); the Odyssey stall is swarm quality (peers unchoke but send 0 bytes), plus WebTorrent's active session held the good peers' per-IP slots.
+- Committed the diagnostics as `b8274e7` (verbose-only, off by default).
+
+### 2026-08-06 — µTP (BEP 29) work-in-progress → handed off
+
+- Began implementing µTP transport so we can reach µTP-only peers (WebTorrent's remaining advantage on the Odyssey swarm). **In progress, not committed** — see `docs/utp-handover.md` for full details, references, known bugs, and the interop test setup against `utp-native` (libutp).
+- Files (uncommitted): `UTP.swift` (wire codec), `UTPConnection.swift` (per-connection state machine), `UTPTransport.swift` (UDP demux + retransmit ticker), and a `UDPSocket.receiveFrom` addition.
+- Known blocker: `UTPTransport` receive loop runs on a raw `Thread` but its handlers are actor-isolated, so inbound packets aren't processed (the Node libutp server received our SYN, proving the codec + SYN are correct). Fix is to run the receive loop as a detached `Task`.
+
 (New entries go here as work progresses.)
