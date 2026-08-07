@@ -14,47 +14,57 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            List {
-                if !store.resolvingItems.isEmpty || !downloadingItems.isEmpty {
-                    Section {
-                        ForEach(store.resolvingItems) { item in
-                            ResolvingTorrentRow(item: item)
-                        }
-                        ForEach(downloadingItems) { item in
-                            row(item)
-                        }
-                    } header: {
-                        Text("Downloading")
-                            .font(.headline)
-                            .foregroundStyle(.primary)
-                            .textCase(nil)
-                    }
-                }
-                if !completedItems.isEmpty {
-                    Section {
-                        if showCompleted {
-                            ForEach(completedItems) { item in
-                                row(item)
-                            }
-                        }
-                    } header: {
-                        Button {
-                            showCompleted.toggle()
-                        } label: {
-                            HStack {
-                                Text("Completed")
+            Group {
+                if store.items.isEmpty && store.resolvingItems.isEmpty {
+                    ContentUnavailableView(
+                        "No Torrents",
+                        systemImage: "arrow.down.circle",
+                        description: Text("Add a magnet link or a .torrent file to start downloading.")
+                    )
+                } else {
+                    List {
+                        if !store.resolvingItems.isEmpty || !downloadingItems.isEmpty {
+                            Section {
+                                ForEach(store.resolvingItems) { item in
+                                    ResolvingTorrentRow(item: item)
+                                }
+                                ForEach(downloadingItems) { item in
+                                    row(item)
+                                }
+                            } header: {
+                                Text("Downloading")
                                     .font(.headline)
                                     .foregroundStyle(.primary)
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .foregroundStyle(.tint)
-                                    .rotationEffect(.degrees(showCompleted ? 90 : 0))
-                                    .animation(.easeInOut(duration: 0.2), value: showCompleted)
+                                    .textCase(nil)
                             }
-                            .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
-                        .textCase(nil)
+                        if !completedItems.isEmpty {
+                            Section {
+                                if showCompleted {
+                                    ForEach(completedItems) { item in
+                                        row(item)
+                                    }
+                                }
+                            } header: {
+                                Button {
+                                    showCompleted.toggle()
+                                } label: {
+                                    HStack {
+                                        Text("Completed")
+                                            .font(.headline)
+                                            .foregroundStyle(.primary)
+                                        Spacer()
+                                        Image(systemName: "chevron.right")
+                                            .foregroundStyle(.tint)
+                                            .rotationEffect(.degrees(showCompleted ? 90 : 0))
+                                            .animation(.easeInOut(duration: 0.2), value: showCompleted)
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .textCase(nil)
+                            }
+                        }
                     }
                 }
             }

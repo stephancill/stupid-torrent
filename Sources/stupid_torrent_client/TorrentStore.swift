@@ -141,5 +141,14 @@ final class TorrentStore {
         saveDates()
         let url = torrentsURL.appendingPathComponent(item.name.replacingOccurrences(of: "/", with: "-") + ".torrent")
         try? FileManager.default.removeItem(at: url)
+        // Also remove the downloaded data and the resume sidecar so nothing is orphaned.
+        for file in item.metainfo.files {
+            var fileURL = downloadsURL
+            for component in file.pathComponents {
+                fileURL.appendPathComponent(component)
+            }
+            try? FileManager.default.removeItem(at: fileURL)
+        }
+        try? FileManager.default.removeItem(at: downloadsURL.appendingPathComponent(".\(item.id).verified"))
     }
 }

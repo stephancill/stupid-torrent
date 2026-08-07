@@ -25,6 +25,9 @@ public final class PeerSession: @unchecked Sendable {
     private var peerChoked = true
     private var outstanding: Set<BlockKey> = []
     private let maxOutstanding = 48
+    /// A peer that sends nothing for this long while we're connected is considered dead and
+    /// disconnected, freeing its pool slot for a live seeder.
+    private let peerIdleTimeout = Duration.seconds(30)
 
     public init(torrent: Torrent, address: PeerAddress, infoHash: Data, peerID: Data, stream: any PeerTransport, isInitiator: Bool, supportsMSE: Bool = true) {
         self.torrent = torrent
@@ -115,7 +118,7 @@ public final class PeerSession: @unchecked Sendable {
 
     private func receiveLoop() async throws {
         while true {
-            let lengthData = try await stream.read(exactly: 4)
+            let lengthData = try await readWithTimeout(exactly: 4)
             let length = Int(lengthData.readUInt32BE(at: 0))
             if length == 0 { continue } // keepalive
             let body = try await stream.read(exactly: length)
@@ -149,6 +152,25 @@ public final class PeerSession: @unchecked Sendable {
             case .extended:
                 break
             }
+        }
+    }
+
+    /// Reads `count` bytes but gives up (closing the stream) if the peer sends nothing within
+    /// `peerIdleTimeout` — a peer that stops delivering data holds a pool slot that a live seeder
+    /// could use, so cycle it out.
+    private func readWithTimeout(exactly count: Int) async throws -> Data {
+        try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask {
+                try await self.stream.read(exactly: count)
+            }
+            group.addTask {
+                try? await Task.sleep(for: self.peerIdleTimeout)
+                if Task.isCancelled { return Data() }
+                self.stream.close()
+                throw PeerStreamError.timeout
+            }
+            defer { group.cancelAll() }
+            return try await group.next() ?? Data()
         }
     }
 

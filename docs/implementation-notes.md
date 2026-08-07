@@ -373,4 +373,13 @@ The recurring symptom across marginal swarms (Odyssey/Incredibles/John Wilson: d
 
 **Verification**: John Wilson S03 (which previously stalled at 96/103 forever) now verifies pieces (19 verified and SHA-1-correct in a few minutes); BBB regression: 70 pieces verified in 60 s at 2.5 MB/s, 0 verify failures. 49 tests green. Deployed to the simulator.
 
+### 2026-08-07 — Removing a torrent also deletes its data files
+
+`TorrentStore.remove` only deleted the persisted `.torrent`; the downloaded data files and the `.verified` resume sidecar were left orphaned in `Documents/downloads/`. **Fix** (`TorrentStore.swift`): `remove(_:)` now also deletes every `metainfo.files` path (relative to `downloadsURL`) and the `.\(infoHash).verified` sidecar. Cleaned up the already-orphaned Odyssey/Incredibles files from the simulator container by hand.
+
+### 2026-08-07 — Peer idle timeout + empty state
+
+- **Peer idle timeout** (`PeerSession.swift`): a peer that sends nothing for 30 s is disconnected (closing its stream, which unblocks the read) so its pool slot frees up for a live seeder. On marginal swarms the reachable peers frequently stop delivering after a few blocks; without this they held slots forever while we kept requesting. The read loop's `readWithTimeout` wraps each length read in a task-group race with a 30 s timer.
+- **Empty state** (`Views.swift`): when there are no torrents (and nothing resolving), the list is replaced by a plain `ContentUnavailableView` ("No Torrents" / arrow-down icon / "Add a magnet link or a .torrent file to start downloading.") inside a `Group` — matching `stupid-authenticator`'s empty state. Adding stays on the toolbar + button.
+
 
