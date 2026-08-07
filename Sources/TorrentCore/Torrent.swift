@@ -108,6 +108,16 @@ public actor Torrent {
         try? await storage.loadVerified()
         picker = PiecePicker(pieceCount: metainfo.pieceCount, verified: await storage.verifiedBitfield)
 
+        // A torrent that is already complete has nothing to do on the network: no announce, no DHT
+        // peer lookup, no listener, no seeding. It just sits there so the user can access and
+        // stream the downloaded files. (Streaming reads reopen file handles on demand, so we don't
+        // close storage here — `stop()` closes it on removal.)
+        if picker.verified.allSet {
+            await publishStatus()
+            isRunning = false
+            return
+        }
+
         announceTask = Task { [weak self] in
             await self?.announceLoop()
         }
@@ -165,15 +175,17 @@ public actor Torrent {
 
     func nextBlockRequest(for peer: PeerSession) async -> Block? {
         guard !bannedPeers.contains(peer.id) else { return nil }
-        // Prefer an active piece with remaining blocks, lowest index first.
+        // Prefer an active piece with remaining blocks, lowest index first. Only request blocks
+        // for pieces the peer claims to have (its bitfield/have messages); a peer without the
+        // piece can never serve it, so requesting is wasted round-trips.
         let sortedActive = activePieces.sorted()
         for piece in sortedActive {
-            if let block = nextBlock(in: piece) {
+            if peer.hasPiece(piece), let block = nextBlock(in: piece) {
                 registerOutstanding(block, peer: peer)
                 return block
             }
         }
-        guard let piece = picker.nextPiece() else {
+        guard let piece = picker.nextPiece(available: { peer.hasPiece($0) }) else {
             TorrentLog.log("nextBlockRequest[\(metainfo.name)]: picker empty (active=\(activePieces.count) verified=\(picker.verified.setCount)/\(metainfo.pieceCount) requested=\(picker.requested.setCount) cursor=\(picker.cursor))")
             return nil
         }
@@ -331,11 +343,14 @@ public actor Torrent {
     /// allocated once but the peer never delivered them) is requeued so the missing blocks get
     /// re-requested — possibly from a different peer. Keeps already-received blocks.
     private func requeueStalledPiece(_ piece: Int) {
-        picker.clearRequested(piece)
-        activePieces.remove(piece)
-        // Keep receivedBlocks; re-request from the next missing offset. Reset the byte counter
-        // so re-received blocks re-count toward completion.
-        pieceReceivedBytes[piece] = 0
+        // Keep the piece ACTIVE (don't clearRequested/remove from activePieces): the sequential
+        // picker's cursor has moved past it, so un-requesting it would let the last ~N blocks of a
+        // near-complete piece sit unrequested forever. Staying active means the next peer refill
+        // serves its missing blocks immediately, while the stall timer still bounds a dead piece.
+        // Keep receivedBlocks AND pieceReceivedBytes: a requeued piece re-requests only its
+        // missing blocks, and duplicates of already-received blocks are discarded, so resetting
+        // the byte counter here would make the piece never reach receivedBytes >= pieceLength
+        // (already-received bytes would never be re-counted) — it would verify-loop forever.
         pieceBlockCursor[piece] = nextMissingOffset(piece)
         pieceLastProgress.removeValue(forKey: piece)
         for key in outstanding.keys where key.index == piece {
@@ -486,7 +501,8 @@ public actor Torrent {
                 peerID: peerID,
                 stream: stream,
                 isInitiator: true,
-                supportsMSE: false
+                supportsMSE: false,
+                pieceCount: metainfo.pieceCount
             )
             activePeerIDs.insert(session.id)
             peerSessions[session.id] = session
@@ -536,7 +552,8 @@ public actor Torrent {
                 infoHash: metainfo.infoHash,
                 peerID: peerID,
                 stream: stream,
-                isInitiator: true
+                isInitiator: true,
+                pieceCount: metainfo.pieceCount
             )
             activePeerIDs.insert(session.id)
             peerSessions[session.id] = session
@@ -609,7 +626,8 @@ public actor Torrent {
             peerID: peerID,
             stream: stream,
             isInitiator: false,
-            supportsMSE: false
+            supportsMSE: false,
+            pieceCount: metainfo.pieceCount
         )
         activePeerIDs.insert(session.id)
         peerSessions[session.id] = session
@@ -627,7 +645,8 @@ public actor Torrent {
             infoHash: metainfo.infoHash,
             peerID: peerID,
             stream: stream,
-            isInitiator: false
+            isInitiator: false,
+            pieceCount: metainfo.pieceCount
         )
         activePeerIDs.insert(session.id)
         peerSessions[session.id] = session

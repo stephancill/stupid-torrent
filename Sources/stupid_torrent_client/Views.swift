@@ -238,6 +238,7 @@ struct TorrentDetailView: View {
 
     @State private var streamSession: TorrentStreamSession?
     @State private var showPlayer = false
+    @State private var copiedMagnet = false
 
     private var fileIndicesBySize: [Int] {
         item.metainfo.files.indices.sorted {
@@ -251,8 +252,7 @@ struct TorrentDetailView: View {
                 Section("Status") {
                     LabeledContent("Progress", value: "\(Int(status.progress * 100))%")
                     LabeledContent("Pieces", value: "\(status.verifiedCount)/\(status.pieceCount)")
-                    LabeledContent("Download", value: byteString(status.downloadRate))
-                    LabeledContent("Upload", value: byteString(status.uploadRate))
+                    LabeledContent("Download", value: byteRateString(status.downloadRate))
                     LabeledContent("Peers", value: "\(status.peers) (\(status.seeds) seeds)")
                 }
             }
@@ -281,6 +281,13 @@ struct TorrentDetailView: View {
                     .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
                 }
             }
+            Section("Actions") {
+                Button {
+                    copyMagnet()
+                } label: {
+                    Label(copiedMagnet ? "Copied" : "Copy Magnet", systemImage: copiedMagnet ? "checkmark" : "link")
+                }
+            }
         }
         .navigationTitle(item.name)
         #if os(iOS)
@@ -296,6 +303,23 @@ struct TorrentDetailView: View {
             }
         }
         #endif
+    }
+
+    private func copyMagnet() {
+        let magnet = magnetLink(item.metainfo)
+        #if os(iOS)
+        UIPasteboard.general.string = magnet
+        #else
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(magnet, forType: .string)
+        #endif
+        copiedMagnet = true
+        Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            await MainActor.run {
+                copiedMagnet = false
+            }
+        }
     }
 
     private func openPlayer(fileIndex: Int) {
@@ -375,11 +399,28 @@ struct VideoPlayerView: View {
 }
 #endif
 
+func magnetLink(_ metainfo: Metainfo) -> String {
+    var parts = ["xt=urn:btih:\(metainfo.infoHash.hexString)"]
+    if let dn = metainfo.displayName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+        parts.append("dn=\(dn)")
+    }
+    for tracker in metainfo.flattenedTrackers {
+        if let tr = tracker.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+            parts.append("tr=\(tr)")
+        }
+    }
+    return "magnet:?" + parts.joined(separator: "&")
+}
+
 func byteString(_ bytes: Double) -> String {
     if bytes >= 1_000_000_000 { return String(format: "%.1f GB", bytes / 1_000_000_000) }
     if bytes >= 1_000_000 { return String(format: "%.1f MB", bytes / 1_000_000) }
     if bytes >= 1_000 { return String(format: "%.1f KB", bytes / 1_000) }
     return "\(Int(bytes)) B"
+}
+
+func byteRateString(_ bytesPerSecond: Double) -> String {
+    "\(byteString(bytesPerSecond))/s"
 }
 
 struct PieProgressView: View {

@@ -60,7 +60,7 @@ final class TorrentStore {
             let url = torrentsURL.appendingPathComponent(name)
             guard let data = try? Data(contentsOf: url),
                   let metainfo = try? Metainfo(data: data) else { continue }
-            try? add(metainfo: metainfo, persist: false)
+            Task { try? await add(metainfo: metainfo, persist: false) }
         }
     }
 
@@ -77,12 +77,13 @@ final class TorrentStore {
         ))
         Task {
             do {
-                let metainfo = try await MagnetBootstrapper.metainfo(from: magnet)
+                let result = try await MagnetBootstrapper.metainfoAndPeer(from: magnet)
+                let metainfo = result.metainfo
                 if let addedAt = resolvingItems.first(where: { $0.id == id })?.addedAt {
                     addedDates[id] = addedAt
                     saveDates()
                 }
-                try add(metainfo: metainfo, persist: true)
+                try await add(metainfo: metainfo, persist: true, injectedPeer: result.metadataPeer)
                 resolvingItems.removeAll { $0.id == id }
             } catch {
                 resolvingItems.removeAll { $0.id == id }
@@ -98,10 +99,10 @@ final class TorrentStore {
         }
         let data = try Data(contentsOf: url)
         let metainfo = try Metainfo(data: data)
-        try add(metainfo: metainfo, persist: true)
+        Task { try? await add(metainfo: metainfo, persist: true) }
     }
 
-    private func add(metainfo: Metainfo, persist: Bool) throws {
+    private func add(metainfo: Metainfo, persist: Bool, injectedPeer: PeerAddress? = nil) async throws {
         guard !items.contains(where: { $0.id == metainfo.infoHash.hexString }) else {
             throw TorrentStoreError.alreadyAdded
         }
@@ -114,6 +115,11 @@ final class TorrentStore {
             saveDates()
         }
         let torrent = Torrent(directory: downloadsURL, metainfo: metainfo)
+        if let injectedPeer {
+            // The metadata-serving peer is a verified-reachable seeder; feed it straight into the
+            // download instead of re-discovering the (mostly-dead) swarm.
+            await torrent.addPeer(host: injectedPeer.host, port: injectedPeer.port)
+        }
         let verifiedCount = Storage.loadVerifiedCount(
             directory: downloadsURL,
             infoHash: metainfo.infoHash,

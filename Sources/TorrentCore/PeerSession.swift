@@ -29,7 +29,12 @@ public final class PeerSession: @unchecked Sendable {
     /// disconnected, freeing its pool slot for a live seeder.
     private let peerIdleTimeout = Duration.seconds(30)
 
-    public init(torrent: Torrent, address: PeerAddress, infoHash: Data, peerID: Data, stream: any PeerTransport, isInitiator: Bool, supportsMSE: Bool = true) {
+    /// Which pieces this peer claims to have (from its bitfield/have/have-all messages).
+    /// Peers that advertise nothing for this torrent are leechers without data; requesting blocks
+    /// from them is wasted round-trips, so the picker only serves peers with a known piece.
+    public private(set) var peerPieces: Bitfield?
+
+    public init(torrent: Torrent, address: PeerAddress, infoHash: Data, peerID: Data, stream: any PeerTransport, isInitiator: Bool, supportsMSE: Bool = true, pieceCount: Int) {
         self.torrent = torrent
         self.address = address
         self.infoHash = infoHash
@@ -37,6 +42,7 @@ public final class PeerSession: @unchecked Sendable {
         self.stream = stream
         self.isInitiator = isInitiator
         self.supportsMSE = supportsMSE
+        self.peerPieces = Bitfield(count: pieceCount)
     }
 
     public func run(handshakeBudget: Duration? = nil) async {
@@ -82,6 +88,13 @@ public final class PeerSession: @unchecked Sendable {
     /// Closes the underlying stream, causing `run()` to unwind.
     public func disconnect() {
         stream.close()
+    }
+
+    /// Whether the peer claims to have `piece`. Peers that never advertised a bitfield/have are
+    /// treated as leechers with nothing (the picker won't request from them).
+    public func hasPiece(_ piece: Int) -> Bool {
+        guard let pieces = peerPieces, piece >= 0, piece < pieces.count else { return false }
+        return pieces[piece]
     }
 
     private func performHandshake() async throws {
@@ -135,9 +148,26 @@ public final class PeerSession: @unchecked Sendable {
                 break
             case .notInterested:
                 break
-            case .have:
-                break
-            case .bitfield:
+            case .have(let index):
+                if peerPieces != nil, index >= 0, index < peerPieces!.count {
+                    peerPieces![index] = true
+                }
+                await refillPipeline()
+            case .bitfield(let bits):
+                if let pieces = peerPieces {
+                    for index in 0..<pieces.count where index < bits.count * 8 && (bits[index / 8] & (0x80 >> (index % 8))) != 0 {
+                        peerPieces![index] = true
+                    }
+                }
+                await refillPipeline()
+            case .haveAll:
+                if let pieces = peerPieces {
+                    for index in 0..<pieces.count {
+                        peerPieces![index] = true
+                    }
+                }
+                await refillPipeline()
+            case .haveNone:
                 break
             case .request(let block):
                 await serveRequest(block)

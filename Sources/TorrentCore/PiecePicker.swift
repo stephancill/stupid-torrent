@@ -25,11 +25,18 @@ public struct PiecePicker: Sendable {
     }
 
     public mutating func nextPiece() -> Int? {
+        nextPiece(available: { _ in true })
+    }
+
+    /// Returns the next piece to request from a peer that only has certain pieces. `available`
+    /// lets the caller restrict selection to pieces the peer actually holds (its bitfield), so we
+    /// never request blocks a peer can't serve. Prioritized pieces win, then lowest index.
+    public mutating func nextPiece(available: (Int) -> Bool) -> Int? {
         guard pieceCount > 0 else { return nil }
         // Prioritized pieces first: highest level, then lowest index within the level.
         for level in Set(priority.values).sorted(by: >) {
             for piece in priority.keys.filter({ priority[$0] == level }).sorted() {
-                if !verified[piece] && !requested[piece] {
+                if !verified[piece] && !requested[piece] && available(piece) {
                     cursor = (piece + 1) % pieceCount
                     return piece
                 }
@@ -37,7 +44,7 @@ public struct PiecePicker: Sendable {
         }
         for offset in 0..<pieceCount {
             let index = (cursor + offset) % pieceCount
-            if !verified[index] && !requested[index] {
+            if !verified[index] && !requested[index] && available(index) {
                 cursor = (index + 1) % pieceCount
                 return index
             }

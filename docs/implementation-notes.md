@@ -386,4 +386,40 @@ The recurring symptom across marginal swarms (Odyssey/Incredibles/John Wilson: d
 
 Safari offered to open the app for magnet links (the `magnet` URL scheme was registered in Info.plist) but nothing happened — there was no `onOpenURL` handler, so the URL was dropped. **Fix** (`Views.swift`): `.onOpenURL` calls `store.addMagnet(url.absoluteString)` for `magnet`-scheme URLs, mirroring `stupid-authenticator`'s `importOTPAUTH`. Verified on the simulator with `simctl openurl "magnet:?xt=urn:btih:c9e15763..."` — the app immediately started `bootstrap: querying DHT for peers`.
 
+### 2026-08-07 — Copy Magnet action in torrent details
+
+`TorrentDetailView` gained an "Actions" section below Files with a **Copy Magnet** button that writes the full magnet link (`magnet:?xt=urn:btih:…&dn=…&tr=…`, built from `Metainfo` via a new `magnetLink(_:)` helper in `Views.swift`) to the pasteboard (iOS `UIPasteboard`, macOS `NSPasteboard`) with a brief "Copied ✓" label state.
+
+### 2026-08-08 — Magnet resolution + download fixes for QxR live swarm (Backrooms 2026)
+
+The app failed to resolve the Backrooms magnet (webTorrent: ~1.6 s; ours: never within 120 s+) and, when the `.torrent` was used directly, downloaded at 800 KB/s but **stalled at 0 pieces forever** (pieces 3+ never verified even at 262 MB). Both root-caused against `third-party/webtorrent`.
+
+**Metadata resolution (3 bugs):**
+1. **Tracker announce was gated behind the DHT sweep.** `MagnetBootstrapper.metainfoAndPeer` swept the 314-peer DHT result (concurrency 12, up to ~12 s/peer) **before** ever announcing to trackers — the round-0 tracker announce never happened in the first ~5 min. WebTorrent's `torrent-discovery` announces to trackers at t=0. **Fix**: announce to trackers immediately, sweep tracker peers first, and sweep DHT peers concurrently (task group) instead of awaiting the ~20 s DHT lookup.
+2. **No `metadata_size` gate.** We requested ut_metadata piece 0 from *every* peer advertising `ut_metadata`, then waited the full 8 s fetch timeout for leechers that have no info dict. WebTorrent's `ut_metadata` reads `metadata_size` from the extended handshake and skips metadata-less peers instantly. **Fix**: `ExtendedHandshake.metadataSize` + `MetadataError.peerHasNoMetadata`; skip such peers immediately.
+3. **Sequential chunk requests + long per-peer timeouts.** Now request **all** metadata pieces at once (webtorrent `_requestPieces`) and tightened timeouts (fetch 8→5 s, connect 4→3 s, sweep concurrency 12→24).
+
+**Download (2 bugs):**
+1. **Stalled pieces could never complete** (`Torrent.requeueStalledPiece`): it reset `pieceReceivedBytes` to 0 while keeping `receivedBlocks`, so already-received bytes were deduped and never re-counted → `receivedBytes` could never reach `pieceLength`, so a piece stalled at e.g. 500/512 blocks verified-loop forever. **Fix**: keep the byte counter across a stall requeue.
+2. **Stalled pieces were dropped from the picker.** `requeueStalledPiece` also called `picker.clearRequested` + removed from `activePieces`; the sequential cursor had already moved past the piece, so the last ~12 blocks were never re-requested. **Fix**: keep the piece active (cursor reset to `nextMissingOffset`) so the next peer refill immediately re-requests the missing blocks; the stall timer still bounds a truly-dead piece.
+3. **Requested blocks from peers that don't have the piece.** We ignored `bitfield`/`have`/have-all/have-none entirely, so requests went to leechers that could never serve them. WebTorrent filters selection by `wire.peerPieces`. **Fix**: `PeerSession` tracks a per-peer `Bitfield` (`PeerMessageID` gained `haveAll`/`haveNone`), `nextBlockRequest`/`nextPiece(available:)` only hand out blocks the peer claims to have.
+
+**App**: `TorrentStore.addMagnet` now uses `metainfoAndPeer` and injects the metadata-serving peer straight into the download (it's a verified-reachable seeder) instead of discarding it; `add` is async to `await torrent.addPeer`.
+
+### 2026-08-08 — Completed torrents go fully idle (no announce/DHT/listener/seeding)
+
+Observed in the app: on every launch, **completed** torrents (restored from their `.verified` sidecar) were still announcing to trackers, running DHT lookups, binding TCP/µTP listeners, and seeding — `Torrent.run()` started `announceLoop`/`dhtLoop`/`startListener`/`tickerTask` unconditionally, and the `while` loop only broke afterward, having already fired a `.started` announce, a DHT query, and a port bind per completed torrent.
+
+**Fix** (`Torrent.swift`): `run()` now early-returns for torrents whose resume sidecar already marks them complete (`picker.verified.allSet`) — before starting any network machinery. It just loads the bitfield, publishes the `.seeding`/complete status, and returns. Storage is deliberately left open (streaming reads reopen file handles on demand; `stop()` closes it on removal).
+
+**Verification**: rebuilt + redeployed to the simulator. Console shows zero `announce`/`listening`/`connecting`/`nextBlockRequest` lines for the completed BBB/Sintel torrents; only the genuinely-incomplete torrents (Backrooms 9/571, John Wilson 1/1024, Cosmos 99/843) announce/listen. 49 tests green.
+
+**Verification (live QxR swarm):** metadata resolves in ~40 s worst case (previously never within 120 s; swarm-quality dependent — webTorrent's 1.6 s run had a lucky first-peer). Download: pieces now verify through stall/requeue cycles — one run verified 13 pieces (0-8 within 90 s) at up to 1.4 MB/s; the remaining `bad`/`missing` pieces at `--stop-at` are the documented overshoot (mid-flight piece at stop). Full suite: 49 tests green. Deployed to the simulator; `simctl openurl` of the magnet resolved metadata and began downloading. Note the peer bitfield change means a peer that sends no bitfield/have is treated as a leecher and gets no requests — matches webtorrent.
+
+### 2026-08-08 — Detail view: remove Upload field, Download shows /s, mkv streaming clarification
+
+- **Upload field removed** (`Views.swift`): the Status section no longer shows `Upload` — we don't seed (completed torrents are idle), so it was always 0.
+- **Download field units** (`Views.swift`): added `byteRateString` and the Download row now shows e.g. "1.4 MB/s" instead of the raw `byteString` (which is for file sizes, no `/s`).
+- **Backrooms not streamable — expected**: the release is `.mkv`; `Torrent.contentType(forFileNamed:)` whitelists only AVPlayer-demuxable containers (mp4/m4v/mov/m4a/mp3/aac/wav), so mkv rows are `.disabled`. AVFoundation can't demux MKV even though the x265 stream inside is HEVC — this is the documented mkv/webm/avi limitation (QuickLook fallback; VLCKit future work).
+
 

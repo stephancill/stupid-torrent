@@ -6,6 +6,8 @@ public enum MetadataError: Error, Sendable {
     case wrongInfoHash
     case noExtensions
     case noMetadataExtension
+    case peerHasNoMetadata
+    case rejected
     case hashMismatch
     case timedOut
     case notData
@@ -30,6 +32,16 @@ public enum ExtendedHandshake {
               case .dictionary(let m)? = dict["m"],
               let id = m["ut_metadata"]?.intValue else { return nil }
         return id
+    }
+
+    /// Reads the peer's advertised `metadata_size` from an extended-handshake payload. A peer that
+    /// supports `ut_metadata` but has no info dict (a leecher still bootstrapping) omits this field;
+    /// requesting from such a peer only burns time, so callers gate on this before requesting.
+    public static func metadataSize(from payload: Data) -> Int? {
+        guard let root = try? Bencode.decode(payload),
+              case .dictionary(let dict) = root,
+              let size = dict["metadata_size"]?.intValue else { return nil }
+        return size
     }
 }
 
@@ -84,7 +96,7 @@ public final class MetadataFetcher: @unchecked Sendable {
         self.clientPort = clientPort
     }
 
-    public func fetch(from address: PeerAddress, timeout: Duration = .seconds(8), connectTimeout: Duration = .seconds(4)) async throws -> Data {
+    public func fetch(from address: PeerAddress, timeout: Duration = .seconds(5), connectTimeout: Duration = .seconds(3)) async throws -> Data {
         let stream = try PeerStream(host: address.host, port: address.port)
         return try await withTaskCancellationHandler {
             let timeoutTask = Task {
@@ -123,51 +135,45 @@ public final class MetadataFetcher: @unchecked Sendable {
         TorrentLog.log("metadata: sent extended handshake")
 
         var metadataID: Int?
+        var metadataSize: Int?
         while metadataID == nil {
             guard let message = try await readMessage(stream) else { continue }
             if case .extended(let extID, let payload) = message, extID == 0 {
                 metadataID = ExtendedHandshake.utMetadataID(from: payload)
+                metadataSize = ExtendedHandshake.metadataSize(from: payload)
             }
         }
         guard let metadataID else { throw MetadataError.noMetadataExtension }
+        // A peer that advertises ut_metadata without a metadata_size has no info dict (it's a
+        // leecher still bootstrapping). Skip it immediately instead of requesting and waiting for
+        // data that will never come — webtorrent's ut_metadata does the same check.
+        guard let metadataSize, metadataSize > 0 else { throw MetadataError.peerHasNoMetadata }
         // The id we advertise for ut_metadata (used by the peer when sending data TO us).
         let ourMetadataID: UInt8 = 1
-        TorrentLog.log("metadata: peer ut_metadata id = \(metadataID)")
+        TorrentLog.log("metadata: peer ut_metadata id = \(metadataID), size = \(metadataSize)")
 
         let deadline = ContinuousClock.now + timeout
+        let pieceCount = (metadataSize + MetadataMessage.chunkSize - 1) / MetadataMessage.chunkSize
         var chunks: [Int: Data] = [:]
-        var totalSize: Int?
-        var nextToRequest = 0
-        func requestPiece(_ piece: Int) async throws {
+        // Request all metadata pieces up front (webtorrent's `_requestPieces` sends them all at
+        // once). Sequential request-after-data is slower and stalls on half-responders.
+        for piece in 0..<pieceCount {
             try await stream.send(MetadataMessage.request(id: metadataID, piece: piece).encode())
         }
-
-        try await requestPiece(0)
-        nextToRequest = 1
 
         while ContinuousClock.now < deadline {
             guard let message = try await readMessage(stream) else { continue }
             guard case .extended(let extID, let payload) = message, extID == ourMetadataID else { continue }
             guard let dataMessage = try? MetadataMessage.parseData(payload) else { continue }
             chunks[dataMessage.piece] = dataMessage.chunk
-            TorrentLog.log("metadata: chunk \(dataMessage.piece) (\(dataMessage.chunk.count)B, \(chunks.count) so far)")
-            totalSize = totalSize ?? dataMessage.totalSize
-            if let total = totalSize {
-                let pieceCount = (total + MetadataMessage.chunkSize - 1) / MetadataMessage.chunkSize
-                while nextToRequest < pieceCount {
-                    try await requestPiece(nextToRequest)
-                    nextToRequest += 1
-                }
-            }
-            if let total = totalSize {
-                let pieceCount = (total + MetadataMessage.chunkSize - 1) / MetadataMessage.chunkSize
-                guard chunks.count >= pieceCount else { continue }
+            TorrentLog.log("metadata: chunk \(dataMessage.piece) (\(dataMessage.chunk.count)B, \(chunks.count)/\(pieceCount))")
+            if chunks.count >= pieceCount {
                 var assembled = Data()
                 for index in 0..<pieceCount {
                     guard let chunk = chunks[index] else { break }
                     assembled.append(chunk)
                 }
-                guard assembled.count == total else { continue }
+                guard assembled.count == metadataSize else { continue }
                 if Data(Insecure.SHA1.hash(data: assembled)) == infoHash {
                     return assembled
                 }
@@ -225,10 +231,10 @@ public enum MagnetBootstrapper {
         }
 
         // Discovery runs on two fronts in parallel:
+        //   - Trackers return large peer lists that include real seeders
         //   - DHT (BEP 5) finds live, reachable peers that trackers often don't return
-        //   - Trackers return large but mostly-NAT'd/poisoned peer lists
-        // DHT peers are announced for this infohash, so they're far more likely to answer
-        // ut_metadata; sweep them first, then fall back to tracker peers.
+        // Announce to trackers FIRST, immediately (mirroring webtorrent's torrent-discovery: it
+        // announces at t=0). The DHT lookup runs concurrently and its peers are swept afterward.
         let dhtPeerTask = Task { () -> [PeerAddress] in
             guard let dhtClient else { return [] }
             defer { dhtClient.stop() }
@@ -240,56 +246,110 @@ public enum MagnetBootstrapper {
             return []
         }
 
+        if !clients.isEmpty {
+            let request = AnnounceRequest(
+                infoHash: magnet.infoHash,
+                peerID: peerID,
+                port: 6881,
+                left: 0,
+                event: .started,
+                numWant: 200,
+                key: Int32.random(in: .min ... .max)
+            )
+            await withTaskGroup(of: [PeerAddress].self) { group in
+                for client in clients {
+                    group.addTask {
+                        do {
+                            let response = try await client.announce(request)
+                            TorrentLog.log("bootstrap: announce got \(response.peers.count) peers (failure: \(response.failureReason ?? "none"))")
+                            return response.peers
+                        } catch {
+                            TorrentLog.log("bootstrap: announce failed: \(error)")
+                            return []
+                        }
+                    }
+                }
+                for await result in group {
+                    peers.append(contentsOf: result)
+                }
+            }
+        }
+
         // The swarm is overwhelmingly dead/NAT'd: only a handful of peers in a few hundred are
         // reachable and serve ut_metadata. Instead of giving up after one sample, re-announce for
         // fresh peer lists and keep sweeping until we find a cooperative peer or exhaust rounds.
+        // The tracker sweep runs FIRST and immediately (tracker peers include seeders) — do NOT
+        // block it on the DHT lookup, which takes ~20s. DHT peers are swept in parallel.
         let rounds = 6
         var seen: Set<PeerAddress> = []
         for round in 0..<rounds {
+            var candidates: [PeerAddress] = []
             if round == 0 {
-                // Sweep DHT-discovered peers first (they're live, announced for this infohash).
-                // Preserve DHT order (don't go through Set) since the first peers are the closest.
-                let dhtPeers = Array(dedup(await dhtPeerTask.value))
-                TorrentLog.log("bootstrap: sweeping \(dhtPeers.count) DHT peers for metadata")
-                if let result = try await sweepCandidates(dhtPeers, infoHash: magnet.infoHash, peerID: peerID, magnet: magnet) {
-                    return result
-                }
-                seen.formUnion(dhtPeers)
-            }
-            if !clients.isEmpty {
-                let request = AnnounceRequest(
-                    infoHash: magnet.infoHash,
-                    peerID: peerID,
-                    port: 6881,
-                    left: 0,
-                    event: .started,
-                    numWant: 200,
-                    key: Int32.random(in: .min ... .max)
-                )
-                await withTaskGroup(of: [PeerAddress].self) { group in
-                    for client in clients {
-                        group.addTask {
-                            do {
-                                let response = try await client.announce(request)
-                                TorrentLog.log("bootstrap: announce got \(response.peers.count) peers (failure: \(response.failureReason ?? "none"))")
-                                return response.peers
-                            } catch {
-                                TorrentLog.log("bootstrap: announce failed: \(error)")
-                                return []
+                // Sweep tracker-returned peers immediately. Kick off the DHT sweep concurrently
+                // (its lookup has already been running) instead of awaiting it first.
+                candidates = dedup(peers)
+            } else {
+                if !clients.isEmpty {
+                    let request = AnnounceRequest(
+                        infoHash: magnet.infoHash,
+                        peerID: peerID,
+                        port: 6881,
+                        left: 0,
+                        event: .started,
+                        numWant: 200,
+                        key: Int32.random(in: .min ... .max)
+                    )
+                    await withTaskGroup(of: [PeerAddress].self) { group in
+                        for client in clients {
+                            group.addTask {
+                                do {
+                                    let response = try await client.announce(request)
+                                    return response.peers
+                                } catch {
+                                    return []
+                                }
                             }
                         }
-                    }
-                    for await result in group {
-                        peers.append(contentsOf: result)
+                        for await result in group {
+                            peers.append(contentsOf: result)
+                        }
                     }
                 }
+                candidates = dedup(Array(Set(peers).subtracting(seen)))
             }
-            let fresh = Array(Set(peers).subtracting(seen)).prefix(300)
-            TorrentLog.log("bootstrap round \(round): \(fresh.count) fresh candidate peers (total \(Set(peers).count))")
-            if let result = try await sweepCandidates(fresh, infoHash: magnet.infoHash, peerID: peerID, magnet: magnet) {
-                return result
+            let fresh = candidates.filter { seen.insert($0).inserted }.prefix(300)
+            if round == 0, !fresh.isEmpty {
+                // Sweep tracker candidates IMMEDIATELY, and run the DHT candidate sweep in
+                // parallel — whichever finds a metadata server wins. Do NOT await the DHT lookup
+                // before starting the tracker sweep (that was the ~20s stall).
+                let result = try await withThrowingTaskGroup(of: (Metainfo, PeerAddress)?.self) { group in
+                    group.addTask {
+                        try await sweepCandidates(fresh, infoHash: magnet.infoHash, peerID: peerID, magnet: magnet)
+                    }
+                    group.addTask {
+                        let dhtPeers = dedup(await dhtPeerTask.value)
+                        return try await sweepCandidates(dhtPeers, infoHash: magnet.infoHash, peerID: peerID, magnet: magnet)
+                    }
+                    var result: (Metainfo, PeerAddress)? = nil
+                    while let next = try await group.next() {
+                        if let next {
+                            result = next
+                            group.cancelAll()
+                            break
+                        }
+                    }
+                    return result
+                }
+                if let result {
+                    seen.formUnion(fresh)
+                    return result
+                }
+            } else {
+                TorrentLog.log("bootstrap round \(round): \(fresh.count) fresh candidate peers (total \(seen.count))")
+                if let result = try await sweepCandidates(fresh, infoHash: magnet.infoHash, peerID: peerID, magnet: magnet) {
+                    return result
+                }
             }
-            seen.formUnion(fresh)
             if round < rounds - 1 {
                 try? await Task.sleep(for: .seconds(3))
             }
@@ -307,9 +367,10 @@ public enum MagnetBootstrapper {
         guard !list.isEmpty else { return nil }
         return try await withThrowingTaskGroup(of: (Data, PeerAddress)?.self) { group in
             var iterator = list.makeIterator()
-            // Keep concurrency low: peers reject/close when hammered with many simultaneous
-            // connections (we observed `write(9)`/`closed` under concurrency 30).
-            let concurrency = min(12, list.count)
+            // Balance: webtorrent opens up to ~55 outgoing connections, but too much concurrency
+            // makes peers reject/close (observed `write(9)`/`closed` at 30). 24 is a safe middle
+            // ground that cycles dead peers ~2x faster than 12.
+            let concurrency = min(24, list.count)
             for _ in 0..<concurrency {
                 guard let peer = iterator.next() else { break }
                 group.addTask {

@@ -18,6 +18,8 @@ public enum PeerMessageID: UInt8, Sendable {
     case piece = 7
     case cancel = 8
     case port = 9
+    case haveAll = 14
+    case haveNone = 15
     case extended = 20
 }
 
@@ -44,6 +46,8 @@ public enum PeerMessage: Equatable, Sendable {
     case piece(Block, Data)
     case cancel(Block)
     case port(UInt16)
+    case haveAll
+    case haveNone
     case extended(UInt8, Data)
 
     public var messageID: PeerMessageID {
@@ -58,6 +62,8 @@ public enum PeerMessage: Equatable, Sendable {
         case .piece: .piece
         case .cancel: .cancel
         case .port: .port
+        case .haveAll: .haveAll
+        case .haveNone: .haveNone
         case .extended: .extended
         }
     }
@@ -68,7 +74,7 @@ public enum PeerMessage: Equatable, Sendable {
         var payload = Data()
         payload.append(messageID.rawValue)
         switch self {
-        case .choke, .unchoke, .interested, .notInterested:
+        case .choke, .unchoke, .interested, .notInterested, .haveAll, .haveNone:
             break
         case .have(let index):
             payload.appendInt32(index)
@@ -113,6 +119,12 @@ public enum PeerMessage: Equatable, Sendable {
             return .have(payload.int32(at: 0))
         case .bitfield:
             return .bitfield(Data(payload))
+        case .haveAll:
+            guard payload.isEmpty else { throw PeerWireError.unknownMessage }
+            return .haveAll
+        case .haveNone:
+            guard payload.isEmpty else { throw PeerWireError.unknownMessage }
+            return .haveNone
         case .request, .cancel:
             guard payload.count == 12 else { throw PeerWireError.unknownMessage }
             let block = Block(index: payload.int32(at: 0), begin: payload.int32(at: 4), length: payload.int32(at: 8))
