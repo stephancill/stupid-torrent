@@ -32,7 +32,18 @@ public actor Torrent {
     private var peerSessions: [UUID: PeerSession] = [:]
     private var bannedPeers: Set<UUID> = []
     private var peerFailures: [UUID: Int] = [:]
+    /// Peers currently in a connect attempt (socket dialing/handshaking). Removed once the
+    /// connection is established, so `pendingPeerAddresses.count + activePeerIDs.count` counts
+    /// connecting + connected exactly (mirrors webtorrent's `_numPending + _numConns`).
     private var pendingPeerAddresses: Set<PeerAddress> = []
+    /// FIFO of discovered-but-unconnected peers. `drainPeerPool()` pops from this and dials while
+    /// the pool has room; slots freed by a disconnect are refilled immediately (mirrors
+    /// webtorrent's `_queue` + `_drain()`).
+    private var peerQueue: [PeerAddress] = []
+    private var queuedPeerAddresses: Set<PeerAddress> = []
+    /// Reconnect backoff per address: [1s, 5s, 15s] (mirrors webtorrent's RECONNECT_WAIT).
+    private var connectAttempts: [PeerAddress: Int] = [:]
+    private let maxReconnectAttempts = 3
     private var trackerClients: [any TrackerClient] = []
 
     private var listener: TCPListener?
@@ -164,6 +175,9 @@ public actor Torrent {
             await transport.stop()
         }
         retiredUTPTransports.removeAll()
+        peerQueue.removeAll()
+        queuedPeerAddresses.removeAll()
+        connectAttempts.removeAll()
         disconnectAllPeers()
         let _ = await announceAll(event: .stopped)
         try? await storage.saveVerified()
@@ -293,6 +307,9 @@ public actor Torrent {
                 pieceBlockCursor[key.index] = min(cursor, key.begin)
             }
         }
+        // A freed slot should immediately pull the next queued peer (webtorrent's `_drain` runs on
+        // every `removePeer`), so the pool stays full instead of waiting for the next announce.
+        drainPeerPool()
         await publishStatus()
     }
 
@@ -458,28 +475,75 @@ public actor Torrent {
         return maxInterval
     }
 
+    /// Adds a peer address to the connection queue and drains the pool. The pool is always kept
+    /// at/near `maxActivePeers`: every queue add and every freed slot triggers a drain, so the
+    /// client stays connected to as many live peers as possible (mirrors webtorrent's `_drain`).
     private func considerPeer(_ address: PeerAddress) {
-        guard pendingPeerAddresses.count + activePeerIDs.count < maxActivePeers else { return }
-        guard !pendingPeerAddresses.contains(address) else { return }
-        pendingPeerAddresses.insert(address)
-        TorrentLog.log("connecting to \(address.host):\(address.port)")
-        let torrent = self
-        Task {
-            await torrent.runPeerConnection(to: address)
+        guard !bannedPeers.contains(where: { peerSessions[$0]?.address == address }) else { return }
+        guard !pendingPeerAddresses.contains(address),
+              !queuedPeerAddresses.contains(address),
+              !activePeerIDs.contains(where: { peerSessions[$0]?.address == address }) else { return }
+        peerQueue.append(address)
+        queuedPeerAddresses.insert(address)
+        drainPeerPool()
+    }
+
+    private func drainPeerPool() {
+        while pendingPeerAddresses.count + activePeerIDs.count < maxActivePeers, !peerQueue.isEmpty {
+            let address = peerQueue.removeFirst()
+            queuedPeerAddresses.remove(address)
+            pendingPeerAddresses.insert(address)
+            TorrentLog.log("connecting to \(address.host):\(address.port)")
+            let torrent = self
+            Task {
+                await torrent.runPeerConnection(to: address)
+            }
         }
     }
 
     private func runPeerConnection(to address: PeerAddress) async {
-        defer {
-            pendingPeerAddresses.remove(address)
-        }
         // µTP first (reaches µTP-only peers — webtorrent's advantage on swarms like The Odyssey),
         // then TCP. A µTP session that stalls before the BT handshake falls through to TCP.
-        if await connectUTP(to: address) {
+        let utpHandshake = await connectUTP(to: address)
+        let tcpHandshake = utpHandshake ? false : await connectTCP(to: address)
+        // One reconnect schedule per address per attempt cycle (both transports tried). A peer that
+        // handshaked is real — reset its budget (webtorrent resets `retries` on handshake) so it
+        // gets fresh reconnect attempts when it drops.
+        if utpHandshake || tcpHandshake {
+            connectAttempts.removeValue(forKey: address)
+        }
+        scheduleReconnect(address)
+        await publishStatus()
+    }
+
+    /// Re-queues a peer that dropped or failed to connect, with exponential backoff, so the pool
+    /// keeps cycling candidates like webtorrent's `RECONNECT_WAIT`. Injected/manual peers and
+    /// already-queued/pending ones are not re-queued (avoids duplicate attempts).
+    private func scheduleReconnect(_ address: PeerAddress) {
+        guard isRunning else { return }
+        let attempts = connectAttempts[address] ?? 0
+        guard attempts < maxReconnectAttempts else {
+            connectAttempts.removeValue(forKey: address)
             return
         }
-        await connectTCP(to: address)
-        await publishStatus()
+        connectAttempts[address] = attempts + 1
+        let backoff = [1.0, 5.0, 15.0][attempts]
+        guard !pendingPeerAddresses.contains(address), !queuedPeerAddresses.contains(address) else { return }
+        queuedPeerAddresses.insert(address)
+        let torrent = self
+        Task {
+            try? await Task.sleep(for: .seconds(backoff))
+            await torrent.flushReconnect(address)
+        }
+    }
+
+    /// Called by the reconnect timer: moves a backoff-queued peer back into the connection queue
+    /// and drains the pool (webtorrent's `conn.on('close')` → `_addPeer` + `_drain`).
+    private func flushReconnect(_ address: PeerAddress) {
+        guard isRunning else { return }
+        guard queuedPeerAddresses.remove(address) != nil else { return }
+        peerQueue.append(address)
+        drainPeerPool()
     }
 
     private func connectUTP(to address: PeerAddress) async -> Bool {
@@ -504,6 +568,9 @@ public actor Torrent {
                 supportsMSE: false,
                 pieceCount: metainfo.pieceCount
             )
+            // Connection established: free the pending slot before the (blocking) session runs, so
+            // `pending + active` counts connecting + connected exactly, not double.
+            pendingPeerAddresses.remove(address)
             activePeerIDs.insert(session.id)
             peerSessions[session.id] = session
             TorrentLog.log("µTP connected to \(address.host):\(address.port)")
@@ -512,6 +579,7 @@ public actor Torrent {
         } catch {
             TorrentLog.log("µTP connect to \(address.host):\(address.port) failed: \(error)")
             await connection.unregister()
+            pendingPeerAddresses.remove(address)
             return false
         }
     }
@@ -533,7 +601,7 @@ public actor Torrent {
         }
     }
 
-    private func connectTCP(to address: PeerAddress) async {
+    private func connectTCP(to address: PeerAddress) async -> Bool {
         do {
             let stream = try PeerStream(host: address.host, port: address.port)
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -555,13 +623,17 @@ public actor Torrent {
                 isInitiator: true,
                 pieceCount: metainfo.pieceCount
             )
+            pendingPeerAddresses.remove(address)
             activePeerIDs.insert(session.id)
             peerSessions[session.id] = session
             TorrentLog.log("connected to \(address.host):\(address.port)")
             await session.run()
             TorrentLog.log("peer session ended \(address.host):\(address.port)")
+            return session.completedHandshake
         } catch {
+            pendingPeerAddresses.remove(address)
             TorrentLog.log("connect to \(address.host):\(address.port) failed: \(error)")
+            return false
         }
     }
 

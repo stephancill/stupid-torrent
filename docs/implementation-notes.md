@@ -437,4 +437,16 @@ User reported a torrent (John Wilson S03) reappearing every launch after being d
 - Refactored the remaining-time math into shared helpers `remainingSeconds(_:metainfo:)` and `durationString(_:)`, used by both the row and the detail view.
 - Built + installed to the `NoFeedSocial iOS 26.3` simulator.
 
+### 2026-08-08 — Peer pool mirrors webtorrent: drain-on-drop + reconnect backoff
+
+Observed: the app hovered at ~0 / 16.4 / 32.8 KB/s (1-2 blocks/s) for minutes before jumping to 500+ KB/s. Root cause vs webtorrent: our pool only connected peers at announce cycles (60-90 s), and a connected peer stayed in `pendingPeerAddresses` for its whole session, so `pending + active` double-counted live connections — we held 3-5 peers where webtorrent held 18-55.
+
+**Fix** (`Torrent.swift`) — mirrors webtorrent's `_queue` + `_drain()` + `RECONNECT_WAIT`:
+- **Peer queue + drain**: `considerPeer` appends to a FIFO `peerQueue`; `drainPeerPool()` pops and dials while `pending + active < maxActivePeers`. Called on every new peer AND every `peerDisconnected` (webtorrent calls `_drain()` on `removePeer`), so freed slots refill immediately instead of waiting for the next announce.
+- **Pending freed on connect**: `pendingPeerAddresses` is removed once the connection is established (before the blocking `session.run()`), so `pending + active` counts connecting + connected exactly.
+- **Reconnect with backoff**: `scheduleReconnect` re-queues a dropped/failed peer after `[1s, 5s, 15s]` (`flushReconnect`), capped at 3 attempts; a peer that handshaked resets its budget (webtorrent resets `retries` on handshake). µTP→TCP fallback unchanged.
+- `stop()` clears the queue/reconnect state.
+
+**Verification** (live QxR swarm): pool now holds **20-47 peers** (was 2-5); ~766 connect attempts in 60 s (was ~96 in 90 s). Pieces verify through stall/requeue cycles (piece 0 reached 512/512 bytes after two 20 s stalls); speeds reach 500-880 KB/s. Full suite: 49 tests green.
+
 
