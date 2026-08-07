@@ -156,7 +156,10 @@ public actor Torrent {
                 return block
             }
         }
-        guard let piece = picker.nextPiece() else { return nil }
+        guard let piece = picker.nextPiece() else {
+            TorrentLog.log("nextBlockRequest[\(metainfo.name)]: picker empty (active=\(activePieces.count) verified=\(picker.verified.setCount)/\(metainfo.pieceCount) requested=\(picker.requested.setCount) cursor=\(picker.cursor))")
+            return nil
+        }
         picker.markRequested(piece)
         activePieces.insert(piece)
         receivedBlocks[piece] = []

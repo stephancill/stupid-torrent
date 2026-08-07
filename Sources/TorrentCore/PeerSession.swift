@@ -120,12 +120,16 @@ public final class PeerSession: @unchecked Sendable {
     private func refillPipeline() async {
         var batch = Data()
         while !peerChoked, outstanding.count < maxOutstanding {
-            guard let block = await torrent.nextBlockRequest(for: self) else { break }
+            guard let block = await torrent.nextBlockRequest(for: self) else {
+                TorrentLog.log("\(address.host): refill -> no block (picker empty)")
+                break
+            }
             let key = BlockKey(index: block.index, begin: block.begin)
             outstanding.insert(key)
             batch.append(PeerMessage.request(block).encode())
         }
         guard !batch.isEmpty else { return }
+        TorrentLog.log("\(address.host): requesting \(outstanding.count) blocks")
         do {
             try await stream.send(batch)
         } catch {
