@@ -13,12 +13,20 @@ public actor Torrent {
 
     var picker: PiecePicker
     private var receivedBlocks: [Int: Set<Int>] = [:]
+    /// Total distinct bytes received per piece. Some peers coalesce a piece's final (short) block
+    /// into the last full block, so per-offset block counting can never reach the needed count even
+    /// though the data is complete on disk — byte coverage is the reliable completion signal.
+    private var pieceReceivedBytes: [Int: Int] = [:]
     private var pieceBlockCursor: [Int: Int] = [:]
     private var activePieces: Set<Int> = []
     private var outstanding: [BlockKey: UUID] = [:]
     private var blockSenders: [BlockKey: UUID] = [:]
     private var pieceFailures: [Int: Int] = [:]
     private let maxPieceFailures = 5
+    /// When each active piece last received a block. Pieces that stop making progress are
+    /// requeued (stall detection) so their never-arriving blocks get re-requested.
+    private var pieceLastProgress: [Int: ContinuousClock.Instant] = [:]
+    private let stallTimeout = Duration.seconds(20)
 
     private var activePeerIDs: Set<UUID> = []
     private var peerSessions: [UUID: PeerSession] = [:]
@@ -171,8 +179,11 @@ public actor Torrent {
         }
         picker.markRequested(piece)
         activePieces.insert(piece)
-        receivedBlocks[piece] = []
-        pieceBlockCursor[piece] = 0
+        // Keep progress already made on a piece that was requeued after a stall (don't wipe the
+        // blocks we've already received); only a brand-new piece starts from scratch.
+        if receivedBlocks[piece] == nil { receivedBlocks[piece] = [] }
+        if pieceReceivedBytes[piece] == nil { pieceReceivedBytes[piece] = 0 }
+        if pieceBlockCursor[piece] == nil { pieceBlockCursor[piece] = 0 }
         if let block = nextBlock(in: piece) {
             registerOutstanding(block, peer: peer)
             return block
@@ -204,6 +215,9 @@ public actor Torrent {
         guard isNew else { return } // duplicate block
 
         downloadedBytes += Int64(data.count)
+        pieceLastProgress[block.index] = ContinuousClock.now
+        let receivedBytes = (pieceReceivedBytes[block.index] ?? 0) + data.count
+        pieceReceivedBytes[block.index] = receivedBytes
         do {
             try await storage.writeBlock(piece: block.index, offset: block.begin, data: data)
         } catch {
@@ -212,8 +226,10 @@ public actor Torrent {
             return
         }
 
-        let needed = neededBlockCount(block.index)
-        guard blocks.count >= needed else { return }
+        // Completion is signalled by byte coverage, not block count: a peer may coalesce the
+        // piece's final short block into the last full block, so the offset set can fall one short
+        // of `needed` while all bytes are present. SHA-1 verify is the real gate.
+        guard receivedBytes >= pieceLength(block.index) else { return }
         do {
             if try await storage.verify(piece: block.index) {
                 await completePiece(block.index)
@@ -281,8 +297,10 @@ public actor Torrent {
         await storage.markVerified(piece)
         activePieces.remove(piece)
         receivedBlocks.removeValue(forKey: piece)
+        pieceReceivedBytes.removeValue(forKey: piece)
         pieceBlockCursor.removeValue(forKey: piece)
         pieceFailures.removeValue(forKey: piece)
+        pieceLastProgress.removeValue(forKey: piece)
         for key in outstanding.keys where key.index == piece {
             outstanding.removeValue(forKey: key)
             blockSenders.removeValue(forKey: key)
@@ -300,11 +318,41 @@ public actor Torrent {
         picker.clearRequested(piece)
         activePieces.remove(piece)
         receivedBlocks.removeValue(forKey: piece)
+        pieceReceivedBytes.removeValue(forKey: piece)
         pieceBlockCursor.removeValue(forKey: piece)
+        pieceLastProgress.removeValue(forKey: piece)
         for key in outstanding.keys where key.index == piece {
             outstanding.removeValue(forKey: key)
             blockSenders.removeValue(forKey: key)
         }
+    }
+
+    /// Stall detection: an active piece that stops receiving blocks (its remaining blocks were
+    /// allocated once but the peer never delivered them) is requeued so the missing blocks get
+    /// re-requested — possibly from a different peer. Keeps already-received blocks.
+    private func requeueStalledPiece(_ piece: Int) {
+        picker.clearRequested(piece)
+        activePieces.remove(piece)
+        // Keep receivedBlocks; re-request from the next missing offset. Reset the byte counter
+        // so re-received blocks re-count toward completion.
+        pieceReceivedBytes[piece] = 0
+        pieceBlockCursor[piece] = nextMissingOffset(piece)
+        pieceLastProgress.removeValue(forKey: piece)
+        for key in outstanding.keys where key.index == piece {
+            outstanding.removeValue(forKey: key)
+            blockSenders.removeValue(forKey: key)
+        }
+    }
+
+    /// The next block offset of `piece` not yet received (its cursor resets here after a stall).
+    private func nextMissingOffset(_ piece: Int) -> Int {
+        let count = neededBlockCount(piece)
+        let received = receivedBlocks[piece] ?? []
+        for index in 0..<count {
+            let offset = index * PeerMessage.blockSize
+            if !received.contains(offset) { return offset }
+        }
+        return 0
     }
 
     private func neededBlockCount(_ piece: Int) -> Int {
@@ -601,11 +649,29 @@ public actor Torrent {
         uploadRate = Double(uploadedBytes - lastTickUploaded)
         lastTickDownloaded = downloadedBytes
         lastTickUploaded = uploadedBytes
+        requeueStalledPieces()
         if verifiedDirty {
             verifiedDirty = false
             try? await storage.saveVerified()
         }
         await publishStatus()
+    }
+
+    /// Requeues active pieces that haven't received a block recently — their remaining blocks
+    /// were allocated once but the peer never delivered them, so without this the piece never
+    /// completes (the classic "blocks written but nothing verifies" stall).
+    private func requeueStalledPieces() {
+        let now = ContinuousClock.now
+        for piece in activePieces {
+            guard let lastProgress = pieceLastProgress[piece] else {
+                pieceLastProgress[piece] = now
+                continue
+            }
+            if now - lastProgress >= stallTimeout {
+                TorrentLog.log("piece \(piece) stalled (\(now - lastProgress) no progress); requeueing")
+                requeueStalledPiece(piece)
+            }
+        }
     }
 
     private func publishStatus() async {

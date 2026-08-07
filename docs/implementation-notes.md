@@ -360,4 +360,17 @@ Hermetic end-to-end test: a **WebTorrent (node) µTP seeder** (5 MB file, `clien
 
 **Bug fixed en route**: injected peers (`--peer`) are considered before `run()` starts the listener, so `utpTransport` was nil and µTP was skipped, and a lazy-transport fallback raced `startListener` (which stopped it → `write(9)`/EBADF on the in-flight SYN). Now `connectUTP` lazily creates an outbound-only transport when needed and `startListener` retires (rather than destroys) a pre-existing one, stopping it only in `Torrent.stop()`.
 
+### 2026-08-07 — Root cause of "blocks written but nothing verifies": piece completion fix
+
+The recurring symptom across marginal swarms (Odyssey/Incredibles/John Wilson: download trickles at 16-32 KB/s, file grows, but **zero pieces verify**, no verify-failure logged) turned out to be a real engine bug, found via block-progress instrumentation:
+
+- **Allocated-but-never-delivered blocks are never re-requested.** `pieceBlockCursor` advances past every block of a piece on first allocation; if a peer never delivers a specific block (partial seeder / dropped request), the cursor is already past it, so `nextBlockRequest` returns nil for that piece forever. Pieces sit at e.g. 96/103 blocks indefinitely → nothing verifies.
+- **Coalesced final blocks.** Some peers send a piece's final short block (e.g. the 4 KB tail) *coalesced* into the last full block. The `receivedBlocks` per-offset set then lands one short of `needed` even though all bytes are on disk.
+
+**Fix** (`Torrent.swift`):
+- **Stall detection**: `pieceLastProgress` tracks the last block arrival per active piece; `tick()` requeues any active piece idle >20 s, resetting its cursor to the next missing offset so the outstanding blocks are re-requested (possibly from another peer) while keeping already-received blocks.
+- **Byte-coverage completion**: `pieceReceivedBytes` counts distinct received bytes per piece; a piece is handed to SHA-1 verification when `receivedBytes >= pieceLength` instead of when the block-offset count hits `needed`. Over-counting from overlapping/coalesced blocks is harmless (SHA-1 is the real gate).
+
+**Verification**: John Wilson S03 (which previously stalled at 96/103 forever) now verifies pieces (19 verified and SHA-1-correct in a few minutes); BBB regression: 70 pieces verified in 60 s at 2.5 MB/s, 0 verify failures. 49 tests green. Deployed to the simulator.
+
 
