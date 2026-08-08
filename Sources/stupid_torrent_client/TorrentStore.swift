@@ -27,16 +27,32 @@ final class TorrentStore {
     let downloadsURL: URL
     private let torrentsURL: URL
     private let datesURL: URL
+    private let pausedURL: URL
     private var addedDates: [String: Date] = [:]
+    private var pausedIDs: Set<String> = []
 
     init() {
         documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         downloadsURL = documentsURL.appendingPathComponent("downloads", isDirectory: true)
         torrentsURL = documentsURL.appendingPathComponent("torrents", isDirectory: true)
         datesURL = documentsURL.appendingPathComponent("added-dates.json")
+        pausedURL = documentsURL.appendingPathComponent("paused.json")
         addedDates = Self.loadDates(datesURL)
+        pausedIDs = Set(Self.loadPausedIDs(pausedURL))
         try? FileManager.default.createDirectory(at: downloadsURL, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: torrentsURL, withIntermediateDirectories: true)
+    }
+
+    private static func loadPausedIDs(_ url: URL) -> [String] {
+        guard let data = try? Data(contentsOf: url),
+              let raw = try? JSONSerialization.jsonObject(with: data) as? [String] else { return [] }
+        return raw
+    }
+
+    private func savePausedIDs() {
+        let raw = Array(pausedIDs).sorted()
+        guard let data = try? JSONSerialization.data(withJSONObject: raw, options: [.sortedKeys]) else { return }
+        try? data.write(to: pausedURL)
     }
 
     private static func loadDates(_ url: URL) -> [String: Date] {
@@ -114,7 +130,7 @@ final class TorrentStore {
             addedDates[key] = .now
             saveDates()
         }
-        let torrent = Torrent(directory: downloadsURL, metainfo: metainfo)
+        let torrent = Torrent(directory: downloadsURL, metainfo: metainfo, startPaused: pausedIDs.contains(key))
         if let injectedPeer {
             // The metadata-serving peer is a verified-reachable seeder; feed it straight into the
             // download instead of re-discovering the (mostly-dead) swarm.
@@ -145,6 +161,8 @@ final class TorrentStore {
         items.removeAll { $0.id == item.id }
         addedDates.removeValue(forKey: item.id)
         saveDates()
+        pausedIDs.remove(item.id)
+        savePausedIDs()
         // Delete the persisted .torrent by matching its info hash, not by reconstructing the
         // filename from displayName: a magnet-resolved torrent's displayName (the `dn` param, e.g.
         // "...x264[eztv.re][eztvx.to]") can differ from the filename it was saved under (e.g.
@@ -169,5 +187,17 @@ final class TorrentStore {
             try? FileManager.default.removeItem(at: fileURL)
         }
         try? FileManager.default.removeItem(at: downloadsURL.appendingPathComponent(".\(item.id).verified"))
+    }
+
+    /// Pauses/resumes a torrent and persists the paused state so it survives a relaunch.
+    func togglePause(_ item: TorrentItem) {
+        let wasPaused = item.isPaused
+        item.togglePause()
+        if wasPaused {
+            pausedIDs.remove(item.id)
+        } else {
+            pausedIDs.insert(item.id)
+        }
+        savePausedIDs()
     }
 }

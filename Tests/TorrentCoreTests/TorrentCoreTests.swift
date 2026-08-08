@@ -686,6 +686,26 @@ extension Data {
         await torrent.stop()
     }
 
+    @Test func startPausedTorrentParksAndPublishesPaused() async throws {
+        let metainfo = try torrentMetainfo()
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let torrent = Torrent(directory: dir, metainfo: metainfo, enableDHT: false, startPaused: true)
+        let runTask = Task { await torrent.run() }
+        defer { runTask.cancel() }
+        defer { Task { await torrent.stop() } }
+
+        #expect(await waitForState(torrent, .paused) == .paused)
+        // No network machinery runs while parked: no announce/DHT/ticker peers, no peers.
+        #expect(await torrent.statusBroadcast.value.peers == 0)
+
+        // Resuming restarts the download machinery.
+        await torrent.resume()
+        #expect(await waitForState(torrent, .downloading) == .downloading)
+
+        await torrent.stop()
+    }
+
     @Test func pauseIsNoOpForCompleteTorrent() async throws {
         let metainfo = try torrentMetainfo()
         let dir = tempDir()

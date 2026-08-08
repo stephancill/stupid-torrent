@@ -82,13 +82,14 @@ public actor Torrent {
     /// the 1s ticker doesn't churn SwiftUI observers (which visibly pulses toolbar/menu items).
     private var lastPublishedStatus: TorrentStatus?
 
-    public init(directory: URL, metainfo: Metainfo, peerID: Data = PeerID.generate(), maxActivePeers: Int = 50, stopAfterBytes: Int64? = nil, enableDHT: Bool = true) {
+    public init(directory: URL, metainfo: Metainfo, peerID: Data = PeerID.generate(), maxActivePeers: Int = 50, stopAfterBytes: Int64? = nil, enableDHT: Bool = true, startPaused: Bool = false) {
         self.directory = directory
         self.metainfo = metainfo
         self.peerID = peerID
         self.maxActivePeers = maxActivePeers
         self.stopAfterBytes = stopAfterBytes
         self.enableDHT = enableDHT
+        self.isPaused = startPaused
         self.storage = Storage(directory: directory, metainfo: metainfo)
         self.picker = PiecePicker(pieceCount: metainfo.pieceCount, verified: [Bool](repeating: false, count: metainfo.pieceCount))
         // Seed the broadcast with the restored state (from the resume sidecar) so subscribers
@@ -149,6 +150,9 @@ public actor Torrent {
         if !isPaused {
             await startNetworkMachinery()
         }
+        // A torrent restored into the paused state (or paused between the flag read and here) must
+        // publish that immediately so subscribers reflect it instead of a stale `.downloading`.
+        await publishStatus()
 
         while !Task.isCancelled {
             // Park while paused; `resume()` flips the flag and the loop restarts the machinery.

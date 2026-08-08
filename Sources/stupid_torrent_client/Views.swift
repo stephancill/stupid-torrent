@@ -139,7 +139,7 @@ struct ContentView: View {
         }
         .swipeActions(edge: .leading) {
             Button(item.isPaused ? "Resume" : "Pause") {
-                item.togglePause()
+                store.togglePause(item)
             }
             .tint(item.isPaused ? .blue : .orange)
         }
@@ -383,7 +383,7 @@ private struct TorrentDetailMenu: View {
         Menu {
             if item.canPause {
                 Button {
-                    item.togglePause()
+                    store.togglePause(item)
                 } label: {
                     Label(item.isPaused ? "Resume" : "Pause", systemImage: item.isPaused ? "play" : "pause")
                 }
