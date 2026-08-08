@@ -174,6 +174,17 @@ Track the offset locally (follow `currentOffset` only if the player jumps ahead)
 
 ## Unreleased
 
+### 2026-08-08 — Fix: "fast download but nothing verifies" (stalled pieces never re-requested)
+
+Backrooms QxR (`749c6111…`, 8 MiB pieces, 571 pieces, single 4.78 GB mkv) in the simulator downloaded at several MB/s (file grew) while verified stuck at ~1 piece — every piece that did verify had first logged a **20 s stall + requeue**. Root cause vs the log:
+
+- `pieceBlockCursor` allocates a piece's blocks once, to whichever peers refill first. When the cursor exhausts (all 512 blocks handed out) but the peers holding the tail blocks never deliver them, `nextBlock(in:)` returned `nil` — the missing blocks were **never re-requested** until the 20 s stall timer (or a peer drop) reset the cursor. On a churny swarm every piece paid a dead 20 s wait, so the data rate (~7 MB/s at peak) never became verified pieces (~1 per 40-60 s).
+- The 8 MiB piece length made this severe: 512 blocks per piece meant many peers' pipelines could exhaust a piece's allocation while the tail sat undelivered.
+
+**Fix** (`Torrent.nextBlock(in:)`): when a piece's cursor is exhausted but it still has missing blocks, return the *next missing block* (endgame-style, mirroring webtorrent's duplicate tail requests) instead of `nil`, so a near-complete piece finishes in one round-trip. `PeerSession.refillPipeline` gained a guard to skip a block already in that peer's outstanding set (otherwise `nextBlockRequest` keeps returning the same missing block and the fill loop spins forever).
+
+**Verification**: 62 tests green. Redeployed to the simulator: with the fix, zero `stalled` lines and pieces verify continuously (`piece 71…74` ~15 s apart at the swarm's ~530 KB/s — verification now tracks the real delivery rate instead of losing 20 s per piece). Note the sidecar's stale low pieces (bits set from a prior deleted file) still produce sparse/zero data at the file head; a full verify/resume from a clean bitfield is unaffected.
+
 ### 2026-08-08 — MKV streaming via embedded MobileVLCKit (iOS-only)
 
 The documented mkv limitation (implementation-notes line 423) is now closed for MKV/MKA: Matroska files stream through VLCKit instead of AVPlayer. Full detail in `docs/mkv-streaming.md`; this entry records what landed and why.
@@ -542,6 +553,16 @@ The dedupe fix above stopped publishing identical snapshots, but an **actively d
 ### 2026-08-08 — Copy Magnet: remove temporary "Copied" label state
 
 `TorrentDetailMenu`'s Copy Magnet item now always shows "Copy Magnet" + `link` icon; the 1.5s "Copied"/`checkmark` state (and its `copiedMagnet` `@State`) was removed — the menu still copies to the pasteboard on tap. Deployed to the iPhone.
+
+### 2026-08-08 — Paused state persists across restarts
+
+Previously paused was intentionally not persisted (a relaunch resumed the download). Now `TorrentStore` persists paused info-hashes in `Documents/paused.json` (mirrors `added-dates.json`):
+
+- `TorrentStore.togglePause(_:)` — the single entry point for pause/resume (detail menu + list swipe now call it); flips the item and adds/removes its id from `pausedIDs`, saving immediately. `remove(_:)` also clears the id.
+- `Torrent.init` gained `startPaused: Bool = false`; `TorrentStore.add` passes `pausedIDs.contains(key)` so a restored-paused torrent starts with the flag set.
+- `Torrent.run()` publishes status right after the machinery-start decision, so a paused-at-entry torrent immediately emits `.paused` (previously it parked silently and the UI showed stale `.downloading` until resume).
+
+**Test**: `startPausedTorrentParksAndPublishesPaused` — a `startPaused` torrent publishes `.paused` with 0 peers, and `resume()` moves it to `.downloading`. 62 tests green. Deployed to the iPhone.
 
 ### 2026-08-08 — Detail view: hide Download/ETA/Peers while paused
 

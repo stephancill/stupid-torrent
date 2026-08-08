@@ -296,10 +296,21 @@ public actor Torrent {
 
     private func nextBlock(in piece: Int) -> Block? {
         let pieceLength = self.pieceLength(piece)
-        guard let cursor = pieceBlockCursor[piece], cursor < pieceLength else { return nil }
-        let length = min(PeerMessage.blockSize, pieceLength - cursor)
-        pieceBlockCursor[piece] = cursor + length
-        return Block(index: piece, begin: cursor, length: length)
+        guard let cursor = pieceBlockCursor[piece] else { return nil }
+        if cursor < pieceLength {
+            let length = min(PeerMessage.blockSize, pieceLength - cursor)
+            pieceBlockCursor[piece] = cursor + length
+            return Block(index: piece, begin: cursor, length: length)
+        }
+        // The cursor is exhausted (every block was allocated once) but the piece is still missing
+        // blocks — the peers they were handed to never delivered them. Re-request the next missing
+        // block immediately (endgame-style) instead of waiting for the 20s stall timer, so a
+        // near-complete piece finishes in one round-trip rather than stalling the download.
+        let received = receivedBlocks[piece] ?? []
+        guard received.count < neededBlockCount(piece) else { return nil }
+        let missing = nextMissingOffset(piece)
+        guard !received.contains(missing) else { return nil }
+        return Block(index: piece, begin: missing, length: min(PeerMessage.blockSize, pieceLength - missing))
     }
 
     private func registerOutstanding(_ block: Block, peer: PeerSession) {

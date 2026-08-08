@@ -212,6 +212,10 @@ public final class PeerSession: @unchecked Sendable {
                 break
             }
             let key = BlockKey(index: block.index, begin: block.begin)
+            // Skip a block the peer already has in flight — `nextBlockRequest` can keep returning the
+            // same missing block (the cursor is exhausted, so there's nothing new to allocate) and
+            // re-inserting it wouldn't grow `outstanding`, which would loop forever.
+            guard !outstanding.contains(key) else { break }
             outstanding.insert(key)
             batch.append(PeerMessage.request(block).encode())
         }
