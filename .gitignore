@@ -12,3 +12,6 @@ DerivedData/
 # reference clones + hermetic seeder cache (see docs/planning.md)
 /third-party/
 /seeder-cache/
+
+# MobileVLCKit XCFramework (see docs/mkv-streaming.md) — download + repack step
+/Vendor/

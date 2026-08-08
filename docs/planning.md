@@ -85,7 +85,7 @@ Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
 2. `AVURLAsset(stream://...)` + `TorrentResourceLoader`. Loader answers `contentInformationRequest` (type from `ftyp`/extension, total length, `isByteRangeAccessSupported = true`) and holds `dataRequest`s until their bytes are verified, feeding from `Storage`.
 3. Picker drives playback: sequential window around current position + moov-tail jump (when the loader sees a non-zero offset request — AVPlayer probing a tail `moov` atom on non-faststart MP4 — temporarily prioritize that region, then resume sequential).
 4. Playback begins after the loader supplies `moov` + leading frames.
-5. Non-AVPlayer formats (mkv/webm/avi): QuickLook preview of the partial file + "streaming unavailable". VLCKit noted as future work.
+5. Non-AVPlayer formats: MKV/MKA stream through **VLCKit (MobileVLCKit)** via `VLCMedia(initWithStream:)` fed from a custom seekable `NSInputStream` over the verified-byte APIs (see `docs/mkv-streaming.md`). iOS-only; the macOS CLI/app never link VLCKit. Other formats (webm/avi/AV1-in-MKV) remain unplayable; VLCKit handles most codecs VLC supports on iOS hardware.
 
 ### Persistence
 
@@ -126,7 +126,7 @@ Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
 | Magnet dependency chain (magnet requires peer-wire + BEP 10/9 all working) | Phases build bottom-up, each gated by unit + hermetic tests |
 | Tracker/peer long tail | Follow anacrolix/webtorrent behavior; hermetic coverage via mock trackers + third-party seeder (webtorrent/aria2c); live swarm as final gate; fail loudly with clear logs |
 | iOS suspension in background | Foreground-only by design + `audio` background mode |
-| mkv/AV1 not playable by AVPlayer | QuickLook fallback; VLCKit later |
+| mkv/AV1 not playable by AVPlayer | MKV/MKA streamed via embedded MobileVLCKit (iOS only, see `docs/mkv-streaming.md`); AV1-in-MKV / webm / avi remain unplayable; app size grows ~225 MB static framework + LGPL obligations |
 | BBB is UDP-tracker-only | UDP tracker lands in Phase 3 (before first live download); both BBB trackers probed UP on 2026-08-06 (opentrackr HTTP+UDP, explodie UDP-only), plus fallback trackers in the magnet |
 | Torrent can exceed free disk space | Storage disk-space guard (`volumeAvailableCapacityForImportantUsage`); fail loudly (pause + surface error) on ENOSPC |
 

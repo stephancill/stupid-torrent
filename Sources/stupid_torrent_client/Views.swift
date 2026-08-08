@@ -3,6 +3,9 @@ import AVKit
 import AVFoundation
 import TorrentCore
 import Streaming
+#if os(iOS)
+import VLCBridge
+#endif
 
 struct ContentView: View {
     @State private var store = TorrentStore()
@@ -267,6 +270,8 @@ struct TorrentDetailView: View {
     let store: TorrentStore
 
     @State private var streamSession: TorrentStreamSession?
+    @State private var activeKind: Torrent.PlaybackKind?
+    @State private var activeFileIndex: Int?
     @State private var showPlayer = false
 
     private var fileIndicesBySize: [Int] {
@@ -289,10 +294,15 @@ struct TorrentDetailView: View {
             Section("Files") {
                 ForEach(fileIndicesBySize, id: \.self) { index in
                     let file = item.metainfo.files[index]
-                    let isStreamable = Torrent.contentType(forFileNamed: file.name) != nil
+                    let playbackKind = Torrent.playbackKind(forFileNamed: file.name)
+                    #if os(iOS)
+                    let isStreamable = playbackKind != .none
+                    #else
+                    let isStreamable = playbackKind == .avPlayer
+                    #endif
                     Button {
                         if isStreamable {
-                            openPlayer(fileIndex: index)
+                            openPlayer(fileIndex: index, kind: playbackKind)
                         }
                     } label: {
                         HStack {
@@ -318,8 +328,17 @@ struct TorrentDetailView: View {
         }
         #if os(iOS)
         .fullScreenCover(isPresented: $showPlayer) {
-            if let streamSession {
-                PlayerView(session: streamSession)
+            if let activeKind, let activeFileIndex {
+                switch activeKind {
+                case .avPlayer:
+                    if let streamSession {
+                        PlayerView(session: streamSession)
+                    }
+                case .vlc:
+                    MKVPlayerView(torrent: item.torrent, fileIndex: activeFileIndex)
+                case .none:
+                    EmptyView()
+                }
             }
         }
         #else
@@ -331,9 +350,21 @@ struct TorrentDetailView: View {
         #endif
     }
 
-    private func openPlayer(fileIndex: Int) {
+    private func openPlayer(fileIndex: Int, kind: Torrent.PlaybackKind) {
+        #if os(iOS)
+        activeFileIndex = fileIndex
+        activeKind = kind
+        switch kind {
+        case .avPlayer:
+            streamSession = TorrentStreamSession(torrent: item.torrent, fileIndex: fileIndex)
+        case .vlc, .none:
+            streamSession = nil
+        }
+        showPlayer = true
+        #else
         streamSession = TorrentStreamSession(torrent: item.torrent, fileIndex: fileIndex)
         showPlayer = true
+        #endif
     }
 }
 

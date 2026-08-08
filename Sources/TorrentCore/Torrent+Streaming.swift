@@ -79,4 +79,21 @@ public extension Torrent {
         default: return nil
         }
     }
+
+    /// How a media file should be played back. AVPlayer handles Apple containers; VLCKit
+    /// (iOS only) handles Matroska; everything else is not streamable by this client.
+    public enum PlaybackKind: Equatable, Sendable {
+        case avPlayer
+        case vlc
+        case none
+    }
+
+    public static func playbackKind(forFileNamed name: String) -> PlaybackKind {
+        let ext = (name as NSString).pathExtension.lowercased()
+        if contentType(forFileNamed: name) != nil { return .avPlayer }
+        switch ext {
+        case "mkv", "mka": return .vlc
+        default: return .none
+        }
+    }
 }

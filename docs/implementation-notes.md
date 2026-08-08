@@ -174,6 +174,37 @@ Track the offset locally (follow `currentOffset` only if the player jumps ahead)
 
 ## Unreleased
 
+### 2026-08-08 — MKV streaming via embedded MobileVLCKit (iOS-only)
+
+The documented mkv limitation (implementation-notes line 423) is now closed for MKV/MKA: Matroska files stream through VLCKit instead of AVPlayer. Full detail in `docs/mkv-streaming.md`; this entry records what landed and why.
+
+**Decision**: embed **MobileVLCKit 3.7.2** (LGPL, static XCFramework in gitignored `Vendor/`, 225 MB after stripping dSYMs) for MKV playback rather than writing a Matroska demux + fMP4 remux from scratch. VLCKit accepts the motivating file directly (HEVC Main 10 + E-AC-3 Atmos + embedded SRT). Tradeoffs accepted: app size, LGPL attribution, custom player controls (no AVPlayerViewController/PiP for MKV). macOS never links it — the platform-conditional dependency keeps `swift build`/`swift test`/`torrent-cli` VLC-free.
+
+**Packaging (gate 0, passed)**:
+- `Package.swift`: `.binaryTarget(name: "MobileVLCKit", path: "Vendor/MobileVLCKit.xcframework")` + new `VLCBridge` target (iOS-only dep on the binary; declares the podspec system frameworks/libraries: QuartzCore/CoreText/AVFoundation/Security/CFNetwork/AudioToolbox/OpenGLES/CoreGraphics/VideoToolbox/CoreMedia + c++/xml2/z/bz2/iconv). `stupid_torrent_client` depends on `VLCBridge` only under `.when(platforms: [.iOS])`.
+- xtool simulator build embeds `MobileVLCKit.framework` into `App.app/Frameworks` and links via `@rpath`; app launches with the framework loaded. macOS host `swift build`/`swift test` unaffected.
+- Repack step: official VideoLAN CocoaPods tarball (`MobileVLCKit-3.7.2-…tar.xz`), extract the `.xcframework` + `COPYING.txt` into `Vendor/`, delete `dSYMs/`. `Vendor/` is gitignored; a setup step must repopulate it.
+
+**Stream plumbing (`Streaming`)**:
+- New `TorrentStreamSource` protocol (fileLength/availability/read/prioritize) + `TorrentStreamSourceAdapter` forwarding to the `Torrent` actor's streaming APIs.
+- New `TorrentSeekableInputStream`: an `NSInputStream` for libVLC's callback bridge (`VLCMedia.initWithStream`). Reads **block until verified bytes exist** (a premature 0 would look like EOF to libVLC); seeks via `NSStreamFileCurrentOffsetKey`; a background feed task pulls verified bytes into a capped 2 MB buffer, prioritizing a 2 MB lookahead window per read (the picker's jump classification handles seek targets automatically).
+- Swift 6 concurrency notes: `NSCondition` lock/unlock is banned in async contexts, so locked sections live in sync helper methods; and `Task { await self.… }` from an `InputStream` subclass trips the sending check (the `Stream` base isn't Sendable), so all mutable state lives in a separate `@unchecked Sendable` box (`TorrentStreamBuffer`) the feed task captures instead of the stream itself. Two real bugs found by the tests: the feed loop used the consumer's cursor as its fetch cursor (re-appending the same range → unbounded buffer), and it broke at `fetchOffset >= fileLength` even before the consumer drained (a backward seek then starved). Fixed with a dedicated fetch cursor (`fileOffset + buffer.count`) and an EOF condition gated on the consumer actually reaching the end.
+
+**VLCBridge (iOS-only target)**:
+- `MKVStreamSession` (@MainActor @ObservableObject): owns the stream + `VLCMedia` + `VLCMediaPlayer`; applies a tail-jump priority (Cues index, analogous to moov-tail) at init; exposes state/duration/position/seekable + audio/subtitle track lists; `attach(drawable:)`, `seek(toMs:)`, `selectAudioTrack`/`selectSubtitleTrack`, `teardown()` (stops player + closes stream).
+- `MKVPlayerView`: SwiftUI fullscreen player with a plain-`UIView` drawable, black background, loading/failed states, play/pause + seek slider, and audio/subtitle pickers. Reuses the existing `.playback`/`.moviePlayback` audio session.
+
+**App routing (`TorrentCore` + `Views.swift`)**:
+- `Torrent.playbackKind(forFileNamed:)` — `.avPlayer` (existing whitelist), `.vlc` (mkv/mka), `.none` — drives the file rows and the player dispatch. `.vlc` rows open `MKVPlayerView` via the existing `.fullScreenCover`; on macOS `.vlc` is treated as `.none` (no VLCKit). `contentType(forFileNamed:)` unchanged for the AVPlayer loader.
+
+**Verification**:
+- 8 new `SeekableInputStreamTests` against a fake source; 61 tests green (macOS host).
+- Gate-0 render test (temporary env-gated smoke path, removed after passing): generated 10 s H.264/AAC MKV played fully — stream served the whole file, VLC `playing=true seekable=true`, test pattern frames advanced between screenshots.
+- Real Backrooms MKV: HEVC Main 10 + E-AC-3 + SRT decodes and renders (screenshots show real video content); playback paces to the download — with 0 live peers it buffers rather than erroring.
+- iOS simulator build embeds the framework; `strings` on the final app binary shows no leftover smoke code.
+
+**Known limitations / follow-ups**: MKV PiP (VLCKit has no native PiP API), webm/avi/AV1-in-MKV still unplayable, seeks beyond the downloaded frontier wait for the jump range to verify. LGPL obligations: `Vendor/COPYING.txt` shipped, end-user attribution still to add to the About/acknowledgements UI before release.
+
 ### 2026-08-06 — Streaming fix: moov-tail playback for non-faststart MP4s (Sintel)
 
 Added Sintel (`08ada5a7...`) as a second torrent in the sim. Its `Sintel.mp4` is a **non-faststart MP4** (ftyp + mdat only; `moov` at the very end). AVPlayer could not play it while downloading — only after the file completed.
@@ -511,6 +542,10 @@ The dedupe fix above stopped publishing identical snapshots, but an **actively d
 ### 2026-08-08 — Copy Magnet: remove temporary "Copied" label state
 
 `TorrentDetailMenu`'s Copy Magnet item now always shows "Copy Magnet" + `link` icon; the 1.5s "Copied"/`checkmark` state (and its `copiedMagnet` `@State`) was removed — the menu still copies to the pasteboard on tap. Deployed to the iPhone.
+
+### 2026-08-08 — Detail view: hide Download/ETA/Peers while paused
+
+When a torrent is paused, its status shows zero rates and no active peers, so `TorrentDetailView`'s Status section now hides the Download, ETA, and Peers rows (`!item.isPaused` guard); Progress and Pieces stay visible. Deployed to the iPhone.
 
 ### 2026-08-08 — Detail view kebab menu: plain ellipsis icon + Delete
 
