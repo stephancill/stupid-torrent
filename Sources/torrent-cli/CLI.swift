@@ -119,11 +119,13 @@ struct TorrentCLI {
             idle = s
         }
         do {
-            let dht = try DHTClient()
-            defer { dht.stop() }
+            guard let dht = DHTNode.shared() else {
+                print("error: could not start DHT node")
+                return
+            }
             let start = ContinuousClock.now
             if let peers = try? await dht.lookup(infoHash: infoHash, timeout: 15) {
-                print("lookup: \(peers.count) peers in \(ContinuousClock.now - start)")
+                print("lookup: \(peers.count) peers in \(ContinuousClock.now - start) (node \(dht.nodeID.hexString.prefix(8)))")
             }
             try? await dht.announce(infoHash: infoHash, port: UInt16(port))
             print("announced; idling \(idle)s to observe inbound queries...")

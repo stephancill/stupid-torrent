@@ -80,6 +80,15 @@ public final class DHTClient: @unchecked Sendable {
         return base.appendingPathComponent("stupid-torrent-dht.peers")
     }
 
+    /// The persistent node identity, shared across launches. A stable node ID is what lets the
+    /// node accumulate a real position in the DHT (nodes that learn us keep querying the same
+    /// identity) instead of churning a fresh identity every cycle.
+    public static func defaultNodeIDURL() -> URL {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return base.appendingPathComponent("stupid-torrent-dht.nodeid")
+    }
+
     private func loadNodeCache() {
         guard let data = try? Data(contentsOf: nodeCacheURL), data.count >= 26 else { return }
         for node in CompactNode.parse(data) where node.id != nodeID {

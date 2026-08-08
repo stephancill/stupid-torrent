@@ -484,26 +484,24 @@ public actor Torrent {
         }
     }
 
-    /// Periodically queries the DHT for new peers and announces our listen port (BEP 5). The
-    /// tracker pool is mostly NAT'd peers, but DHT returns live, reachable ones — and announcing
-    /// ourselves + answering inbound queries is what accumulates a live peer store over time
-    /// (mirrors webtorrent's discovery sources + node participation).
+    /// Periodically queries the DHT for new peers and announces our listen port (BEP 5). Uses the
+    /// app-lifetime shared node (`DHTNode`) so all torrents participate as ONE stable DHT node —
+    /// a persistent identity and socket is what accumulates a live peer store and a real position
+    /// in the DHT (mirrors webtorrent's long-running node).
     private func dhtLoop() async {
         while !Task.isCancelled {
-            do {
-                let dht = try DHTClient()
-                let start = ContinuousClock.now
-                if let dhtPeers = try? await dht.lookup(infoHash: metainfo.infoHash, timeout: 10) {
-                    TorrentLog.log("DHT: found \(dhtPeers.count) peers in \(ContinuousClock.now - start)")
-                    for peer in dhtPeers {
-                        considerPeer(peer)
-                    }
-                }
-                try? await dht.announce(infoHash: metainfo.infoHash, port: listenPort)
-                dht.stop()
-            } catch {
-                // DHT is best-effort; skip and retry later.
+            guard let dht = DHTNode.shared() else {
+                try? await Task.sleep(for: .seconds(120))
+                continue
             }
+            let start = ContinuousClock.now
+            if let dhtPeers = try? await dht.lookup(infoHash: metainfo.infoHash, timeout: 10) {
+                TorrentLog.log("DHT: found \(dhtPeers.count) peers in \(ContinuousClock.now - start)")
+                for peer in dhtPeers {
+                    considerPeer(peer)
+                }
+            }
+            try? await dht.announce(infoHash: metainfo.infoHash, port: listenPort)
             try? await Task.sleep(for: .seconds(120))
         }
     }

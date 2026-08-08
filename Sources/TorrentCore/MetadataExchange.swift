@@ -277,10 +277,11 @@ public enum MagnetBootstrapper {
             await pool.add(injectedPeer)
         }
 
-        let dhtClient = try? DHTClient()
+        // Use the app-lifetime shared DHT node so magnet bootstraps leverage (and contribute to)
+        // the same warm routing table, live peer store, and stable identity as the downloads.
+        let dhtClient = DHTNode.shared()
         let dhtTask = Task {
             guard let dhtClient else { return }
-            defer { dhtClient.stop() }
             // Emit cached live peers for this infohash immediately, before any network query
             // (webtorrent's DHT peer store, emitted at next-tick).
             let cached = dhtClient.cachedPeers(infoHash: magnet.infoHash)

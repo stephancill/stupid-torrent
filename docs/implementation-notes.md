@@ -515,6 +515,19 @@ The remaining gap to webtorrent's ~1.6s resolve is its **live DHT peer store**: 
 - New loopback tests (`nodeAnswersQueriesAndStoresAnnouncedPeers`, `nodeSelfAnnounce`): node answers ping/find_node/get_peers, rejects a bad announce token, stores an announced peer and serves it back in a later `get_peers`, and `announce()` round-trips a token + stores us at the peer node. 53 tests green.
 - **Live**: `dht-node` on the Backrooms infohash does a 438-peer lookup and `DHT: announce 3b124452 to 3 nodes` — the node announced itself to real swarm DHT nodes with valid tokens. Resolve unaffected (3.3-7.0s); the live-store benefit accrues to the long-running app node (its `dhtLoop` announces every 120s), not a one-shot CLI resolve.
 
+### 2026-08-08 — Persistent app-lifetime DHT node (`DHTNode`)
+
+The node's value comes from being a *stable* participant, but `Torrent.dhtLoop` created a fresh `DHTClient` every 120s — a new random node ID + new ephemeral UDP socket each cycle, so nodes that learned us queried a dead identity and we never built a durable DHT position.
+
+**Change**:
+- New `DHTNode.swift`: an app-lifetime shared node — ONE `DHTClient` with a **persisted node ID** (`stupid-torrent-dht.nodeid`, stable across launches) and a live socket for the whole session. `DHTNode.shared()` creates/returns it (lock-protected, starts the receive loop); `DHTNode.stop()` for tests/shutdown.
+- `Torrent.dhtLoop` uses `DHTNode.shared()` instead of constructing a client per cycle — all torrents participate as one stable node, and the live peer store + routing table accumulate across the session and across launches.
+- `MagnetBootstrapper` uses `DHTNode.shared()` (and no longer stops it — it's shared), so magnet resolutions leverage AND contribute to the same warm store as downloads.
+- `dht-node` CLI diagnostic switched to the shared node (prints the node ID).
+
+**Verification**: 53 tests green (hermetic tests untouched — they gate on `enableDHT: false` and never touch the singleton). Live: two separate `dht-node` processes report the **same persisted node ID** (`112b4c99`), and the announce now reaches **11 real DHT nodes** (was 3). Resolve unaffected (2.4-8.5s, swarm variance); `add` flow verified end-to-end.
+
+
 
 
 
