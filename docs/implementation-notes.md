@@ -190,7 +190,17 @@ Track the offset locally (follow `currentOffset` only if the player jumps ahead)
 
 ## Unreleased
 
-### 2026-08-08 — Fix: "fast download but nothing verifies" (stalled pieces never re-requested)
+### 2026-08-08 — Fix: app crashed with SIGPIPE during streaming + active download
+
+The MKV player crashed while waiting to stream a partially-downloaded file (Backrooms QxR `749c6111…`): the app died ~100 s after opening the player. Simulator repro (auto-open the player on the partial torrent) reproduced it — `launchd_sim` reported `exited due to SIGPIPE | sent by stupid_torrent_client`.
+
+**Root cause**: the engine's BSD sockets (`BSD.swift`) never suppress SIGPIPE. When a peer disconnects mid-download and an in-flight `write()`/`send()` lands on the closed socket, Darwin raises SIGPIPE, which by default terminates the process. The engine already throws `SocketError.write(errno)` on EPIPE (peer dropped) — the missing piece was suppressing the signal so the write returns EPIPE instead of killing the app. It surfaced now because streaming keeps the download (and its writes to flaky swarm peers) running under the player.
+
+**Fix** (`BSD.swift`): `BSD.setNoSigPipe(fd)` sets `SO_NOSIGPIPE`, applied at every socket creation point — `TCPSocket.init()`, `TCPSocket.init(fd:)` (covers inbound accepted sockets via `PeerStream`), and `UDPSocket.init()`. With it, writes to a closed peer return EPIPE and the existing peer-drop handling applies.
+
+**Verification**: new `NoSigPipeTests.writeToClosedPeerThrowsInsteadOfSigPipe` — writes to a socket whose peer closed repeatedly until the RST surfaces; asserts a throw. **Without** `setNoSigPipe` this test kills the test runner (output truncates exactly where SIGPIPE fires) — confirming it reproduces the crash; with the fix it passes. Full suite 63 tests green. The app then ran 180 s in the simulator with the QxR player open and no crash (the swarm had dried up, so the write path wasn't heavily exercised there — the hermetic test is the deterministic gate). Deployed to the iPhone; launch there waits for the phone to be unlocked.
+
+
 
 Backrooms QxR (`749c6111…`, 8 MiB pieces, 571 pieces, single 4.78 GB mkv) in the simulator downloaded at several MB/s (file grew) while verified stuck at ~1 piece — every piece that did verify had first logged a **20 s stall + requeue**. Root cause vs the log:
 

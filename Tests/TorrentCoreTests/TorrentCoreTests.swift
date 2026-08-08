@@ -727,3 +727,35 @@ extension Data {
         #expect(await torrent.statusBroadcast.value.state == .seeding)
     }
 }
+
+@Suite struct NoSigPipeTests {
+    /// Writing to a socket whose peer has closed must throw (EPIPE) rather than raise SIGPIPE
+    /// and terminate the process. Without `SO_NOSIGPIPE` this test kills the test runner.
+    @Test func writeToClosedPeerThrowsInsteadOfSigPipe() async throws {
+        let listener = try TCPListener(port: 0)
+        defer { listener.close() }
+
+        let client = try TCPSocket()
+        defer { client.close() }
+        try client.connect(host: "127.0.0.1", port: listener.port, timeout: 5)
+
+        let serverFD = try listener.accept()
+        // Peer closes immediately — a later write to `client` lands on a closed socket.
+        Darwin.close(serverFD)
+
+        try? await Task.sleep(for: .milliseconds(200))
+        // TCP buffers the first writes; keep writing until the RST surfaces (EPIPE without a
+        // SIGPIPE because of SO_NOSIGPIPE).
+        var threw = false
+        for _ in 0..<64 {
+            do {
+                try client.send(Data(repeating: 0xFF, count: 64 * 1024))
+                try? await Task.sleep(for: .milliseconds(20))
+            } catch {
+                threw = true
+                break
+            }
+        }
+        #expect(threw)
+    }
+}

@@ -35,6 +35,15 @@ enum BSD {
         addr.sin_addr = info.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }.sin_addr
         return addr
     }
+
+    /// Prevents `write`/`send` on a socket whose peer has closed from raising SIGPIPE (which by
+    /// default terminates the process). With `SO_NOSIGPIPE`, the write returns EPIPE and the
+    /// caller handles it as a dropped peer — essential for long-running downloads where a peer
+    /// can disconnect between the read loop noticing and an in-flight block request write.
+    static func setNoSigPipe(_ fd: Int32) {
+        var one: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+    }
 }
 
 public final class TCPSocket: @unchecked Sendable {
@@ -43,10 +52,12 @@ public final class TCPSocket: @unchecked Sendable {
     public init() throws {
         fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw SocketError.create(errno) }
+        BSD.setNoSigPipe(fd)
     }
 
     public init(fd: Int32) {
         self.fd = fd
+        BSD.setNoSigPipe(fd)
     }
 
     public func connect(host: String, port: UInt16, timeout: TimeInterval) throws {
@@ -127,6 +138,7 @@ public final class UDPSocket: @unchecked Sendable {
     public init() throws {
         fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else { throw SocketError.create(errno) }
+        BSD.setNoSigPipe(fd)
     }
 
     /// The port the socket is bound to after `bind(port:)` (0 until bound).
