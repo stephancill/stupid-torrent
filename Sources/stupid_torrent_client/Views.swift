@@ -284,11 +284,13 @@ struct TorrentDetailView: View {
         List {
             if let status = item.status, !status.isComplete {
                 Section("Status") {
-                    LabeledContent("Progress", value: "\(Int(status.progress * 100))%")
+                    LabeledContent("Progress", value: item.isPaused ? "\(Int(status.progress * 100))% (Paused)" : "\(Int(status.progress * 100))%")
                     LabeledContent("Pieces", value: "\(status.verifiedCount)/\(status.pieceCount)")
-                    LabeledContent("Download", value: byteRateString(status.downloadRate))
-                    LabeledContent("ETA", value: remainingSeconds(status, metainfo: item.metainfo).map(durationString) ?? "-")
-                    LabeledContent("Peers", value: "\(status.peers) (\(status.seeds) seeds)")
+                    if !item.isPaused {
+                        LabeledContent("Download", value: byteRateString(status.downloadRate))
+                        LabeledContent("ETA", value: remainingSeconds(status, metainfo: item.metainfo).map(durationString) ?? "-")
+                        LabeledContent("Peers", value: "\(status.peers) (\(status.seeds) seeds)")
+                    }
                 }
             }
             Section("Files") {
