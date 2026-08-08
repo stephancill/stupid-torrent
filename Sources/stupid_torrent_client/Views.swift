@@ -8,9 +8,16 @@ struct ContentView: View {
     @State private var store = TorrentStore()
     @State private var showAdd = false
     @State private var showCompleted = true
+    @Environment(\.scenePhase) private var scenePhase
 
     private var downloadingItems: [TorrentItem] { store.items.filter { !$0.isComplete } }
     private var completedItems: [TorrentItem] { store.items.filter { $0.isComplete } }
+
+    /// True while anything needs the network: resolving a magnet, or a torrent in the `.downloading`
+    /// state (paused/complete/error do not keep the screen awake).
+    private var shouldKeepAwake: Bool {
+        !store.resolvingItems.isEmpty || store.items.contains { $0.status?.state == .downloading }
+    }
 
     var body: some View {
         NavigationStack {
@@ -69,7 +76,7 @@ struct ContentView: View {
                 }
             }
             .navigationDestination(for: TorrentItem.self) { item in
-                TorrentDetailView(item: item)
+                TorrentDetailView(item: item, store: store)
             }
             .navigationTitle("Torrents")
             .toolbar {
@@ -100,6 +107,13 @@ struct ContentView: View {
         }
         .onAppear {
             store.restore()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // Re-apply on every phase change so a resume from background restores the right state.
+            IdleTimer.update(isDownloading: phase == .active && shouldKeepAwake)
+        }
+        .onChange(of: shouldKeepAwake) { _, downloading in
+            IdleTimer.update(isDownloading: downloading)
         }
         .onOpenURL { url in
             guard url.scheme?.lowercased() == "magnet" else { return }
@@ -250,10 +264,13 @@ struct AddTorrentView: View {
 
 struct TorrentDetailView: View {
     let item: TorrentItem
+    let store: TorrentStore
 
+    @Environment(\.dismiss) private var dismiss
     @State private var streamSession: TorrentStreamSession?
     @State private var showPlayer = false
     @State private var copiedMagnet = false
+    @State private var confirmDelete = false
 
     private var fileIndicesBySize: [Int] {
         item.metainfo.files.indices.sorted {
@@ -313,8 +330,20 @@ struct TorrentDetailView: View {
                 } label: {
                     Label(copiedMagnet ? "Copied" : "Copy Magnet", systemImage: copiedMagnet ? "checkmark" : "link")
                 }
+                Divider()
+                Button(role: .destructive) {
+                    confirmDelete = true
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
             } label: {
                 Image(systemName: "ellipsis")
+            }
+        }
+        .confirmationDialog("Delete \"\(item.name)\"?", isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                store.remove(item)
+                dismiss()
             }
         }
         #if os(iOS)

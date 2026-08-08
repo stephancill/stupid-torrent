@@ -492,6 +492,11 @@ Timeline tracing of a 7.6s resolve showed the first ~5s was spent draining the 5
 
 `TorrentDetailView` (Views.swift): the Pause/Resume button (previously the first row of the Status section) and the whole "Actions" section (Copy Magnet) are replaced by a single kebab menu (`ellipsis.circle`) in the navigation bar's top-right. Pause/Resume still only appears for incomplete torrents; Copy Magnet shows its temporary "Copied" checkmark state in the menu label. Removed the now-empty Actions section. `swift build` green.
 
+### 2026-08-08 — Detail view kebab menu: plain ellipsis icon + Delete
+
+- Kebab icon changed from `ellipsis.circle` to the ring-free `ellipsis`.
+- Added **Delete** to the kebab menu (destructive role, divider above it) with a `confirmationDialog` before removing. `TorrentDetailView` now receives the `TorrentStore` (passed from `ContentView.navigationDestination`) and dismisses after `store.remove(item)` — same delete path as the list's swipe action (removes `.torrent`, data files, and `.verified` sidecar).
+
 ### 2026-08-08 — µTP for the metadata fetch + DHT lookup streaming
 
 **µTP metadata fetch** (`MetadataExchange.swift`): `MetadataFetcher` now has `fetchUTP(from:transport:)` — µTP (BEP 29) with a plaintext BT handshake (µTP is its own transport; MSE stays TCP-only, mirroring the download path). The protocol exchange (BT handshake → extended handshake → ut_metadata `_requestPieces`-style all-pieces burst) was extracted into `performMetadataExchange(stream:)` shared by both transports. `MagnetBootstrapper` creates one outbound-only `UTPTransport`, and `fetchMetadata` **races µTP + TCP per peer** (webtorrent's `utpOutgoing` + `tcpOutgoing`): first success wins, loser cancelled; both share the same connect/metadata budget so dead peers still cost ~one timeout. Verified: 5 µTP connects + 4 TCP MSE handshakes in a single resolve run.
@@ -526,6 +531,15 @@ The node's value comes from being a *stable* participant, but `Torrent.dhtLoop` 
 - `dht-node` CLI diagnostic switched to the shared node (prints the node ID).
 
 **Verification**: 53 tests green (hermetic tests untouched — they gate on `enableDHT: false` and never touch the singleton). Live: two separate `dht-node` processes report the **same persisted node ID** (`112b4c99`), and the announce now reaches **11 real DHT nodes** (was 3). Resolve unaffected (2.4-8.5s, swarm variance); `add` flow verified end-to-end.
+
+### 2026-08-08 — Keep the screen awake while downloading (`IdleTimer`)
+
+The engine (DHT node, downloads) only runs while the app is foregrounded, and an iOS auto-lock backgrounds + suspends the app — killing the node mid-download. Prevented via `UIApplication.isIdleTimerDisabled`.
+
+**Change** (`IdleTimer.swift`, `Views.swift`): `ContentView` sets the idle timer based on `shouldKeepAwake` = any magnet resolving (`resolvingItems` non-empty) OR any torrent in the `.downloading` state (paused/complete/error don't keep the screen awake). Applied via `.onChange(of: shouldKeepAwake)` and re-applied on scene-phase changes, so a resume from background restores the right state. Follows Apple's guidance of disabling only while needed (battery).
+
+**Verification** (simulator console): on launch `idle timer enabled`; opening a magnet flips to `idle timer disabled (auto-lock off)`; when the resolve ends (success or timeout) it flips back to `enabled`. iOS build via xtool compiles clean; 53 tests green. Note: the app's first resolve in a fresh install on the marginal Backrooms swarm still hits the cold-cache dead-peer lottery (CLI's ~2s times are its warm DHT peer cache) — expected until the app's node warms up; not a regression.
+
 
 
 
