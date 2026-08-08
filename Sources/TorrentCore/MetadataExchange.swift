@@ -96,9 +96,30 @@ public final class MetadataFetcher: @unchecked Sendable {
         self.clientPort = clientPort
     }
 
-    public func fetch(from address: PeerAddress, timeout: Duration = .seconds(5), connectTimeout: Duration = .seconds(3)) async throws -> Data {
+    /// Fetches the info dict over TCP with MSE/PE encryption (BEP 10), falling back to plaintext
+    /// for peers that don't speak MSE. The transport-level path used for injected peers and tests.
+    public func fetch(from address: PeerAddress, timeout: Duration = .seconds(3), connectTimeout: Duration = .seconds(2)) async throws -> Data {
         let stream = try PeerStream(host: address.host, port: address.port)
         return try await withTaskCancellationHandler {
+            // Connect is bounded by its own `connectTimeout`, so arm the overall timeout only
+            // AFTER the connection is up. Arming it before lets a 3s timeout close the stream
+            // while a slow/queued connect() is still in flight -> connect() runs on a closed fd
+            // (EBADF), and every peer in a slow sweep dies with errno 9 instead of being swept.
+            let seconds = TimeInterval(connectTimeout.components.seconds) + TimeInterval(connectTimeout.components.attoseconds) / 1e18
+            try await stream.connect(timeout: seconds)
+            TorrentLog.log("metadata: connected to \(address.host)")
+
+            // MSE/PE (BEP 10): obfuscate the handshake + payload. Many metadata servers (and most of
+            // this swarm) close plaintext connections, so encrypt first; peers without MSE answer in
+            // plaintext, which falls back and continues unencrypted.
+            let mse = MSEHandshake(stream: stream)
+            do {
+                try await mse.performAsInitiator(infoHash: infoHash)
+                TorrentLog.log("metadata: MSE handshake ok (method \(mse.method == .rc4 ? "rc4" : "plaintext"))")
+            } catch MSEError.plaintextFallback {
+                TorrentLog.log("metadata: peer doesn't support MSE, using plaintext")
+            }
+
             let timeoutTask = Task {
                 try? await Task.sleep(for: timeout)
                 if !Task.isCancelled {
@@ -109,30 +130,55 @@ public final class MetadataFetcher: @unchecked Sendable {
                 timeoutTask.cancel()
                 stream.close()
             }
-            let seconds = TimeInterval(connectTimeout.components.seconds) + TimeInterval(connectTimeout.components.attoseconds) / 1e18
-            try await stream.connect(timeout: seconds)
-        TorrentLog.log("metadata: connected to \(address.host)")
-
-        // MSE/PE (BEP 10): obfuscate the handshake + payload. Many metadata servers (and most of
-        // this swarm) close plaintext connections, so encrypt first; peers without MSE answer in
-        // plaintext, which falls back and continues unencrypted.
-        let mse = MSEHandshake(stream: stream)
-        do {
-            try await mse.performAsInitiator(infoHash: infoHash)
-            TorrentLog.log("metadata: MSE handshake ok (method \(mse.method == .rc4 ? "rc4" : "plaintext"))")
-        } catch MSEError.plaintextFallback {
-            TorrentLog.log("metadata: peer doesn't support MSE, using plaintext")
+            return try await performMetadataExchange(stream: stream, address: address, overUTP: false, timeout: timeout)
+        } onCancel: {
+            stream.close()
         }
+    }
 
+    /// Fetches the info dict over µTP (BEP 29) with a plaintext BitTorrent handshake — µTP is its
+    /// own transport, so MSE is skipped (mirrors the download path's `supportsMSE: false` µTP
+    /// sessions). Reaches µTP-only peers (transmission/deluge/webtorrent) that close TCP metadata
+    /// connections.
+    public func fetchUTP(from address: PeerAddress, transport: UTPTransport, timeout: Duration = .seconds(3), connectTimeout: Duration = .seconds(2)) async throws -> Data {
+        let connection = await transport.connect(to: address)
+        do {
+            try await connection.startAsInitiator(timeout: connectTimeout)
+        } catch {
+            await connection.unregister()
+            throw error
+        }
+        let stream = UTPStream(connection: connection)
+        return try await withTaskCancellationHandler {
+            TorrentLog.log("metadata: µTP connected to \(address.host)")
+            let timeoutTask = Task {
+                try? await Task.sleep(for: timeout)
+                if !Task.isCancelled {
+                    stream.close()
+                }
+            }
+            defer {
+                timeoutTask.cancel()
+                stream.close()
+            }
+            return try await performMetadataExchange(stream: stream, address: address, overUTP: true, timeout: timeout)
+        } onCancel: {
+            stream.close()
+        }
+    }
+
+    /// The wire exchange that is identical over both transports: BT handshake (extension bit),
+    /// extended handshake (BEP 10), then ut_metadata (BEP 9) — request all pieces up front
+    /// (webtorrent's `_requestPieces`) and assemble until the assembled dict hashes to the infohash.
+    private func performMetadataExchange(stream: PeerTransport, address: PeerAddress, overUTP: Bool, timeout: Duration) async throws -> Data {
         let local = Handshake.make(extensionEnabled: true, infoHash: infoHash, peerID: peerID)
         try await stream.send(local.encode())
         let remote = try Handshake.parse(try await stream.read(exactly: Handshake.length))
         guard remote.infoHash == infoHash else { throw MetadataError.wrongInfoHash }
         guard remote.supportsExtensions else { throw MetadataError.noExtensions }
-        TorrentLog.log("metadata: handshake ok, peer supports extensions")
+        TorrentLog.log("metadata: handshake ok, peer supports extensions\(overUTP ? " (µTP)" : "")")
 
         try await stream.send(ExtendedHandshake.message(client: "stupid-torrent-client/0.1", port: clientPort).encode())
-        TorrentLog.log("metadata: sent extended handshake")
 
         var metadataID: Int?
         var metadataSize: Int?
@@ -180,13 +226,10 @@ public final class MetadataFetcher: @unchecked Sendable {
                 throw MetadataError.hashMismatch
             }
         }
-            throw MetadataError.timedOut
-        } onCancel: {
-            stream.close()
-        }
+        throw MetadataError.timedOut
     }
 
-    private func readMessage(_ stream: PeerStream) async throws -> PeerMessage? {
+    private func readMessage(_ stream: PeerTransport) async throws -> PeerMessage? {
         let lengthData = try await stream.read(exactly: 4)
         let length = Int(lengthData.readUInt32BE(at: 0))
         if length == 0 { return nil } // keepalive
@@ -220,30 +263,41 @@ public enum MagnetBootstrapper {
                 clients.append(client)
             }
         }
-        var peers: [PeerAddress] = []
-        if let injectedPeer {
-            peers.append(injectedPeer)
-        }
-        // DHT discovery is always attempted (it needs no trackers).
-        let dhtClient = try? DHTClient()
-        if clients.isEmpty && injectedPeer == nil && dhtClient == nil {
+        if clients.isEmpty && injectedPeer == nil {
             throw MetadataError.timedOut
         }
 
-        // Discovery runs on two fronts in parallel:
-        //   - Trackers return large peer lists that include real seeders
-        //   - DHT (BEP 5) finds live, reachable peers that trackers often don't return
-        // Announce to trackers FIRST, immediately (mirroring webtorrent's torrent-discovery: it
-        // announces at t=0). The DHT lookup runs concurrently and its peers are swept afterward.
-        let dhtPeerTask = Task { () -> [PeerAddress] in
-            guard let dhtClient else { return [] }
+        // Shared, concurrency-safe peer accumulator. Trackers and DHT append peers as each
+        // response lands; the sweep loop drains them continuously. This mirrors webtorrent's
+        // event-driven discovery: the first tracker/DHT response starts connection attempts
+        // immediately instead of waiting for every announce to finish (a dead UDP tracker used
+        // to gate the whole sweep on its 15s timeout).
+        let pool = PeerAccumulator()
+        if let injectedPeer {
+            await pool.add(injectedPeer)
+        }
+
+        let dhtClient = try? DHTClient()
+        let dhtTask = Task {
+            guard let dhtClient else { return }
             defer { dhtClient.stop() }
-            TorrentLog.log("bootstrap: querying DHT for peers")
-            if let dhtPeers = try? await dhtClient.lookup(infoHash: magnet.infoHash, timeout: 20) {
-                TorrentLog.log("bootstrap: DHT returned \(dhtPeers.count) peers")
-                return dhtPeers
+            // Emit cached live peers for this infohash immediately, before any network query
+            // (webtorrent's DHT peer store, emitted at next-tick).
+            let cached = dhtClient.cachedPeers(infoHash: magnet.infoHash)
+            TorrentLog.log("bootstrap: DHT cache has \(cached.count) cached peers")
+            for peer in cached {
+                await pool.add(peer)
             }
-            return []
+            TorrentLog.log("bootstrap: querying DHT for peers")
+            if let dhtPeers = try? await dhtClient.lookup(infoHash: magnet.infoHash, timeout: 20) { batch in
+                // Stream DHT peers into the pool as each get_peers response lands, so the sweep
+                // starts on them long before the full lookup finishes.
+                for peer in batch {
+                    await pool.add(peer)
+                }
+            } {
+                TorrentLog.log("bootstrap: DHT returned \(dhtPeers.count) peers")
+            }
         }
 
         if !clients.isEmpty {
@@ -256,128 +310,107 @@ public enum MagnetBootstrapper {
                 numWant: 200,
                 key: Int32.random(in: .min ... .max)
             )
-            await withTaskGroup(of: [PeerAddress].self) { group in
-                for client in clients {
-                    group.addTask {
-                        do {
-                            let response = try await client.announce(request)
-                            TorrentLog.log("bootstrap: announce got \(response.peers.count) peers (failure: \(response.failureReason ?? "none"))")
-                            return response.peers
-                        } catch {
-                            TorrentLog.log("bootstrap: announce failed: \(error)")
-                            return []
+            for client in clients {
+                Task {
+                    do {
+                        let response = try await client.announce(request)
+                        TorrentLog.log("bootstrap: announce got \(response.peers.count) peers (failure: \(response.failureReason ?? "none"))")
+                        for peer in response.peers {
+                            await pool.add(peer)
                         }
+                    } catch {
+                        TorrentLog.log("bootstrap: announce failed: \(error)")
                     }
-                }
-                for await result in group {
-                    peers.append(contentsOf: result)
                 }
             }
         }
 
-        // The swarm is overwhelmingly dead/NAT'd: only a handful of peers in a few hundred are
-        // reachable and serve ut_metadata. Instead of giving up after one sample, re-announce for
-        // fresh peer lists and keep sweeping until we find a cooperative peer or exhaust rounds.
-        // The tracker sweep runs FIRST and immediately (tracker peers include seeders) — do NOT
-        // block it on the DHT lookup, which takes ~20s. DHT peers are swept in parallel.
-        let rounds = 6
-        var seen: Set<PeerAddress> = []
-        for round in 0..<rounds {
-            var candidates: [PeerAddress] = []
-            if round == 0 {
-                // Sweep tracker-returned peers immediately. Kick off the DHT sweep concurrently
-                // (its lookup has already been running) instead of awaiting it first.
-                candidates = dedup(peers)
-            } else {
-                if !clients.isEmpty {
-                    let request = AnnounceRequest(
-                        infoHash: magnet.infoHash,
-                        peerID: peerID,
-                        port: 6881,
-                        left: 0,
-                        event: .started,
-                        numWant: 200,
-                        key: Int32.random(in: .min ... .max)
-                    )
-                    await withTaskGroup(of: [PeerAddress].self) { group in
-                        for client in clients {
-                            group.addTask {
-                                do {
-                                    let response = try await client.announce(request)
-                                    return response.peers
-                                } catch {
-                                    return []
-                                }
-                            }
-                        }
-                        for await result in group {
-                            peers.append(contentsOf: result)
-                        }
-                    }
-                }
-                candidates = dedup(Array(Set(peers).subtracting(seen)))
-            }
-            let fresh = candidates.filter { seen.insert($0).inserted }.prefix(300)
-            if round == 0, !fresh.isEmpty {
-                // Sweep tracker candidates IMMEDIATELY, and run the DHT candidate sweep in
-                // parallel — whichever finds a metadata server wins. Do NOT await the DHT lookup
-                // before starting the tracker sweep (that was the ~20s stall).
-                let result = try await withThrowingTaskGroup(of: (Metainfo, PeerAddress)?.self) { group in
-                    group.addTask {
-                        try await sweepCandidates(fresh, infoHash: magnet.infoHash, peerID: peerID, magnet: magnet)
-                    }
-                    group.addTask {
-                        let dhtPeers = dedup(await dhtPeerTask.value)
-                        return try await sweepCandidates(dhtPeers, infoHash: magnet.infoHash, peerID: peerID, magnet: magnet)
-                    }
-                    var result: (Metainfo, PeerAddress)? = nil
-                    while let next = try await group.next() {
-                        if let next {
-                            result = next
-                            group.cancelAll()
-                            break
-                        }
-                    }
-                    return result
-                }
-                if let result {
-                    seen.formUnion(fresh)
-                    return result
-                }
-            } else {
-                TorrentLog.log("bootstrap round \(round): \(fresh.count) fresh candidate peers (total \(seen.count))")
-                if let result = try await sweepCandidates(fresh, infoHash: magnet.infoHash, peerID: peerID, magnet: magnet) {
-                    return result
-                }
-            }
-            if round < rounds - 1 {
-                try? await Task.sleep(for: .seconds(3))
+        // Shared outbound-only µTP transport for the metadata sweep. Each candidate is raced
+        // over µTP (plaintext) AND TCP (MSE) in parallel, like webtorrent's `utpOutgoing` +
+        // `tcpOutgoing` — reaching µTP-only seeders costs nothing on the dead-peer lottery since
+        // both transports share the same timeout budget.
+        let utpTransport: UTPTransport?
+        do {
+            let transport = UTPTransport(socket: try UDPSocket())
+            await transport.start()
+            utpTransport = transport
+        } catch {
+            TorrentLog.log("bootstrap: µTP transport failed: \(error)")
+            utpTransport = nil
+        }
+        defer {
+            if let utpTransport {
+                Task { await utpTransport.stop() }
             }
         }
+
+        // Continuous sweep: drain the pool as peers arrive, refilling worker slots the moment
+        // one frees (a true pipeline, like webtorrent's conn pool) instead of draining fixed
+        // batches. Slower trackers/DHT results join mid-flight.
+        let deadline = ContinuousClock.now + .seconds(90)
+        while ContinuousClock.now < deadline {
+            let active = await pool.queuedCount
+            if active == 0 {
+                // Nothing new yet (trackers still resolving, DHT still bootstrapping). Poll.
+                try? await Task.sleep(for: .milliseconds(250))
+                continue
+            }
+            TorrentLog.log("bootstrap: streaming sweep (pool \(active))")
+            if let result = try await sweepStreaming(pool, infoHash: magnet.infoHash, peerID: peerID, magnet: magnet, utpTransport: utpTransport) {
+                dhtTask.cancel()
+                // Remember the peer that actually served metadata as confirmed-reachable, so the
+                // next resolution for this infohash retries it first instead of re-draining stale
+                // get_peers records.
+                dhtClient?.cacheKnownGood([result.metadataPeer], for: magnet.infoHash)
+                return result
+            }
+        }
+        dhtTask.cancel()
         throw MetadataError.timedOut
     }
 
-    private static func sweepCandidates(
-        _ candidates: some Sequence<PeerAddress>,
+    /// Concurrency-safe peer accumulator: discovery sources (trackers, DHT, injected) append
+    /// peers as each response lands; the sweep workers pull them one at a time.
+    private actor PeerAccumulator {
+        private var queued: [PeerAddress] = []
+        private var seen: Set<PeerAddress> = []
+
+        var queuedCount: Int { queued.count }
+
+        func add(_ peer: PeerAddress) {
+            guard seen.insert(peer).inserted else { return }
+            queued.append(peer)
+        }
+
+        func takeOne() -> PeerAddress? {
+            guard !queued.isEmpty else { return nil }
+            return queued.removeFirst()
+        }
+    }
+
+    /// Streaming peer sweep: `concurrency` workers each pull the next candidate from the live
+    /// pool the moment their slot frees, so the pool is drained continuously at the maximum
+    /// churn rate (mirrors webtorrent's conn-pool `_drain`). Returns on the first peer that
+    /// serves metadata, or nil when the pool drains completely.
+    private static func sweepStreaming(
+        _ pool: PeerAccumulator,
         infoHash: Data,
         peerID: Data,
-        magnet: MagnetLink
+        magnet: MagnetLink,
+        utpTransport: UTPTransport?,
+        concurrency: Int = 48
     ) async throws -> (metainfo: Metainfo, metadataPeer: PeerAddress)? {
-        let list = Array(candidates)
-        guard !list.isEmpty else { return nil }
-        return try await withThrowingTaskGroup(of: (Data, PeerAddress)?.self) { group in
-            var iterator = list.makeIterator()
-            // Balance: webtorrent opens up to ~55 outgoing connections, but too much concurrency
-            // makes peers reject/close (observed `write(9)`/`closed` at 30). 24 is a safe middle
-            // ground that cycles dead peers ~2x faster than 12.
-            let concurrency = min(24, list.count)
-            for _ in 0..<concurrency {
-                guard let peer = iterator.next() else { break }
+        try await withThrowingTaskGroup(of: (Data, PeerAddress)?.self) { group in
+            var active = 0
+            while active < concurrency {
+                guard let peer = await pool.takeOne() else { break }
                 group.addTask {
-                    await fetchMetadata(from: peer, infoHash: infoHash, peerID: peerID)
+                    await fetchMetadata(from: peer, infoHash: infoHash, peerID: peerID, utpTransport: utpTransport)
                 }
+                active += 1
             }
             while let result = try await group.next() {
+                active -= 1
                 if let result {
                     group.cancelAll()
                     let metainfo = try Metainfo(
@@ -387,24 +420,29 @@ public enum MagnetBootstrapper {
                     )
                     return (metainfo, result.1)
                 }
-                if let peer = iterator.next() {
+                // Refill the freed slot from the live pool immediately.
+                if let peer = await pool.takeOne() {
                     group.addTask {
-                        await fetchMetadata(from: peer, infoHash: infoHash, peerID: peerID)
+                        await fetchMetadata(from: peer, infoHash: infoHash, peerID: peerID, utpTransport: utpTransport)
                     }
+                    active += 1
                 }
             }
             return nil
         }
     }
 
-    private static func fetchMetadata(from peer: PeerAddress, infoHash: Data, peerID: Data) async -> (Data, PeerAddress)? {
+    private static func fetchMetadata(from peer: PeerAddress, infoHash: Data, peerID: Data, utpTransport: UTPTransport?) async -> (Data, PeerAddress)? {
+        // Race µTP and TCP (webtorrent opens both `utpOutgoing` + `tcpOutgoing` and keeps the
+        // first to connect). Both share the connect/`metadata` budget, so a dead peer still costs
+        // ~one timeout — but a µTP-only seeder is reachable. Retry once when a peer closes on
+        // connect (fresh connection usually works); timeouts are NOT retried.
         do {
             let fetcher = MetadataFetcher(infoHash: infoHash, peerID: peerID)
-            let infoDict = try await fetcher.fetch(from: peer)
+            let infoDict = try await raceTransports(fetcher, from: peer, utpTransport: utpTransport)
             return (infoDict, peer)
-        } catch let error as PeerStreamError {
-            // A peer that closes on connect usually accepts a fresh connection; try once more.
-            TorrentLog.log("bootstrap: peer \(peer.host) \(error); retrying once")
+        } catch PeerStreamError.closed {
+            TorrentLog.log("bootstrap: peer \(peer.host) closed on connect; retrying once")
             let fetcher = MetadataFetcher(infoHash: infoHash, peerID: peerID)
             do {
                 let infoDict = try await fetcher.fetch(from: peer)
@@ -419,12 +457,40 @@ public enum MagnetBootstrapper {
         }
     }
 
-    private static func dedup(_ peers: [PeerAddress]) -> [PeerAddress] {
-        var seen = Set<PeerAddress>()
-        var out: [PeerAddress] = []
-        for peer in peers where seen.insert(peer).inserted {
-            out.append(peer)
+    /// Runs the TCP (MSE) fetch and the µTP (plaintext) fetch concurrently; the first success
+    /// wins and the loser is cancelled. If no transport succeeds, the first error is returned.
+    private static func raceTransports(_ fetcher: MetadataFetcher, from peer: PeerAddress, utpTransport: UTPTransport?) async throws -> Data {
+        let outcome = await withTaskGroup(of: Result<Data, Error>.self) { group in
+            group.addTask {
+                do {
+                    return .success(try await fetcher.fetch(from: peer))
+                } catch {
+                    return .failure(error)
+                }
+            }
+            if let utpTransport {
+                group.addTask {
+                    do {
+                        return .success(try await fetcher.fetchUTP(from: peer, transport: utpTransport))
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+            }
+            var firstFailure: Error?
+            while let result = await group.next() {
+                switch result {
+                case .success(let data):
+                    group.cancelAll()
+                    return Result<Data, Error>.success(data)
+                case .failure(let error):
+                    if firstFailure == nil {
+                        firstFailure = error
+                    }
+                }
+            }
+            return Result<Data, Error>.failure(firstFailure ?? MetadataError.timedOut)
         }
-        return out
+        return try outcome.get()
     }
 }

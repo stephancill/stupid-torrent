@@ -19,7 +19,7 @@ public final class UDPTrackerClient: TrackerClient, @unchecked Sendable {
         connectRequest.appendUInt32BE(0) // action connect
         connectRequest.appendUInt32BE(UInt32(bitPattern: connectTxn))
         try socket.send(connectRequest, to: host, port: port)
-        guard let connectResponse = try socket.receive(timeout: 15), connectResponse.count >= 16,
+        guard let connectResponse = try socket.receive(timeout: 5), connectResponse.count >= 16,
               connectResponse.readUInt32BE(at: 0) == 0,
               connectResponse.readInt32BE(at: 4) == connectTxn else {
             throw TrackerError.malformedResponse("bad UDP connect response")
@@ -43,7 +43,7 @@ public final class UDPTrackerClient: TrackerClient, @unchecked Sendable {
         announce.appendUInt16BE(request.port)
 
         try socket.send(announce, to: host, port: port)
-        guard let response = try socket.receive(timeout: 15), response.count >= 20 else {
+        guard let response = try socket.receive(timeout: 5), response.count >= 20 else {
             throw TrackerError.malformedResponse("bad UDP announce response")
         }
 

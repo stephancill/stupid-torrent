@@ -69,7 +69,12 @@ public final class PeerStream: @unchecked Sendable, PeerTransport {
 
     public func connect(timeout: TimeInterval = 10) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            Task.detached(priority: .utility) { [weak self] in
+            // Run the blocking connect() on a dedicated Thread, NOT `Task.detached` on the
+            // cooperative pool: a pool with ~8 threads blocks a `poll()` for up to `timeout`
+            // seconds each, so 40+ concurrent connects queue behind it and a peer's 3s timeout
+            // task closes the stream while a queued connect is still pending -> connect() runs
+            // on a closed fd (EBADF). A raw thread gives true parallel connects.
+            let thread = Thread { [weak self] in
                 guard let self else {
                     continuation.resume(throwing: PeerStreamError.closed)
                     return
@@ -81,6 +86,8 @@ public final class PeerStream: @unchecked Sendable, PeerTransport {
                     continuation.resume(throwing: error)
                 }
             }
+            thread.name = "peer-connect"
+            thread.start()
         }
         startReader()
     }
@@ -93,7 +100,9 @@ public final class PeerStream: @unchecked Sendable, PeerTransport {
     public func send(_ data: Data) async throws {
         let payload = currentEncryptTransform?(data) ?? data
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            Task.detached(priority: .utility) { [weak self] in
+            // Same rationale as `connect`: a blocking `write()` on the cooperative pool can queue
+            // behind other tasks and then run on a stream the timeout task already closed (EBADF).
+            let thread = Thread { [weak self] in
                 guard let self else {
                     continuation.resume(throwing: PeerStreamError.closed)
                     return
@@ -105,6 +114,8 @@ public final class PeerStream: @unchecked Sendable, PeerTransport {
                     continuation.resume(throwing: error)
                 }
             }
+            thread.name = "peer-send"
+            thread.start()
         }
     }
 

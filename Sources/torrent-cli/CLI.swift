@@ -16,6 +16,8 @@ struct TorrentCLI {
         switch args[1] {
         case "add":
             await add(Array(args.dropFirst(2)))
+        case "resolve":
+            await resolve(Array(args.dropFirst(2)))
         case "verify":
             await verify(Array(args.dropFirst(2)))
         case "tracker":
@@ -38,6 +40,7 @@ struct TorrentCLI {
         torrent-cli v\(TorrentCore.version)
         usage:
           torrent-cli add <file.torrent|magnet:...> [--dir <dir>] [--stop-at <bytes>] [--peer host:port] [--verbose]
+          torrent-cli resolve <magnet:...> [--verbose]   (metadata resolution benchmark only)
           torrent-cli verify <file.torrent> [--dir <dir>]
           torrent-cli tracker <announce-url> --info-hash <hex40> [--verbose]
           torrent-cli stream-test <file.torrent> [--dir <dir>] [--file <index>] [--seed-until <bytes>] [--peer host:port]
@@ -96,6 +99,30 @@ struct TorrentCLI {
             print("ECHO: \(String(decoding: echo, as: UTF8.self))")
         } catch {
             print("FAILED: \(error)")
+        }
+    }
+
+    static func resolve(_ args: [String]) async {
+        guard let path = args.first else {
+            print("usage: torrent-cli resolve <magnet:...> [--verbose]")
+            return
+        }
+        if args.contains("--verbose") { TorrentLog.verbose = true }
+        do {
+            let magnet = try MagnetLinkParser.parse(path)
+            print("Resolving \(magnet.displayName ?? magnet.infoHash.hexString)...")
+            let start = ContinuousClock.now
+            let result = try await MagnetBootstrapper.metainfoAndPeer(from: magnet)
+            let elapsed = start.duration(to: .now)
+            print("RESOLVED in \(String(format: "%.1f", Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18))s")
+            print("  name:  \(result.metainfo.name)")
+            print("  hash:  \(result.metainfo.infoHash.hexString)")
+            print("  size:  \(result.metainfo.totalLength) bytes, \(result.metainfo.pieceCount) pieces")
+            if let peer = result.metadataPeer {
+                print("  peer:  \(peer.host):\(peer.port)")
+            }
+        } catch {
+            print("error: \(error)")
         }
     }
 

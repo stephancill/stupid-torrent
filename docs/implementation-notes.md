@@ -449,4 +449,54 @@ Observed: the app hovered at ~0 / 16.4 / 32.8 KB/s (1-2 blocks/s) for minutes be
 
 **Verification** (live QxR swarm): pool now holds **20-47 peers** (was 2-5); ~766 connect attempts in 60 s (was ~96 in 90 s). Pieces verify through stall/requeue cycles (piece 0 reached 512/512 bytes after two 20 s stalls); speeds reach 500-880 KB/s. Full suite: 49 tests green.
 
+### 2026-08-08 — Download pause/resume (engine + app, Phase 8 polish)
+
+`TorrentStatus.State.paused` existed but was never published, and `TorrentItem.pauseResume()` was never wired to any UI. Implemented real pause/resume.
+
+**Engine** (`Torrent.swift`):
+- `pause()`: guard `isRunning && !isPaused`; set `isPaused`, tear the network down immediately via the new `stopNetwork()` (announce/DHT/ticker cancelled, TCP listener + µTP stopped, peer queue cleared, all peers disconnected), flush the `.verified` sidecar, announce `.stopped`, publish `.paused`. Storage stays open so streaming of downloaded pieces keeps working.
+- `resume()`: guard `isRunning && isPaused`; clear the flag, reset `firstAnnounce` (so the tracker gets a fresh `.started`), publish.
+- `run()` now **parks while paused** (250 ms sleep loop) instead of exiting, and on resume calls `startNetworkMachinery()` again (extracted from `run()`: announce loop + DHT loop + listener + ticker). A pause can interleave with a machinery start via actor reentrancy, so the park block also tears down machinery it finds already started (`if networkStarted { await stopNetwork() }`) before parking. Teardown announces are now gated on `networkStarted` so a never-started (paused-at-entry / completed) torrent doesn't announce `.stopped`.
+- `publishStatus()` now emits `.paused` when `isPaused`.
+- Peer-coordination guards: `considerPeer`/`drainPeerPool`/`scheduleReconnect`/`flushReconnect` no-op while paused, so in-flight sessions can't re-dial after a pause.
+- `stop()` reuses `stopNetwork()` and clears `isPaused`.
+- New `running` accessor (`isRunning`) and an `enableDHT` init flag (default `true`; off keeps `swift test` hermetic — the DHT loop otherwise fires real lookups).
+
+**App**: `TorrentItem.isPaused` (from the broadcast state) + `togglePause()` (calls `torrent.pause()`/`resume()`; the status/run tasks stay alive across both). UI: leading swipe action "Pause"/"Resume" on list rows, a `pause.circle` icon + "Paused" caption on paused rows (instead of pie/ETA), and a Pause/Resume button at the top of the detail Status section.
+
+**Tests** (`TorrentPauseResumeTests`, +2 → 51 total): `pauseAndResumeControlDownloadState` — pause/resume before run are no-ops; waits for `torrent.running`, then pause → `.paused` with 0 peers, resume → `.downloading`, pause again → `.paused` (tracker-less BBB metainfo + `enableDHT: false`, so no network beyond loopback). `pauseIsNoOpForCompleteTorrent` — a sidecar-complete torrent stays `.seeding` through pause/resume.
+
+**Verification**: `swift test` 51 green; live `torrent-cli add Fixtures/big-buck-bunny.torrent --stop-at 2MB` confirms the refactored `run()` (machinery start, park loop, `networkStarted`-gated teardown) still downloads and verifies from the live swarm.
+
+Note: paused state is intentionally not persisted — a relaunch resumes an in-progress torrent (the app already restores progress from the `.verified` sidecar).
+
+### 2026-08-08 — Magnet metadata resolution: 200s → ~4s (Backrooms live swarm)
+
+Benchmarked the Backrooms magnet (`3b124452…`) with a new `torrent-cli resolve` command (times `MagnetBootstrapper.metainfoAndPeer` only; `add` skips bootstrapping once a `.torrent` is saved). Baseline: **200.3 s**. Final: **2.9-8.4 s** (warm DHT cache), **4.1 s** cold cache. WebTorrent: ~1.6 s (lucky first-peer). Root causes vs webtorrent and fixes:
+
+1. **Batch-then-sweep discovery → streaming pool** (`MetadataExchange.swift`). The old flow announced to ALL trackers (awaiting the slowest — a dead UDP tracker gated the sweep for its full 15 s), then drained DHT peers only after the full lookup, then swept fixed 300-peer batches. Rewrote `metainfoAndPeer` around a `PeerAccumulator` actor: trackers and DHT append peers as each response lands, and a continuous `sweepStreaming` loop drains the pool with N workers, refilling each slot the moment it frees — no announce gate, no batch boundaries, no inter-round sleeps.
+2. **`connect(9)` EBADF storm — the big one.** `PeerStream.connect`/`send` ran the blocking syscall on `Task.detached` (cooperative pool). ~8 threads means 40+ concurrent connects queue; a peer's 3 s timeout task then closes the stream while a queued `connect()` is still pending, so `connect()` runs on a closed fd → EBADF. Reproduced in isolation: 40 concurrent connects = 24× EBADF + 16× timeout. Fixed by (a) running connect/send on a dedicated `Thread` (true parallelism — 40 connects now drain in 2 s, was 15 s) and (b) arming the per-fetch timeout only AFTER connect completes (connect has its own 2 s budget). This alone took the sweep from 0 peers reaching MSE to several completing handshakes.
+3. **DHT lookup short-circuited at the first peer** (`DHTClient.lookup` had `if !peers.isEmpty { break }`) → sparse swarms returned 1 peer. Removed it: the full iterative closest-node search now returns 554 peers for Backrooms (was 1).
+4. **DHT peer cache** (`DHTClient`): persisted live peers per infohash (`stupid-torrent-dht.peers`, mirroring bittorrent-dht's peer store). `cachedPeers(infoHash:)` emits up to 500 cached peers at t=0 before any network query — warm resolutions start from known-reachable peers. Also added cancellation checks so `dhtTask.cancel()` takes effect promptly.
+5. **Per-fetch timeouts tightened** to match webtorrent's cycle speed: connect 3 s→2 s, metadata fetch 5 s→3 s, sweep concurrency 24→48, retry-once only for `PeerStreamError.closed` (a timed-out peer stays dead). UDP tracker receive timeout 15 s→5 s (a packet-dropping tracker no longer stalls every round).
+
+`PeerStream.connect`/`send` thread change applies to the download path too (same pattern). New `torrent-cli resolve <magnet>` benchmark command kept (it's the dev harness for future regressions). 51 tests green; `add` flow verified end-to-end (metadata resolved, `.torrent` saved, known-good metadata peer injected into the download).
+
+### 2026-08-08 — Known-good peer cache (warm-path follow-up)
+
+Timeline tracing of a 7.6s resolve showed the first ~5s was spent draining the 500 cached `get_peers` records — which are ~99% stale/NAT'd garbage, same as tracker lists — before the fresh tracker peers hit a live seeder. Raw DHT records are not "known-reachable", so caching them wholesale just delays the lottery.
+
+**Change** (`DHTClient.swift`): the peer cache now stores a `good` flag per peer (line format `… <port> 0|1`). `cacheKnownGood(_:for:)` marks peers that completed a real handshake / served metadata as `good`, persists them immediately, and orders them FIRST so the next resolution for that infohash retries them before the stale records. `MagnetBootstrapper` calls it with the metadata-serving peer on success. Cached good peers for Backrooms: `151.243.141.9`, `69.4.196.10`.
+
+### 2026-08-08 — µTP for the metadata fetch + DHT lookup streaming
+
+**µTP metadata fetch** (`MetadataExchange.swift`): `MetadataFetcher` now has `fetchUTP(from:transport:)` — µTP (BEP 29) with a plaintext BT handshake (µTP is its own transport; MSE stays TCP-only, mirroring the download path). The protocol exchange (BT handshake → extended handshake → ut_metadata `_requestPieces`-style all-pieces burst) was extracted into `performMetadataExchange(stream:)` shared by both transports. `MagnetBootstrapper` creates one outbound-only `UTPTransport`, and `fetchMetadata` **races µTP + TCP per peer** (webtorrent's `utpOutgoing` + `tcpOutgoing`): first success wins, loser cancelled; both share the same connect/metadata budget so dead peers still cost ~one timeout. Verified: 5 µTP connects + 4 TCP MSE handshakes in a single resolve run.
+
+**DHT lookup streaming** (`DHTClient.swift`): `lookup` gained an `onPeers` callback (per-`get_peers`-batch delivery, webtorrent's streaming model) and an early-exit at 200 peers so the sweep is fed long before the 20s budget elapses. `MagnetBootstrapper` feeds each batch into the pool immediately.
+
+**Result**: resolve went from never-in-120s → 200s → ~2.9-10s. µTP reaches more peers but does NOT change the resolve time on this swarm — the bottleneck is not transport. Timeline traces show ~5-6s is spent draining the 500 cached `get_peers` records (all stale/NAT'd) and waiting on slow tracker announces (~5.9s for the bulk), before a live tracker peer serves metadata at ~7s. **WebTorrent's ~1.6s comes from a live DHT node**: it ingests `announce_peer` records continuously, so its peer store holds currently-active peers and the first connection attempts hit them. We don't ingest inbound DHT queries (a pure `get_peers` client), so our store is only ever `get_peers` garbage. Closing that gap = implementing inbound DHT query handling (`ping`/`find_node`/`get_peers`/`announce_peer`) + announcing ourselves (BEP 5 node, not just client). 51 tests green.
+
+
+
+
 
