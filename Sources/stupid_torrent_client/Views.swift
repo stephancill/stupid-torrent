@@ -265,11 +265,6 @@ struct TorrentDetailView: View {
         List {
             if let status = item.status, !status.isComplete {
                 Section("Status") {
-                    Button {
-                        item.togglePause()
-                    } label: {
-                        Label(item.isPaused ? "Resume" : "Pause", systemImage: item.isPaused ? "play.circle" : "pause.circle")
-                    }
                     LabeledContent("Progress", value: "\(Int(status.progress * 100))%")
                     LabeledContent("Pieces", value: "\(status.verifiedCount)/\(status.pieceCount)")
                     LabeledContent("Download", value: byteRateString(status.downloadRate))
@@ -302,15 +297,26 @@ struct TorrentDetailView: View {
                     .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
                 }
             }
-            Section("Actions") {
+        }
+        .navigationTitle(item.name)
+        .toolbar {
+            Menu {
+                if let status = item.status, !status.isComplete {
+                    Button {
+                        item.togglePause()
+                    } label: {
+                        Label(item.isPaused ? "Resume" : "Pause", systemImage: item.isPaused ? "play" : "pause")
+                    }
+                }
                 Button {
                     copyMagnet()
                 } label: {
                     Label(copiedMagnet ? "Copied" : "Copy Magnet", systemImage: copiedMagnet ? "checkmark" : "link")
                 }
+            } label: {
+                Image(systemName: "ellipsis.circle")
             }
         }
-        .navigationTitle(item.name)
         #if os(iOS)
         .fullScreenCover(isPresented: $showPlayer) {
             if let streamSession {
