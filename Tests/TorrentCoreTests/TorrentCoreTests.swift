@@ -549,3 +549,90 @@ extension Data {
         #expect(responderRecv == responderSend &+ 1)
     }
 }
+
+@Suite struct TorrentPauseResumeTests {
+    /// BBB metainfo without any trackers and no DHT, so `run()` only touches loopback.
+    private func torrentMetainfo() throws -> Metainfo {
+        let source = try Metainfo(data: try Fixtures.bigBuckBunnyTorrentData)
+        return try Metainfo(infoDict: source.infoDict, trackers: [])
+    }
+
+    private func tempDir() -> URL {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// Waits (bounded) until the broadcast's current state matches `expected`.
+    private func waitForState(_ torrent: Torrent, _ expected: TorrentStatus.State, timeout: Duration = .seconds(5)) async -> TorrentStatus.State {
+        var state = await torrent.statusBroadcast.value.state
+        let deadline = ContinuousClock.now + timeout
+        while state != expected && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(50))
+            state = await torrent.statusBroadcast.value.state
+        }
+        return state
+    }
+
+    /// Waits until the run loop is actually active (the engine started, past the initial seeded
+    /// status which is already `.downloading`).
+    private func waitUntilRunning(_ torrent: Torrent, timeout: Duration = .seconds(5)) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while !(await torrent.running) && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return await torrent.running
+    }
+
+    @Test func pauseAndResumeControlDownloadState() async throws {
+        let metainfo = try torrentMetainfo()
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let torrent = Torrent(directory: dir, metainfo: metainfo, enableDHT: false)
+        let runTask = Task { await torrent.run() }
+        defer { runTask.cancel() }
+        defer { Task { await torrent.stop() } }
+
+        // Not running yet: pause/resume are no-ops and never flip to paused.
+        await torrent.pause()
+        #expect(await torrent.statusBroadcast.value.state != .paused)
+        await torrent.resume()
+        #expect(await torrent.statusBroadcast.value.state != .paused)
+
+        #expect(await waitUntilRunning(torrent))
+
+        await torrent.pause()
+        #expect(await torrent.statusBroadcast.value.state == .paused)
+        #expect(await torrent.statusBroadcast.value.peers == 0)
+
+        await torrent.resume()
+        #expect(await waitForState(torrent, .downloading) == .downloading)
+
+        await torrent.pause()
+        #expect(await torrent.statusBroadcast.value.state == .paused)
+
+        // Fully shut the engine down before the temp dir is removed.
+        await torrent.stop()
+    }
+
+    @Test func pauseIsNoOpForCompleteTorrent() async throws {
+        let metainfo = try torrentMetainfo()
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        var full = Data()
+        full.appendUInt32BE(UInt32(metainfo.pieceCount))
+        full.append(Bitfield(bits: [Bool](repeating: true, count: metainfo.pieceCount)).data())
+        try full.write(to: dir.appendingPathComponent(".\(metainfo.infoHash.hexString).verified"))
+
+        let torrent = Torrent(directory: dir, metainfo: metainfo, enableDHT: false)
+        await torrent.run()
+        #expect(await torrent.statusBroadcast.value.state == .seeding)
+        #expect(!(await torrent.running))
+
+        // A complete torrent has no network to pause; the state stays seeding.
+        await torrent.pause()
+        #expect(await torrent.statusBroadcast.value.state == .seeding)
+        await torrent.resume()
+        #expect(await torrent.statusBroadcast.value.state == .seeding)
+    }
+}

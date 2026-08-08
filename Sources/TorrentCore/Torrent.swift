@@ -10,6 +10,9 @@ public actor Torrent {
     private let peerID: Data
     private let maxActivePeers: Int
     private let stopAfterBytes: Int64?
+    /// DHT (BEP 5) peer discovery is best-effort; off for hermetic tests that must not touch the
+    /// network beyond loopback.
+    private let enableDHT: Bool
 
     var picker: PiecePicker
     private var receivedBlocks: [Int: Set<Int>] = [:]
@@ -58,6 +61,13 @@ public actor Torrent {
     private var dhtTask: Task<Void, Never>?
     private var tickerTask: Task<Void, Never>?
     private var isRunning = false
+    /// Whether the download is paused. `pause()` tears down the network immediately and parks
+    /// `run()`'s loop; `resume()` clears the flag and the loop restarts the machinery.
+    private var isPaused = false
+    /// Whether the announce/DHT/listener/ticker machinery has been started in the current run
+    /// cycle. A torrent that never started networking (paused at entry, or completed) must not
+    /// announce `.stopped` on teardown.
+    private var networkStarted = false
     private var firstAnnounce = true
     private var verifiedDirty = false
 
@@ -69,12 +79,13 @@ public actor Torrent {
     private var uploadRate: Double = 0
     private var lastSeeders = 0
 
-    public init(directory: URL, metainfo: Metainfo, peerID: Data = PeerID.generate(), maxActivePeers: Int = 50, stopAfterBytes: Int64? = nil) {
+    public init(directory: URL, metainfo: Metainfo, peerID: Data = PeerID.generate(), maxActivePeers: Int = 50, stopAfterBytes: Int64? = nil, enableDHT: Bool = true) {
         self.directory = directory
         self.metainfo = metainfo
         self.peerID = peerID
         self.maxActivePeers = maxActivePeers
         self.stopAfterBytes = stopAfterBytes
+        self.enableDHT = enableDHT
         self.storage = Storage(directory: directory, metainfo: metainfo)
         self.picker = PiecePicker(pieceCount: metainfo.pieceCount, verified: [Bool](repeating: false, count: metainfo.pieceCount))
         // Seed the broadcast with the restored state (from the resume sidecar) so subscribers
@@ -106,6 +117,9 @@ public actor Torrent {
 
     public var verifiedCount: Int { picker.verified.setCount }
 
+    /// Whether the run loop is active (including while parked by a pause).
+    public var running: Bool { isRunning }
+
     /// Test/dev hook: inject a specific peer address to connect to directly, bypassing trackers.
     public func addPeer(host: String, port: UInt16) {
         considerPeer(PeerAddress(host: host, port: port))
@@ -123,28 +137,32 @@ public actor Torrent {
         // peer lookup, no listener, no seeding. It just sits there so the user can access and
         // stream the downloaded files. (Streaming reads reopen file handles on demand, so we don't
         // close storage here — `stop()` closes it on removal.)
-        if picker.verified.allSet {
+        if picker.verified.allSet && !isPaused {
             await publishStatus()
             isRunning = false
             return
         }
 
-        announceTask = Task { [weak self] in
-            await self?.announceLoop()
+        if !isPaused {
+            await startNetworkMachinery()
         }
-        dhtTask = Task { [weak self] in
-            await self?.dhtLoop()
-        }
-        await startListener()
-        tickerTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1))
-                await self?.tick()
-            }
-        }
-        await publishStatus()
 
         while !Task.isCancelled {
+            // Park while paused; `resume()` flips the flag and the loop restarts the machinery.
+            if isPaused {
+                // A pause can interleave with a machinery start (actor reentrancy at an await), so
+                // the machinery may already be up when we notice the flag — tear it down before
+                // parking so nothing runs while paused.
+                if networkStarted {
+                    await stopNetwork()
+                }
+                while isPaused && !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(250))
+                }
+                if Task.isCancelled { break }
+                await startNetworkMachinery()
+                continue
+            }
             if picker.verified.allSet { break }
             if let stopAfter = stopAfterBytes {
                 let verifiedBytes = picker.verified.setCount * metainfo.pieceLength
@@ -158,16 +176,45 @@ public actor Torrent {
         dhtTask?.cancel()
         disconnectAllPeers()
         try? await storage.saveVerified()
-        let _ = await announceAll(event: picker.verified.allSet ? .completed : .none)
-        let _ = await announceAll(event: .stopped)
+        if networkStarted {
+            let _ = await announceAll(event: picker.verified.allSet ? .completed : .none)
+            let _ = await announceAll(event: .stopped)
+        }
         await storage.close()
         isRunning = false
     }
 
-    public func stop() async {
+    /// Starts the announce loop, DHT lookup loop, inbound listener, and ticker. Called at the start
+    /// of `run()` and again each time the download resumes from a pause.
+    private func startNetworkMachinery() async {
+        guard !isPaused else { return }
+        networkStarted = true
+        announceTask = Task { [weak self] in
+            await self?.announceLoop()
+        }
+        if enableDHT {
+            dhtTask = Task { [weak self] in
+                await self?.dhtLoop()
+            }
+        }
+        await startListener()
+        tickerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                await self?.tick()
+            }
+        }
+        await publishStatus()
+    }
+
+    /// Tears down the download machinery: announce/DHT/ticker tasks cancelled, listener and µTP
+    /// closed, peer queue cleared, all peers disconnected. Leaves the verified bitfield and storage
+    /// intact (streaming still works for downloaded pieces). Used by `pause()` and by `run()`'s
+    /// parked loop when a pause interleaved with a machinery start.
+    private func stopNetwork() async {
         announceTask?.cancel()
-        tickerTask?.cancel()
         dhtTask?.cancel()
+        tickerTask?.cancel()
         listener?.close()
         listenerThread?.cancel()
         await utpTransport?.stop()
@@ -179,6 +226,33 @@ public actor Torrent {
         queuedPeerAddresses.removeAll()
         connectAttempts.removeAll()
         disconnectAllPeers()
+        networkStarted = false
+    }
+
+    /// Pauses the download: tears the network down immediately (peers disconnected, listener and
+    /// µTP closed, announce/DHT/ticker stopped, bitfield flushed) and publishes `.paused`. `run()`
+    /// parks until `resume()`. Storage stays open so streaming still works for downloaded pieces.
+    public func pause() async {
+        guard isRunning, !isPaused else { return }
+        isPaused = true
+        await stopNetwork()
+        try? await storage.saveVerified()
+        let _ = await announceAll(event: .stopped)
+        await publishStatus()
+    }
+
+    /// Resumes a paused download. `run()`'s parked loop notices the flag and restarts the network
+    /// machinery (re-announcing `.started` so the tracker picks us up again).
+    public func resume() async {
+        guard isRunning, isPaused else { return }
+        isPaused = false
+        firstAnnounce = true
+        await publishStatus()
+    }
+
+    public func stop() async {
+        isPaused = false
+        await stopNetwork()
         let _ = await announceAll(event: .stopped)
         try? await storage.saveVerified()
         await storage.close()
@@ -479,6 +553,7 @@ public actor Torrent {
     /// at/near `maxActivePeers`: every queue add and every freed slot triggers a drain, so the
     /// client stays connected to as many live peers as possible (mirrors webtorrent's `_drain`).
     private func considerPeer(_ address: PeerAddress) {
+        guard !isPaused else { return }
         guard !bannedPeers.contains(where: { peerSessions[$0]?.address == address }) else { return }
         guard !pendingPeerAddresses.contains(address),
               !queuedPeerAddresses.contains(address),
@@ -489,6 +564,7 @@ public actor Torrent {
     }
 
     private func drainPeerPool() {
+        guard !isPaused else { return }
         while pendingPeerAddresses.count + activePeerIDs.count < maxActivePeers, !peerQueue.isEmpty {
             let address = peerQueue.removeFirst()
             queuedPeerAddresses.remove(address)
@@ -520,7 +596,7 @@ public actor Torrent {
     /// keeps cycling candidates like webtorrent's `RECONNECT_WAIT`. Injected/manual peers and
     /// already-queued/pending ones are not re-queued (avoids duplicate attempts).
     private func scheduleReconnect(_ address: PeerAddress) {
-        guard isRunning else { return }
+        guard isRunning, !isPaused else { return }
         let attempts = connectAttempts[address] ?? 0
         guard attempts < maxReconnectAttempts else {
             connectAttempts.removeValue(forKey: address)
@@ -540,7 +616,7 @@ public actor Torrent {
     /// Called by the reconnect timer: moves a backoff-queued peer back into the connection queue
     /// and drains the pool (webtorrent's `conn.on('close')` → `_addPeer` + `_drain`).
     private func flushReconnect(_ address: PeerAddress) {
-        guard isRunning else { return }
+        guard isRunning, !isPaused else { return }
         guard queuedPeerAddresses.remove(address) != nil else { return }
         peerQueue.append(address)
         drainPeerPool()
@@ -766,7 +842,13 @@ public actor Torrent {
     }
 
     private func publishStatus() async {
-        let state: TorrentStatus.State = picker.verified.allSet ? .seeding : .downloading
+        let state: TorrentStatus.State = if isPaused {
+            .paused
+        } else if picker.verified.allSet {
+            .seeding
+        } else {
+            .downloading
+        }
         let status = TorrentStatus(
             name: metainfo.name,
             infoHash: metainfo.infoHash,

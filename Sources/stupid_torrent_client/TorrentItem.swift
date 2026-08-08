@@ -40,6 +40,8 @@ final class TorrentItem: Identifiable, Hashable {
 
     var isComplete: Bool { status?.isComplete ?? false }
 
+    var isPaused: Bool { status?.state == .paused }
+
     func start() {
         guard statusTask == nil else { return }
         statusTask = Task { [weak self] in
@@ -61,11 +63,14 @@ final class TorrentItem: Identifiable, Hashable {
         runTask = nil
     }
 
-    func pauseResume() {
-        if runTask != nil {
-            stop()
+    /// Pauses or resumes the download. The status/run tasks stay alive across both — `pause()`
+    /// tears down the engine's network while `run()` parks, and `resume()` restarts it.
+    func togglePause() {
+        guard !isComplete else { return }
+        if isPaused {
+            Task { await torrent.resume() }
         } else {
-            start()
+            Task { await torrent.pause() }
         }
     }
 

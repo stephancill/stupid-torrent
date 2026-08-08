@@ -120,6 +120,12 @@ struct ContentView: View {
                 store.remove(item)
             }
         }
+        .swipeActions(edge: .leading) {
+            Button(item.isPaused ? "Resume" : "Pause") {
+                item.togglePause()
+            }
+            .tint(item.isPaused ? .blue : .orange)
+        }
     }
 }
 
@@ -152,6 +158,9 @@ struct TorrentRow: View {
                 if status.isComplete {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.secondary)
+                } else if item.isPaused {
+                    Image(systemName: "pause.circle")
+                        .foregroundStyle(.secondary)
                 } else {
                     PieProgressView(progress: status.progress)
                         .frame(width: 20, height: 20)
@@ -165,7 +174,7 @@ struct TorrentRow: View {
                 .font(.body)
                 .lineLimit(1)
             Spacer()
-            Text(eta ?? relativeTime(item.addedAt))
+            Text(item.isPaused ? "Paused" : (eta ?? relativeTime(item.addedAt)))
                 .font(.body)
                 .foregroundStyle(.secondary)
         }
@@ -256,6 +265,11 @@ struct TorrentDetailView: View {
         List {
             if let status = item.status, !status.isComplete {
                 Section("Status") {
+                    Button {
+                        item.togglePause()
+                    } label: {
+                        Label(item.isPaused ? "Resume" : "Pause", systemImage: item.isPaused ? "play.circle" : "pause.circle")
+                    }
                     LabeledContent("Progress", value: "\(Int(status.progress * 100))%")
                     LabeledContent("Pieces", value: "\(status.verifiedCount)/\(status.pieceCount)")
                     LabeledContent("Download", value: byteRateString(status.downloadRate))
