@@ -24,6 +24,11 @@ public actor Torrent {
     private var activePieces: Set<Int> = []
     private var outstanding: [BlockKey: UUID] = [:]
     private var blockSenders: [BlockKey: UUID] = [:]
+    /// How many peers currently have an outstanding request for each block. Missing blocks get
+    /// re-requested endgame-style, but bounding the redundancy stops a missing block that only a
+    /// dead peer can serve from flooding every peer's pipeline (which stalls the download).
+    private var outstandingCounts: [BlockKey: Int] = [:]
+    private let maxMissingRedundancy = 2
     private var pieceFailures: [Int: Int] = [:]
     private let maxPieceFailures = 5
     /// When each active piece last received a block. Pieces that stop making progress are
@@ -273,9 +278,10 @@ public actor Torrent {
         // Prefer an active piece with remaining blocks, lowest index first. Only request blocks
         // for pieces the peer claims to have (its bitfield/have messages); a peer without the
         // piece can never serve it, so requesting is wasted round-trips.
+        let excluded = peer.outstandingKeys
         let sortedActive = activePieces.sorted()
         for piece in sortedActive {
-            if peer.hasPiece(piece), let block = nextBlock(in: piece) {
+            if peer.hasPiece(piece), let block = nextBlock(in: piece, excluding: excluded) {
                 registerOutstanding(block, peer: peer)
                 return block
             }
@@ -291,41 +297,67 @@ public actor Torrent {
         if receivedBlocks[piece] == nil { receivedBlocks[piece] = [] }
         if pieceReceivedBytes[piece] == nil { pieceReceivedBytes[piece] = 0 }
         if pieceBlockCursor[piece] == nil { pieceBlockCursor[piece] = 0 }
-        if let block = nextBlock(in: piece) {
+        if let block = nextBlock(in: piece, excluding: excluded) {
             registerOutstanding(block, peer: peer)
             return block
         }
         return nil
     }
 
-    private func nextBlock(in piece: Int) -> Block? {
+    private func nextBlock(in piece: Int, excluding: Set<BlockKey>) -> Block? {
         let pieceLength = self.pieceLength(piece)
         guard let cursor = pieceBlockCursor[piece] else { return nil }
         if cursor < pieceLength {
             let length = min(PeerMessage.blockSize, pieceLength - cursor)
             pieceBlockCursor[piece] = cursor + length
+            let key = BlockKey(index: piece, begin: cursor)
+            guard !excluding.contains(key) else { return nextBlock(in: piece, excluding: excluding) }
             return Block(index: piece, begin: cursor, length: length)
         }
         // The cursor is exhausted (every block was allocated once) but the piece is still missing
-        // blocks — the peers they were handed to never delivered them. Re-request the next missing
-        // block immediately (endgame-style) instead of waiting for the 20s stall timer, so a
-        // near-complete piece finishes in one round-trip rather than stalling the download.
+        // blocks — the peers they were handed to never delivered them. Re-request the missing
+        // blocks immediately (endgame-style) instead of waiting for the 20s stall timer. Serve each
+        // peer distinct blocks it doesn't already have in flight, bounded to `maxMissingRedundancy`
+        // concurrent requests per block so a block only a dead peer holds doesn't flood every
+        // peer's pipeline — peers that can't help fall through to the next piece.
+        let count = neededBlockCount(piece)
         let received = receivedBlocks[piece] ?? []
-        guard received.count < neededBlockCount(piece) else { return nil }
-        let missing = nextMissingOffset(piece)
-        guard !received.contains(missing) else { return nil }
-        return Block(index: piece, begin: missing, length: min(PeerMessage.blockSize, pieceLength - missing))
+        guard received.count < count else { return nil }
+        for index in 0..<count {
+            let offset = index * PeerMessage.blockSize
+            guard !received.contains(offset) else { continue }
+            let key = BlockKey(index: piece, begin: offset)
+            guard !excluding.contains(key) else { continue }
+            if (outstandingCounts[key] ?? 0) < maxMissingRedundancy {
+                return Block(index: piece, begin: offset, length: min(PeerMessage.blockSize, pieceLength - offset))
+            }
+        }
+        return nil
     }
 
     private func registerOutstanding(_ block: Block, peer: PeerSession) {
         let key = BlockKey(index: block.index, begin: block.begin)
         outstanding[key] = peer.id
         blockSenders[key] = peer.id
+        outstandingCounts[key, default: 0] += 1
+    }
+
+    /// Removes a block from the outstanding/ownership/count tracking. Safe to call multiple times
+    /// (a block received, its peer dropped, or its piece completed) — the count is decremented only
+    /// while it remains registered.
+    private func unregisterBlock(_ key: BlockKey) {
+        outstanding.removeValue(forKey: key)
+        blockSenders.removeValue(forKey: key)
+        if let count = outstandingCounts[key], count > 1 {
+            outstandingCounts[key] = count - 1
+        } else {
+            outstandingCounts.removeValue(forKey: key)
+        }
     }
 
     func receivedBlock(_ block: Block, data: Data, from peer: PeerSession) async {
         guard activePieces.contains(block.index) else { return }
-        outstanding.removeValue(forKey: BlockKey(index: block.index, begin: block.begin))
+        unregisterBlock(BlockKey(index: block.index, begin: block.begin))
 
         var blocks = receivedBlocks[block.index] ?? []
         let isNew = blocks.insert(block.begin).inserted
@@ -393,8 +425,7 @@ public actor Torrent {
         pendingPeerAddresses.remove(peer.address)
         // Re-request any blocks that peer had outstanding.
         for (key, owner) in outstanding where owner == peer.id {
-            outstanding.removeValue(forKey: key)
-            blockSenders.removeValue(forKey: key)
+            unregisterBlock(key)
             if let cursor = pieceBlockCursor[key.index] {
                 pieceBlockCursor[key.index] = min(cursor, key.begin)
             }
@@ -423,8 +454,7 @@ public actor Torrent {
         pieceFailures.removeValue(forKey: piece)
         pieceLastProgress.removeValue(forKey: piece)
         for key in outstanding.keys where key.index == piece {
-            outstanding.removeValue(forKey: key)
-            blockSenders.removeValue(forKey: key)
+            unregisterBlock(key)
         }
         verifiedDirty = true
         // Persist completion the moment it's reached, so a relaunch never shows a finished
@@ -443,8 +473,7 @@ public actor Torrent {
         pieceBlockCursor.removeValue(forKey: piece)
         pieceLastProgress.removeValue(forKey: piece)
         for key in outstanding.keys where key.index == piece {
-            outstanding.removeValue(forKey: key)
-            blockSenders.removeValue(forKey: key)
+            unregisterBlock(key)
         }
     }
 
@@ -463,8 +492,7 @@ public actor Torrent {
         pieceBlockCursor[piece] = nextMissingOffset(piece)
         pieceLastProgress.removeValue(forKey: piece)
         for key in outstanding.keys where key.index == piece {
-            outstanding.removeValue(forKey: key)
-            blockSenders.removeValue(forKey: key)
+            unregisterBlock(key)
         }
     }
 
@@ -885,9 +913,4 @@ public actor Torrent {
         lastPublishedStatus = status
         await statusBroadcast.publish(status)
     }
-}
-
-private struct BlockKey: Hashable {
-    let index: Int
-    let begin: Int
 }

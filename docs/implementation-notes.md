@@ -2,6 +2,22 @@
 
 Running implementation log. Update **before every commit** with a concise entry describing what changed and why. Reference the relevant phase in `docs/planning.md`.
 
+## Unreleased
+
+### 2026-08-08 — Fix: full pipelines for peers on exhausted pieces (distinct missing blocks per peer)
+
+Follow-up to the endgame re-request fix. The log showed 6,196 refills stuck at `requesting 1 blocks` while the download depended on one seeder (`185.21.216.198` = 37k/52k refills). Root cause: `nextBlockRequest` returned the same missing block to a peer on every refill, and `refillPipeline`'s `guard !outstanding.contains(key) else { break }` then truncated that peer's pipeline to **one** block per round-trip — peers on a near-complete piece (cursor exhausted) contributed a trickle while the single real seeder carried the swarm.
+
+**Changes**:
+- Shared `BlockKey` type (`BlockKey.swift`; was file-private in both `Torrent.swift` and `PeerSession.swift`).
+- `PeerSession.outstandingKeys` exposes the peer's in-flight set; `nextBlockRequest`/`nextBlock(in:excluding:)` serve **distinct** blocks per peer — the cursor-advance path skips excluded blocks, and the missing-block scan skips both excluded and already-received blocks.
+- Bounded endgame redundancy: `outstandingCounts` (per-block request count, incremented in `registerOutstanding`, decremented by the new `unregisterBlock` on receive/peer-drop/piece-complete) caps a missing block at `maxMissingRedundancy` (2) concurrent requests, so a block only a dead peer holds doesn't flood every pipeline — peers that can't help fall through to the next piece (or a fresh allocation).
+- `refillPipeline` guard `break` → `continue` (the excluding set makes duplicates unreachable; the guard is now only defensive).
+
+**Verification**: 62 tests green. Live (QxR swarm): zero `requesting 1 blocks` (all refills full 48-block pipelines), piece 194 — previously stuck >60s — verified immediately, steady ~350-730 KB/s (swarm-seeder-bound, not engine-bound).
+
+### 2026-08-08 — Fix: "fast download but nothing verifies" (stalled pieces never re-requested)
+
 ## 2026-08-06 — Project docs scaffold (Phase 1 prep)
 
 - Created `AGENTS.md` with tech stack, required rules (read planning/implementation notes before changes, update notes before commit, verify with Big Buck Bunny via `torrent-cli`), coding style, and commands.

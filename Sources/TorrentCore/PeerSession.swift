@@ -1,10 +1,5 @@
 import Foundation
 
-private struct BlockKey: Hashable {
-    let index: Int
-    let begin: Int
-}
-
 /// Runs one peer connection: handshake, interest, request pipeline, and message handling.
 /// Lifecycle is owned by a caller task; it calls back into the `Torrent` actor for block
 /// allocation, block delivery, and seeding reads.
@@ -28,6 +23,11 @@ public final class PeerSession: @unchecked Sendable {
     /// A peer that sends nothing for this long while we're connected is considered dead and
     /// disconnected, freeing its pool slot for a live seeder.
     private let peerIdleTimeout = Duration.seconds(30)
+
+    /// The blocks this peer currently has requested and is waiting on. The picker serves distinct
+    /// blocks per peer (excluding this set) so a peer fills its whole pipeline with different
+    /// blocks instead of stalling on one missing block per round-trip.
+    var outstandingKeys: Set<BlockKey> { outstanding }
 
     /// Which pieces this peer claims to have (from its bitfield/have/have-all messages).
     /// Peers that advertise nothing for this torrent are leechers without data; requesting blocks
@@ -212,10 +212,9 @@ public final class PeerSession: @unchecked Sendable {
                 break
             }
             let key = BlockKey(index: block.index, begin: block.begin)
-            // Skip a block the peer already has in flight — `nextBlockRequest` can keep returning the
-            // same missing block (the cursor is exhausted, so there's nothing new to allocate) and
-            // re-inserting it wouldn't grow `outstanding`, which would loop forever.
-            guard !outstanding.contains(key) else { break }
+            // Defensive: `nextBlockRequest` excludes the peer's in-flight blocks, so this only
+            // trips if that guarantee ever slips — skip rather than truncating the pipeline.
+            guard !outstanding.contains(key) else { continue }
             outstanding.insert(key)
             batch.append(PeerMessage.request(block).encode())
         }
