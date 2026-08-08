@@ -266,11 +266,8 @@ struct TorrentDetailView: View {
     let item: TorrentItem
     let store: TorrentStore
 
-    @Environment(\.dismiss) private var dismiss
     @State private var streamSession: TorrentStreamSession?
     @State private var showPlayer = false
-    @State private var copiedMagnet = false
-    @State private var confirmDelete = false
 
     private var fileIndicesBySize: [Int] {
         item.metainfo.files.indices.sorted {
@@ -317,34 +314,7 @@ struct TorrentDetailView: View {
         }
         .navigationTitle(item.name)
         .toolbar {
-            Menu {
-                if let status = item.status, !status.isComplete {
-                    Button {
-                        item.togglePause()
-                    } label: {
-                        Label(item.isPaused ? "Resume" : "Pause", systemImage: item.isPaused ? "play" : "pause")
-                    }
-                }
-                Button {
-                    copyMagnet()
-                } label: {
-                    Label(copiedMagnet ? "Copied" : "Copy Magnet", systemImage: copiedMagnet ? "checkmark" : "link")
-                }
-                Divider()
-                Button(role: .destructive) {
-                    confirmDelete = true
-                } label: {
-                    Label("Delete", systemImage: "trash")
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-            }
-        }
-        .confirmationDialog("Delete \"\(item.name)\"?", isPresented: $confirmDelete, titleVisibility: .visible) {
-            Button("Delete", role: .destructive) {
-                store.remove(item)
-                dismiss()
-            }
+            TorrentDetailMenu(item: item, store: store)
         }
         #if os(iOS)
         .fullScreenCover(isPresented: $showPlayer) {
@@ -361,6 +331,52 @@ struct TorrentDetailView: View {
         #endif
     }
 
+    private func openPlayer(fileIndex: Int) {
+        streamSession = TorrentStreamSession(torrent: item.torrent, fileIndex: fileIndex)
+        showPlayer = true
+    }
+}
+
+/// The detail view's kebab menu. Reads only `TorrentItem`'s change-guarded pause flags (not the
+/// 1s-churning `status`), so it doesn't rebuild every tick and cause the toolbar brightness pulse.
+private struct TorrentDetailMenu: View {
+    let item: TorrentItem
+    let store: TorrentStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirmDelete = false
+
+    var body: some View {
+        Menu {
+            if item.canPause {
+                Button {
+                    item.togglePause()
+                } label: {
+                    Label(item.isPaused ? "Resume" : "Pause", systemImage: item.isPaused ? "play" : "pause")
+                }
+            }
+            Button {
+                copyMagnet()
+            } label: {
+                Label("Copy Magnet", systemImage: "link")
+            }
+            Divider()
+            Button(role: .destructive) {
+                confirmDelete = true
+            } label: {
+                Label("Delete", systemImage: "trash")
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+        }
+        .confirmationDialog("Delete \"\(item.name)\"?", isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                store.remove(item)
+                dismiss()
+            }
+        }
+    }
+
     private func copyMagnet() {
         let magnet = magnetLink(item.metainfo)
         #if os(iOS)
@@ -369,18 +385,6 @@ struct TorrentDetailView: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(magnet, forType: .string)
         #endif
-        copiedMagnet = true
-        Task {
-            try? await Task.sleep(for: .seconds(1.5))
-            await MainActor.run {
-                copiedMagnet = false
-            }
-        }
-    }
-
-    private func openPlayer(fileIndex: Int) {
-        streamSession = TorrentStreamSession(torrent: item.torrent, fileIndex: fileIndex)
-        showPlayer = true
     }
 }
 

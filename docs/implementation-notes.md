@@ -492,6 +492,26 @@ Timeline tracing of a 7.6s resolve showed the first ~5s was spent draining the 5
 
 `TorrentDetailView` (Views.swift): the Pause/Resume button (previously the first row of the Status section) and the whole "Actions" section (Copy Magnet) are replaced by a single kebab menu (`ellipsis.circle`) in the navigation bar's top-right. Pause/Resume still only appears for incomplete torrents; Copy Magnet shows its temporary "Copied" checkmark state in the menu label. Removed the now-empty Actions section. `swift build` green.
 
+### 2026-08-08 — Fix: kebab menu "pulsing brightness" every second
+
+The 1s ticker called `publishStatus()` unconditionally, and `StatusBroadcast.publish` always yielded — even when nothing changed. Each identical snapshot replaced `TorrentItem.status`, invalidating every SwiftUI observer, so `TorrentDetailView` rebuilt its toolbar `Menu` every tick (the visible brightness pulse).
+
+**Fix**: `TorrentStatus` is now `Equatable`; `Torrent.publishStatus()` caches `lastPublishedStatus` and skips the publish when the snapshot is unchanged. Idle/seeding/complete torrents now emit one status and stop; active downloads still publish each second (rates/verified change, which the Status section legitimately needs).
+
+**Verification**: 53 tests green (incl. `pauseAndResumeControlDownloadState`, which exercises repeated `publishStatus` calls). Deployed to the simulator.
+
+### 2026-08-08 — Fix (round 2): kebab menu pulse for active downloads
+
+The dedupe fix above stopped publishing identical snapshots, but an **actively downloading** torrent still changes every tick (rates/verified), so `TorrentDetailView.body` kept re-evaluating each second and SwiftUI rebuilt the toolbar `Menu` — the pulse persisted on the iPhone.
+
+**Fix**: the toolbar menu no longer reads the churning status. `TorrentItem` gained change-guarded stored flags `isPaused`/`canPause` (updated in the status subscriber only when they actually flip), and the toolbar `Menu` moved into a child view `TorrentDetailMenu` that observes only those stable flags (plus its own `copiedMagnet`/`confirmDelete` state). The parent detail body still re-renders for the Status section, but the menu view's inputs are stable, so its toolbar item is not rebuilt.
+
+**Verification**: `swift build` + 53 tests green; deployed to the iPhone.
+
+### 2026-08-08 — Copy Magnet: remove temporary "Copied" label state
+
+`TorrentDetailMenu`'s Copy Magnet item now always shows "Copy Magnet" + `link` icon; the 1.5s "Copied"/`checkmark` state (and its `copiedMagnet` `@State`) was removed — the menu still copies to the pasteboard on tap. Deployed to the iPhone.
+
 ### 2026-08-08 — Detail view kebab menu: plain ellipsis icon + Delete
 
 - Kebab icon changed from `ellipsis.circle` to the ring-free `ellipsis`.

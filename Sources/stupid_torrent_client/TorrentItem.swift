@@ -10,6 +10,10 @@ final class TorrentItem: Identifiable, Hashable {
     nonisolated let metainfo: Metainfo
     nonisolated let addedAt: Date
     var status: TorrentStatus?
+    /// Pause flags updated from the status stream only when they actually change, so views like the
+    /// detail toolbar menu can read them without re-rendering on every 1s status tick.
+    var isPaused = false
+    var canPause = false
 
     private var statusTask: Task<Void, Never>?
     private var runTask: Task<Void, Never>?
@@ -40,14 +44,16 @@ final class TorrentItem: Identifiable, Hashable {
 
     var isComplete: Bool { status?.isComplete ?? false }
 
-    var isPaused: Bool { status?.state == .paused }
-
     func start() {
         guard statusTask == nil else { return }
         statusTask = Task { [weak self] in
             guard let self else { return }
             for await snapshot in await self.torrent.statusBroadcast.subscribe() {
                 self.status = snapshot
+                let newPaused = snapshot.state == .paused
+                let newCanPause = !snapshot.isComplete
+                if newPaused != self.isPaused { self.isPaused = newPaused }
+                if newCanPause != self.canPause { self.canPause = newCanPause }
             }
         }
         runTask = Task {

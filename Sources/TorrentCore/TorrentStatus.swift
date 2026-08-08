@@ -1,6 +1,6 @@
 import Foundation
 
-public struct TorrentStatus: Sendable {
+public struct TorrentStatus: Sendable, Equatable {
     public enum State: Sendable, Equatable {
         case metadata
         case downloading

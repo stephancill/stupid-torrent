@@ -78,6 +78,9 @@ public actor Torrent {
     private var downloadRate: Double = 0
     private var uploadRate: Double = 0
     private var lastSeeders = 0
+    /// Last published status snapshot; `publishStatus()` skips publishing when nothing changed so
+    /// the 1s ticker doesn't churn SwiftUI observers (which visibly pulses toolbar/menu items).
+    private var lastPublishedStatus: TorrentStatus?
 
     public init(directory: URL, metainfo: Metainfo, peerID: Data = PeerID.generate(), maxActivePeers: Int = 50, stopAfterBytes: Int64? = nil, enableDHT: Bool = true) {
         self.directory = directory
@@ -863,6 +866,8 @@ public actor Torrent {
             downloadedBytes: downloadedBytes,
             uploadedBytes: uploadedBytes
         )
+        guard status != lastPublishedStatus else { return }
+        lastPublishedStatus = status
         await statusBroadcast.publish(status)
     }
 }
