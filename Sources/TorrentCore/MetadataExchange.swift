@@ -303,28 +303,37 @@ public enum MagnetBootstrapper {
             try? await dhtClient.announce(infoHash: magnet.infoHash, port: 6881)
         }
 
-        if !clients.isEmpty {
-            let request = AnnounceRequest(
-                infoHash: magnet.infoHash,
-                peerID: peerID,
-                port: 6881,
-                left: 0,
-                event: .started,
-                numWant: 200,
-                key: Int32.random(in: .min ... .max)
-            )
-            for client in clients {
-                Task {
-                    do {
-                        let response = try await client.announce(request)
-                        TorrentLog.log("bootstrap: announce got \(response.peers.count) peers (failure: \(response.failureReason ?? "none"))")
-                        for peer in response.peers {
-                            await pool.add(peer)
+        // Trackers: announce immediately and re-announce every 15s so the sweep keeps getting FRESH
+        // peer lists. A single announce can return an all-dead list on a marginal swarm (the peers
+        // churn continuously); periodic re-announces are new lottery tickets and are how the old
+        // round-based flow kept going.
+        let trackerTask = Task {
+            guard !clients.isEmpty else { return }
+            while !Task.isCancelled {
+                await withTaskGroup(of: Void.self) { group in
+                    for client in clients {
+                        group.addTask {
+                            do {
+                                let response = try await client.announce(AnnounceRequest(
+                                    infoHash: magnet.infoHash,
+                                    peerID: peerID,
+                                    port: 6881,
+                                    left: 0,
+                                    event: .started,
+                                    numWant: 200,
+                                    key: Int32.random(in: .min ... .max)
+                                ))
+                                TorrentLog.log("bootstrap: announce got \(response.peers.count) peers (failure: \(response.failureReason ?? "none"))")
+                                for peer in response.peers {
+                                    await pool.add(peer)
+                                }
+                            } catch {
+                                TorrentLog.log("bootstrap: announce failed: \(error)")
+                            }
                         }
-                    } catch {
-                        TorrentLog.log("bootstrap: announce failed: \(error)")
                     }
                 }
+                try? await Task.sleep(for: .seconds(15))
             }
         }
 
@@ -350,7 +359,7 @@ public enum MagnetBootstrapper {
         // Continuous sweep: drain the pool as peers arrive, refilling worker slots the moment
         // one frees (a true pipeline, like webtorrent's conn pool) instead of draining fixed
         // batches. Slower trackers/DHT results join mid-flight.
-        let deadline = ContinuousClock.now + .seconds(90)
+        let deadline = ContinuousClock.now + .seconds(180)
         while ContinuousClock.now < deadline {
             let active = await pool.queuedCount
             if active == 0 {
@@ -365,10 +374,12 @@ public enum MagnetBootstrapper {
                 // next resolution for this infohash retries it first instead of re-draining stale
                 // get_peers records.
                 dhtClient?.cacheKnownGood([result.metadataPeer], for: magnet.infoHash)
+                trackerTask.cancel()
                 return result
             }
         }
         dhtTask.cancel()
+        trackerTask.cancel()
         throw MetadataError.timedOut
     }
 

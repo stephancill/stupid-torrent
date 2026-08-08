@@ -33,6 +33,18 @@ public enum DHTNode {
         sharedClient = nil
     }
 
+    /// Bootstraps the shared node's routing table in the background, so the first magnet resolve
+    /// doesn't pay a cold DHT bootstrap (8s) inline and has a warm table to query immediately. Call
+    /// once at app launch.
+    public static func warmUp() {
+        Task.detached(priority: .utility) {
+            guard let dht = shared() else { return }
+            if dht.nodeCount == 0 {
+                try? await dht.bootstrap(timeout: 8)
+            }
+        }
+    }
+
     private static func persistedNodeID() -> Data {
         let url = DHTClient.defaultNodeIDURL()
         if let data = try? Data(contentsOf: url), data.count == 20 {

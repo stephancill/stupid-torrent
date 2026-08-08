@@ -540,6 +540,17 @@ The engine (DHT node, downloads) only runs while the app is foregrounded, and an
 
 **Verification** (simulator console): on launch `idle timer enabled`; opening a magnet flips to `idle timer disabled (auto-lock off)`; when the resolve ends (success or timeout) it flips back to `enabled`. iOS build via xtool compiles clean; 53 tests green. Note: the app's first resolve in a fresh install on the marginal Backrooms swarm still hits the cold-cache dead-peer lottery (CLI's ~2s times are its warm DHT peer cache) — expected until the app's node warms up; not a regression.
 
+### 2026-08-08 — Reliable magnet resolution (no resolve timeouts)
+
+A fresh-install app resolve timed out at 90s on the marginal Backrooms swarm while the CLI (warm cache) resolved in ~2s and even a **cold** CLI resolved in ~15s — the app's sim DHT returned 0 peers and the single tracker announce's peers were all dead. "Timing out is unacceptable" → fixed three ways:
+
+1. **Tracker re-announce loop** (`MetadataExchange.swift`): the streaming-sweep restructure had dropped the old round-based re-announce — trackers announced ONCE, so an all-dead first list meant 90s of sweeping stale peers. Restored as a background `trackerTask` that re-announces every 15s, feeding fresh peer lists into the pool (new lottery tickets as the swarm churns). Cancelled on success/timeout.
+2. **Resolve deadline 90s → 180s**: the app no longer gives up on a swarm that has seeders but is slow to surface them (worst-case CLI baseline was 200s).
+3. **DHT node warm-up at app launch** (`DHTNode.warmUp()` called in `stupid_torrent_clientApp.init`): bootstraps the shared node's routing table in the background, so the first magnet resolve doesn't pay a cold 8s bootstrap inline and queries a warm table (also starts accumulating the live peer store immediately).
+
+**Verification**: cold-cache CLI resolve x3 all succeed (21.4s first, then 3.3s/3.0s as caches warm); 53 tests green. Simulator: at launch the node is already live (`DHT: announce … to 8 nodes`, warm-up ran), and adding the Cosmos Laundromat magnet resolves and persists within ~20s (sweep-cancelled `CancellationError`s confirm a peer won; `.torrent` saved; idle timer held disabled while downloading).
+
+
 
 
 
