@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import Bencode
 
 public enum DHTError: Error, Sendable {
@@ -34,6 +35,10 @@ public final class DHTClient: @unchecked Sendable {
     private let nodeCacheURL: URL
     private let peerCacheURL: URL
     private var cachedPeersByHash: [String: [PeerCacheEntry]] = [:]
+    /// Per-process secret used to issue/verify `get_peers` tokens (BEP 5): unguessable per-infohash
+    /// tokens let us serve `announce_peer` records (the live-peer store) without letting arbitrary
+    /// peers poison the cache.
+    private let tokenSecret = Data((0..<20).map { _ in UInt8.random(in: 0...255) })
 
     /// A cached peer plus a `good` flag: `good` peers completed a real connection (e.g. served
     /// metadata) and are retried before the raw `get_peers` records, most of which are stale/NAT'd.
@@ -48,12 +53,12 @@ public final class DHTClient: @unchecked Sendable {
         let timeoutTask: Task<Void, Never>
     }
 
-    public init(nodeID: Data = DHTClient.randomNodeID(), cacheURL: URL? = nil) throws {
+    public init(nodeID: Data = DHTClient.randomNodeID(), cacheURL: URL? = nil, peerCacheURL: URL? = nil) throws {
         self.nodeID = nodeID
         self.socket = try UDPSocket()
         self.table = RoutingTable(localID: nodeID, k: k)
         self.nodeCacheURL = cacheURL ?? Self.defaultCacheURL()
-        self.peerCacheURL = Self.defaultPeerCacheURL()
+        self.peerCacheURL = peerCacheURL ?? Self.defaultPeerCacheURL()
         loadNodeCache()
         loadPeerCache()
     }
@@ -171,11 +176,24 @@ public final class DHTClient: @unchecked Sendable {
 
     public var nodeCount: Int { table.count }
 
-    public func startListening() {
+    /// Adds a known node to the routing table (e.g. from a peer's PORT message, or tests). Mirrors
+    /// bittorrent-dht's `dht.addNode`.
+    public func addNode(_ node: KRPCNodeInfo) {
+        table.add(node)
+    }
+
+    /// The UDP port our socket is bound to (0 until `bind(port:)` is used). Used by tests and by
+    /// callers that want the node reachable at a known address.
+    public var localPort: UInt16 { socket.localPort }
+
+    public func startListening(port: UInt16? = nil) {
         lock.lock()
         if isListening {
             lock.unlock()
             return
+        }
+        if let port {
+            try? socket.bind(port: port)
         }
         isListening = true
         lock.unlock()
@@ -244,11 +262,40 @@ public final class DHTClient: @unchecked Sendable {
 
     /// Live peers previously discovered for `infoHash`, served before any network query so warm
     /// magnet resolutions start from known-reachable peers (mirrors bittorrent-dht's peer store).
-    /// Confirmed-reachable peers come first.
+    /// Confirmed-reachable peers come first, then freshly-announced live peers.
     public func cachedPeers(infoHash: Data) -> [PeerAddress] {
         lock.lock()
         defer { lock.unlock() }
         return (cachedPeersByHash[infoHash.hexString] ?? []).map(\.peer)
+    }
+
+    /// A `get_peers` token for `infoHash` (BEP 5): verifiable per-infohash, unguessable without
+    /// the process secret, so only nodes we issued a token to can `announce_peer` to us.
+    private func token(for infoHash: Data) -> Data {
+        Data(Insecure.SHA1.hash(data: tokenSecret + infoHash))
+    }
+
+    /// Stores a peer that just announced itself for `infoHash` via `announce_peer`. These are
+    /// the LIVE peers: a node that announces is, by definition, currently active in the swarm.
+    /// They're inserted ahead of the older `get_peers` records so a fresh resolution tries them
+    /// first (webtorrent's DHT node does exactly this with its peer store).
+    private func cacheLivePeers(_ peers: [PeerAddress], for infoHash: Data) {
+        guard !peers.isEmpty else { return }
+        lock.lock()
+        let key = infoHash.hexString
+        var list = cachedPeersByHash[key] ?? []
+        var seen = Set(list.map(\.peer))
+        var inserted = false
+        for peer in peers where seen.insert(peer).inserted {
+            list.append(PeerCacheEntry(peer: peer, good: false))
+            inserted = true
+        }
+        if inserted {
+            let good = list.filter(\.good)
+            let rest = list.filter { !$0.good }
+            cachedPeersByHash[key] = Array((good + rest).prefix(500))
+        }
+        lock.unlock()
     }
 
     /// Iterative `get_peers` lookup (BEP 5, "closest node search"). Returns peer addresses
@@ -331,7 +378,7 @@ public final class DHTClient: @unchecked Sendable {
         return Array(peers)
     }
 
-    private func query(_ query: KRPCQuery, to node: KRPCNodeInfo) async throws -> [String: BValue] {
+    func query(_ query: KRPCQuery, to node: KRPCNodeInfo) async throws -> [String: BValue] {
         // A 2-byte transaction id collides within minutes under sustained query load; the old
         // `pending[hex] = ...` would silently overwrite the earlier entry, orphaning its
         // continuation forever ("TASK CONTINUATION MISUSE ... leaked"). Use 4 bytes and re-roll
@@ -387,8 +434,8 @@ public final class DHTClient: @unchecked Sendable {
         while true {
             if !isListeningNow() { return }
             do {
-                guard let data = try socket.receive(timeout: 1) else { continue }
-                handleResponse(data)
+                guard let received = try socket.receiveFrom(timeout: 1) else { continue }
+                handleResponse(received.data, fromHost: received.host, port: received.port)
             } catch {
                 continue
             }
@@ -401,26 +448,119 @@ public final class DHTClient: @unchecked Sendable {
         return isListening
     }
 
-    private func handleResponse(_ data: Data) {
+    private func handleResponse(_ data: Data, fromHost host: String, port: UInt16) {
         guard let message = try? KRPCWire.decode(data) else { return }
-        let transaction: Data
         switch message {
+        case .query(let transaction, let name, let args):
+            // We are a DHT node, not just a client: answer inbound queries (BEP 5). This is what
+            // lets us accumulate a LIVE peer store — nodes that lookup the infohash announce back
+            // to us, and we cache those currently-active peers for fast resolution.
+            handleQuery(name: name, args: args, transaction: transaction, fromHost: host, fromPort: port)
         case .response(let t, _), .error(let t, _, _):
-            transaction = t
-        case .query:
-            return
+            let hex = t.map { String(format: "%02x", $0) }.joined()
+            guard let pendingQuery = removePending(hex) else { return }
+            pendingQuery.timeoutTask.cancel()
+            switch message {
+            case .response(_, let reply):
+                pendingQuery.continuation.resume(returning: reply)
+            case .error(_, let code, let messageText):
+                pendingQuery.continuation.resume(throwing: KRPCError.errorResponse(code: code, message: messageText))
+            case .query:
+                break
+            }
         }
-        let hex = transaction.map { String(format: "%02x", $0) }.joined()
-        guard let pendingQuery = removePending(hex) else { return }
-        pendingQuery.timeoutTask.cancel()
-        switch message {
-        case .response(_, let reply):
-            pendingQuery.continuation.resume(returning: reply)
-        case .error(_, let code, let messageText):
-            pendingQuery.continuation.resume(throwing: KRPCError.errorResponse(code: code, message: messageText))
-        case .query:
+    }
+
+    private func handleQuery(name: String, args: [String: BValue], transaction: Data, fromHost host: String, fromPort port: UInt16) {
+        if let id = args["id"]?.stringValue, id.count == 20 {
+            table.add(KRPCNodeInfo(id: id, host: host, port: port))
+        }
+        switch name {
+        case "ping":
+            sendResponse(transaction: transaction, reply: ["id": .string(nodeID)], to: host, port: port)
+        case "find_node":
+            guard let target = args["target"]?.stringValue, target.count == 20 else { return }
+            let nodes = CompactNode.encode(table.closest(to: target, count: k))
+            sendResponse(transaction: transaction, reply: ["id": .string(nodeID), "nodes": .string(nodes)], to: host, port: port)
+        case "get_peers":
+            guard let infoHash = args["info_hash"]?.stringValue, infoHash.count == 20 else { return }
+            let peers = cachedPeers(infoHash: infoHash).prefix(50)
+            var reply: [String: BValue] = [
+                "id": .string(nodeID),
+                "token": .string(token(for: infoHash)),
+                "nodes": .string(CompactNode.encode(table.closest(to: infoHash, count: k))),
+            ]
+            if !peers.isEmpty {
+                reply["values"] = .string(CompactPeer.encode(Array(peers)))
+            }
+            sendResponse(transaction: transaction, reply: reply, to: host, port: port)
+        case "announce_peer":
+            guard let infoHash = args["info_hash"]?.stringValue, infoHash.count == 20,
+                  let token = args["token"]?.stringValue, token == self.token(for: infoHash) else {
+                sendError(transaction: transaction, code: 203, message: "bad token", to: host, port: port)
+                return
+            }
+            // Use the announced BT port, or the sender's UDP source port for implied_port/port 0.
+            let announcedPort = args["port"]?.intValue
+            let implied = (args["implied_port"]?.intValue ?? 0) != 0
+            let peerPort = (implied || announcedPort == nil || announcedPort == 0) ? port : UInt16(clamping: announcedPort!)
+            TorrentLog.log("DHT: announce_peer for \(infoHash.hexString.prefix(8)) from \(host):\(peerPort)")
+            cacheLivePeers([PeerAddress(host: host, port: peerPort)], for: infoHash)
+            sendResponse(transaction: transaction, reply: ["id": .string(nodeID)], to: host, port: port)
+        default:
             break
         }
+    }
+
+    private func sendResponse(transaction: Data, reply: [String: BValue], to host: String, port: UInt16) {
+        try? socket.send(KRPCWire.encodeResponse(transaction: transaction, reply: reply), to: host, port: port)
+    }
+
+    private func sendError(transaction: Data, code: Int, message: String, to host: String, port: UInt16) {
+        try? socket.send(KRPCWire.encodeError(transaction: transaction, code: code, message: message), to: host, port: port)
+    }
+
+    /// Announces our BitTorrent listen port for `infoHash` (BEP 5): get a token from the closest
+    /// nodes, then `announce_peer` to them so the swarm's DHT stores us as a peer. Participating
+    /// this way is what makes the node (and its live peer store) real over time.
+    public func announce(infoHash: Data, port: UInt16, timeout: TimeInterval = 10) async throws {
+        startListening()
+        if table.count == 0 {
+            try await bootstrap(timeout: min(timeout / 2, 8))
+        }
+        guard table.count > 0 else { throw DHTError.noBootstrapNodes }
+
+        let closeNodes = table.closest(to: infoHash, count: k)
+        var tokenNodes = closeNodes.filter { $0.token != nil }
+        let missing = closeNodes.filter { $0.token == nil }
+        var fetchedTokens: [KRPCNodeInfo] = []
+        await withTaskGroup(of: (KRPCNodeInfo, [String: BValue]?).self) { group in
+            for node in missing.prefix(8) {
+                group.addTask {
+                    do {
+                        return (node, try await self.query(.getPeers(id: self.nodeID, infoHash: infoHash), to: node))
+                    } catch {
+                        return (node, nil)
+                    }
+                }
+            }
+            for await (node, reply) in group {
+                if let reply, let token = reply["token"]?.stringValue {
+                    fetchedTokens.append(KRPCNodeInfo(id: node.id, host: node.host, port: node.port, token: token))
+                }
+            }
+        }
+        let announceTargets = Array((tokenNodes + fetchedTokens).prefix(k))
+        TorrentLog.log("DHT: announce \(infoHash.hexString.prefix(8)) to \(announceTargets.count) nodes")
+        await withTaskGroup(of: Void.self) { group in
+            for node in announceTargets {
+                guard let token = node.token else { continue }
+                group.addTask {
+                    _ = try? await self.query(.announcePeer(id: self.nodeID, infoHash: infoHash, port: port, token: token), to: node)
+                }
+            }
+        }
+        saveNodeCache()
     }
 
     private static func randomTransactionID() -> Data {

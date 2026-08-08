@@ -376,6 +376,77 @@ extension Data {
         let closest = table.closest(to: target, count: 1)
         #expect(closest.first?.id == near.id)
     }
+
+    /// The DHT is a node, not just a client: it answers ping/find_node/get_peers/announce_peer
+    /// over loopback, and stores peers announced to it as its live peer store (webtorrent's edge).
+    @Test func nodeAnswersQueriesAndStoresAnnouncedPeers() async throws {
+        let (nodeCache, peerCache) = tempEmptyCacheURLs()
+        let nodeA = try DHTClient(nodeID: Data(repeating: 0xAA, count: 20), cacheURL: nodeCache, peerCacheURL: peerCache)
+        nodeA.startListening(port: 0)
+        defer { nodeA.stop() }
+        #expect(nodeA.localPort != 0)
+        let nodeAInfo = KRPCNodeInfo(id: nodeA.nodeID, host: "127.0.0.1", port: nodeA.localPort)
+
+        let clientB = try DHTClient(nodeID: Data(repeating: 0xBB, count: 20), cacheURL: nodeCache, peerCacheURL: peerCache)
+        clientB.startListening()
+        defer { clientB.stop() }
+        clientB.addNode(nodeAInfo)
+
+        // ping is answered with the node's id.
+        let pingReply = try await clientB.query(.ping(id: clientB.nodeID), to: nodeAInfo)
+        #expect(pingReply["id"]?.stringValue == nodeA.nodeID)
+
+        // find_node returns the closest nodes.
+        let target = Data(repeating: 0xCC, count: 20)
+        let findReply = try await clientB.query(.findNode(id: clientB.nodeID, target: target), to: nodeAInfo)
+        #expect(findReply["nodes"] != nil)
+
+        // get_peers returns a token, then the announced peer after announce_peer.
+        let infoHash = Data(repeating: 0xDD, count: 20)
+        let getReply = try await clientB.query(.getPeers(id: clientB.nodeID, infoHash: infoHash), to: nodeAInfo)
+        let token = try #require(getReply["token"]?.stringValue)
+        #expect(getReply["values"] == nil)
+
+        let announcePort: UInt16 = 51413
+        let announceReply = try await clientB.query(.announcePeer(id: clientB.nodeID, infoHash: infoHash, port: announcePort, token: token), to: nodeAInfo)
+        #expect(announceReply["id"]?.stringValue == nodeA.nodeID)
+
+        let getReply2 = try await clientB.query(.getPeers(id: clientB.nodeID, infoHash: infoHash), to: nodeAInfo)
+        let expected = PeerAddress(host: "127.0.0.1", port: announcePort)
+        #expect(CompactPeer.parse(getReply2["values"]?.stringValue ?? Data()) == [expected])
+        #expect(nodeA.cachedPeers(infoHash: infoHash) == [expected])
+
+        // announce_peer with a bad token is rejected.
+        let badReply = try? await clientB.query(.announcePeer(id: clientB.nodeID, infoHash: infoHash, port: announcePort, token: Data([0x00])), to: nodeAInfo)
+        #expect(badReply == nil)
+    }
+
+    /// A self-announce (get_peers for a token, then announce_peer back) stores us at the node.
+    @Test func nodeSelfAnnounce() async throws {
+        let (nodeCache, peerCache) = tempEmptyCacheURLs()
+        let nodeA = try DHTClient(nodeID: Data(repeating: 0x11, count: 20), cacheURL: nodeCache, peerCacheURL: peerCache)
+        nodeA.startListening(port: 0)
+        defer { nodeA.stop() }
+        let nodeAInfo = KRPCNodeInfo(id: nodeA.nodeID, host: "127.0.0.1", port: nodeA.localPort)
+
+        let clientB = try DHTClient(nodeID: Data(repeating: 0x22, count: 20), cacheURL: nodeCache, peerCacheURL: peerCache)
+        clientB.startListening()
+        defer { clientB.stop() }
+        clientB.addNode(nodeAInfo)
+
+        let infoHash = Data(repeating: 0x33, count: 20)
+        try await clientB.announce(infoHash: infoHash, port: 6881)
+        // nodeA stored us as a live peer for the infohash.
+        #expect(nodeA.cachedPeers(infoHash: infoHash) == [PeerAddress(host: "127.0.0.1", port: 6881)])
+    }
+
+    /// Empty per-test DHT caches so the shared real-node/peer caches don't leak into loopback tests.
+    private func tempEmptyCacheURLs() -> (URL, URL) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dht-test-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return (dir.appendingPathComponent("nodes"), dir.appendingPathComponent("peers"))
+    }
 }
 
 @Suite struct MSETests {

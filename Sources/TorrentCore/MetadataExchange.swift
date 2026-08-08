@@ -298,6 +298,8 @@ public enum MagnetBootstrapper {
             } {
                 TorrentLog.log("bootstrap: DHT returned \(dhtPeers.count) peers")
             }
+            // Announce ourselves so the swarm's DHT stores us as a peer for this infohash.
+            try? await dhtClient.announce(infoHash: magnet.infoHash, port: 6881)
         }
 
         if !clients.isEmpty {

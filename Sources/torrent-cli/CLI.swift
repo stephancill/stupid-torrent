@@ -18,6 +18,8 @@ struct TorrentCLI {
             await add(Array(args.dropFirst(2)))
         case "resolve":
             await resolve(Array(args.dropFirst(2)))
+        case "dht-node":
+            await dhtNode(Array(args.dropFirst(2)))
         case "verify":
             await verify(Array(args.dropFirst(2)))
         case "tracker":
@@ -99,6 +101,36 @@ struct TorrentCLI {
             print("ECHO: \(String(decoding: echo, as: UTF8.self))")
         } catch {
             print("FAILED: \(error)")
+        }
+    }
+
+    static func dhtNode(_ args: [String]) async {
+        guard let hex = args.first, let infoHash = hexData(hex), infoHash.count == 20 else {
+            print("usage: torrent-cli dht-node <info-hash-hex40> [--announce-port <port>] [--idle <seconds>]")
+            return
+        }
+        TorrentLog.verbose = true
+        var port = 6881
+        var idle = 15
+        if let idx = args.firstIndex(of: "--announce-port"), idx + 1 < args.count, let p = UInt16(args[idx + 1]) {
+            port = Int(p)
+        }
+        if let idx = args.firstIndex(of: "--idle"), idx + 1 < args.count, let s = Int(args[idx + 1]) {
+            idle = s
+        }
+        do {
+            let dht = try DHTClient()
+            defer { dht.stop() }
+            let start = ContinuousClock.now
+            if let peers = try? await dht.lookup(infoHash: infoHash, timeout: 15) {
+                print("lookup: \(peers.count) peers in \(ContinuousClock.now - start)")
+            }
+            try? await dht.announce(infoHash: infoHash, port: UInt16(port))
+            print("announced; idling \(idle)s to observe inbound queries...")
+            try await Task.sleep(for: .seconds(idle))
+            print("done (node table \(dht.nodeCount))")
+        } catch {
+            print("error: \(error)")
         }
     }
 

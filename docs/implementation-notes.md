@@ -488,6 +488,10 @@ Timeline tracing of a 7.6s resolve showed the first ~5s was spent draining the 5
 
 **Change** (`DHTClient.swift`): the peer cache now stores a `good` flag per peer (line format `… <port> 0|1`). `cacheKnownGood(_:for:)` marks peers that completed a real handshake / served metadata as `good`, persists them immediately, and orders them FIRST so the next resolution for that infohash retries them before the stale records. `MagnetBootstrapper` calls it with the metadata-serving peer on success. Cached good peers for Backrooms: `151.243.141.9`, `69.4.196.10`.
 
+### 2026-08-08 — Detail view: Pause/Resume + Copy Magnet moved to toolbar kebab menu
+
+`TorrentDetailView` (Views.swift): the Pause/Resume button (previously the first row of the Status section) and the whole "Actions" section (Copy Magnet) are replaced by a single kebab menu (`ellipsis.circle`) in the navigation bar's top-right. Pause/Resume still only appears for incomplete torrents; Copy Magnet shows its temporary "Copied" checkmark state in the menu label. Removed the now-empty Actions section. `swift build` green.
+
 ### 2026-08-08 — µTP for the metadata fetch + DHT lookup streaming
 
 **µTP metadata fetch** (`MetadataExchange.swift`): `MetadataFetcher` now has `fetchUTP(from:transport:)` — µTP (BEP 29) with a plaintext BT handshake (µTP is its own transport; MSE stays TCP-only, mirroring the download path). The protocol exchange (BT handshake → extended handshake → ut_metadata `_requestPieces`-style all-pieces burst) was extracted into `performMetadataExchange(stream:)` shared by both transports. `MagnetBootstrapper` creates one outbound-only `UTPTransport`, and `fetchMetadata` **races µTP + TCP per peer** (webtorrent's `utpOutgoing` + `tcpOutgoing`): first success wins, loser cancelled; both share the same connect/metadata budget so dead peers still cost ~one timeout. Verified: 5 µTP connects + 4 TCP MSE handshakes in a single resolve run.
@@ -495,6 +499,22 @@ Timeline tracing of a 7.6s resolve showed the first ~5s was spent draining the 5
 **DHT lookup streaming** (`DHTClient.swift`): `lookup` gained an `onPeers` callback (per-`get_peers`-batch delivery, webtorrent's streaming model) and an early-exit at 200 peers so the sweep is fed long before the 20s budget elapses. `MagnetBootstrapper` feeds each batch into the pool immediately.
 
 **Result**: resolve went from never-in-120s → 200s → ~2.9-10s. µTP reaches more peers but does NOT change the resolve time on this swarm — the bottleneck is not transport. Timeline traces show ~5-6s is spent draining the 500 cached `get_peers` records (all stale/NAT'd) and waiting on slow tracker announces (~5.9s for the bulk), before a live tracker peer serves metadata at ~7s. **WebTorrent's ~1.6s comes from a live DHT node**: it ingests `announce_peer` records continuously, so its peer store holds currently-active peers and the first connection attempts hit them. We don't ingest inbound DHT queries (a pure `get_peers` client), so our store is only ever `get_peers` garbage. Closing that gap = implementing inbound DHT query handling (`ping`/`find_node`/`get_peers`/`announce_peer`) + announcing ourselves (BEP 5 node, not just client). 51 tests green.
+
+### 2026-08-08 — DHT is now a node, not a client (BEP 5 inbound queries + self-announce)
+
+The remaining gap to webtorrent's ~1.6s resolve is its **live DHT peer store**: a running DHT node ingests `announce_peer` records continuously, so at resolve time it already has currently-active peers for the swarm and the first connection attempts hit them. We were a pure `get_peers` client — our store only ever held stale `get_peers` records, so every resolution re-drained the dead-peer lottery.
+
+**Changes** (`DHTClient.swift`, `Torrent.swift`):
+- **Inbound query handling** in `handleResponse` (was: queries dropped): answers `ping`, `find_node`, `get_peers` (with our cached peers + closest nodes + a token), and `announce_peer` (verifies a per-process-secret token, then stores the announcer as a **live peer** in the cache — the store webtorrent builds). Bad tokens get a 203 error. The receive loop switched to `receiveFrom` so announce_peer has the sender's address.
+- **`cacheLivePeers`**: announced peers are inserted ahead of older `get_peers` records (a peer that just announced is, by definition, currently active) — `cachedPeers` now returns confirmed-good, then live-announced, then the rest.
+- **Self-announce** (`announce(infoHash:port:)`): gets a token from the closest nodes (reusing table tokens where present), then `announce_peer`s our listen port — so the swarm's DHT stores us. Wired into `Torrent.dhtLoop` (every cycle) and the bootstrapper.
+- `DHTClient` gained `addNode(_:)` (PORT-message/webtorrent `dht.addNode`), a `localPort` accessor, `startListening(port:)`, and a configurable `peerCacheURL` for test isolation.
+- New `torrent-cli dht-node <infohash>` diagnostic.
+
+**Verification**:
+- New loopback tests (`nodeAnswersQueriesAndStoresAnnouncedPeers`, `nodeSelfAnnounce`): node answers ping/find_node/get_peers, rejects a bad announce token, stores an announced peer and serves it back in a later `get_peers`, and `announce()` round-trips a token + stores us at the peer node. 53 tests green.
+- **Live**: `dht-node` on the Backrooms infohash does a 438-peer lookup and `DHT: announce 3b124452 to 3 nodes` — the node announced itself to real swarm DHT nodes with valid tokens. Resolve unaffected (3.3-7.0s); the live-store benefit accrues to the long-running app node (its `dhtLoop` announces every 120s), not a one-shot CLI resolve.
+
 
 
 

@@ -484,8 +484,10 @@ public actor Torrent {
         }
     }
 
-    /// Periodically queries the DHT for new peers; the tracker pool is mostly NAT'd peers, but
-    /// DHT returns live, reachable ones (mirrors webtorrent's discovery sources).
+    /// Periodically queries the DHT for new peers and announces our listen port (BEP 5). The
+    /// tracker pool is mostly NAT'd peers, but DHT returns live, reachable ones — and announcing
+    /// ourselves + answering inbound queries is what accumulates a live peer store over time
+    /// (mirrors webtorrent's discovery sources + node participation).
     private func dhtLoop() async {
         while !Task.isCancelled {
             do {
@@ -497,6 +499,7 @@ public actor Torrent {
                         considerPeer(peer)
                     }
                 }
+                try? await dht.announce(infoHash: metainfo.infoHash, port: listenPort)
                 dht.stop()
             } catch {
                 // DHT is best-effort; skip and retry later.
