@@ -314,7 +314,7 @@ struct TorrentDetailView: View {
                     Label(copiedMagnet ? "Copied" : "Copy Magnet", systemImage: copiedMagnet ? "checkmark" : "link")
                 }
             } label: {
-                Image(systemName: "ellipsis.circle")
+                Image(systemName: "ellipsis")
             }
         }
         #if os(iOS)
