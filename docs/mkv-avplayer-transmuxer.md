@@ -1,6 +1,6 @@
 # Scope — Matroska → fMP4 transmuxer (AVPlayer-native MKV playback)
 
-Status: **scoping only.** No code. This is the fallback option if embedded VLCKit (`docs/mkv-streaming.md`) proves untenable. Read that doc's Decisions §1 and the rejected-alternatives rationale first — this plan is the concrete shape of the rejected option, re-costed and gated.
+Status: **implemented (2026-08-09).** Gates 0-4 landed: EBML/Matroska parsing, init segment + fragments, streaming through `TorrentStreamSession`'s resource loader, and live/partial playback (streamed a 30 s MKV at 5/11 pieces). VLCKit is removed (app back to ~3 MB). Remaining: precise far seeks (sidx), and full device validation. This doc is now the design record for the shipped approach.
 
 ## TL;DR
 

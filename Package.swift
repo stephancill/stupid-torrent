@@ -33,43 +33,11 @@ let package = Package(
             name: "Streaming",
             dependencies: ["TorrentCore"]
         ),
-        // MobileVLCKit binary (iOS only; see docs/mkv-streaming.md "Packaging").
-        // Populate Vendor/MobileVLCKit.xcframework before building (gitignored).
-        .binaryTarget(
-            name: "MobileVLCKit",
-            path: "Vendor/MobileVLCKit.xcframework"
-        ),
-        .target(
-            name: "VLCBridge",
-            dependencies: [
-                .target(name: "MobileVLCKit", condition: .when(platforms: [.iOS])),
-                .target(name: "Streaming"),
-                .target(name: "TorrentCore"),
-            ],
-            linkerSettings: [
-                .linkedFramework("QuartzCore"),
-                .linkedFramework("CoreText"),
-                .linkedFramework("AVFoundation"),
-                .linkedFramework("Security"),
-                .linkedFramework("CFNetwork"),
-                .linkedFramework("AudioToolbox"),
-                .linkedFramework("OpenGLES"),
-                .linkedFramework("CoreGraphics"),
-                .linkedFramework("VideoToolbox"),
-                .linkedFramework("CoreMedia"),
-                .linkedLibrary("c++"),
-                .linkedLibrary("xml2"),
-                .linkedLibrary("z"),
-                .linkedLibrary("bz2"),
-                .linkedLibrary("iconv"),
-            ]
-        ),
         .target(
             name: "stupid_torrent_client",
             dependencies: [
                 "TorrentCore",
                 "Streaming",
-                .target(name: "VLCBridge", condition: .when(platforms: [.iOS])),
             ]
         ),
         .executableTarget(

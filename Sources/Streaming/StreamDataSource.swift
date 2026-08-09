@@ -1,9 +1,9 @@
 import Foundation
 import TorrentCore
 
-/// Abstract byte source for the streaming path. `TorrentSeekableInputStream` consumes this;
-/// a fake implements it in tests, and `TorrentStreamSourceAdapter` forwards to the `Torrent`
-/// actor's verified-byte APIs.
+/// Abstract byte source for the streaming path. `TorrentStreamSession`'s resource loader and
+/// `TransmuxStreamSource` consume this; a fake implements it in tests, and
+/// `TorrentStreamSourceAdapter` forwards to the `Torrent` actor's verified-byte APIs.
 public protocol TorrentStreamSource: Sendable {
     func fileLength(fileIndex: Int) async -> Int
     /// Number of contiguous verified bytes in the file starting at `offset`.

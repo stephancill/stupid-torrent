@@ -1,5 +1,11 @@
 # Technical plan — MKV streaming via VLCKit (iOS)
 
+> **SUPERSEDED 2026-08-09.** VLCKit was ripped out and replaced by the in-house Matroska → fMP4
+> transmuxer (`docs/mkv-avplayer-transmuxer.md`): MKV now plays through native AVPlayer via the
+> resource loader, the app is back to ~3 MB, and there are no LGPL obligations. This doc is
+> retained only as the historical record of the VLCKit path (VLCBridge, `MKVStreamSession`,
+> `TorrentHTTPServer`, `TorrentSeekableInputStream` — all deleted).
+
 Status: **implemented (Phase 1-4 of the plan landed).** Gate 0 (packaging + render smoke test) passed; `TorrentSeekableInputStream` + `VLCBridge` + app routing are in and validated on the simulator with both a generated H.264/AAC MKV (full playback) and the real Backrooms HEVC Main 10 / E-AC-3 / SRT MKV (decodes and renders; playback paces to download). This deliberately changes one locked-in decision from `docs/planning.md` (line 88 / risk table line 129).
 
 ## Problem

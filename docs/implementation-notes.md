@@ -4,6 +4,10 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-09 — Feat: rip out VLCKit, route MKV to AVPlayer (Gates 5)
+
+VLCKit is gone. `.mkv`/`.mka` now play through native AVPlayer via the transmuxer (`PlaybackKind.vlc` removed; mkv/mka → `.avPlayer`; `Views.swift` routes every streamable file to `PlayerView`). Deleted: `Sources/VLCBridge/` (MKVPlayerView, MKVStreamSession), `Sources/Streaming/TorrentSeekableInputStream.swift`, `Sources/Streaming/TorrentHTTPServer.swift`, their tests, the `MobileVLCKit` binary target + `VLCBridge` target + linker settings in `Package.swift`, and the gitignored `Vendor/` framework. The iOS app now builds at **3.3 MB** (was 225+ MB) with no embedded framework, and launches in the iOS 26.3 simulator. `docs/mkv-streaming.md` marked superseded; `docs/planning.md` and `docs/mkv-avplayer-transmuxer.md` updated. 63 tests green (removed the VLC-specific suite).
+
 ### 2026-08-09 — Feat: stream MKV through AVPlayer via the transmuxer (loader integration)
 
 The transmuxer now drives real `.mkv` playback: `TorrentStreamSession` routes Matroska files to a new `TransmuxStreamSource` (a `TorrentStreamSource` presenting the virtual fragmented MP4) and serves it through the existing `AVAssetResourceLoaderDelegate`, so MKV playback uses the same AVPlayer/PiP path as MP4.

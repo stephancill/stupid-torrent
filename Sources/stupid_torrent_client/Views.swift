@@ -3,9 +3,6 @@ import AVKit
 import AVFoundation
 import TorrentCore
 import Streaming
-#if os(iOS)
-import VLCBridge
-#endif
 
 struct ContentView: View {
     @State private var store = TorrentStore()
@@ -86,8 +83,6 @@ struct ContentView: View {
                 switch request.kind {
                 case .avPlayer:
                     PlayerView(session: TorrentStreamSession(torrent: request.torrent, fileIndex: request.fileIndex))
-                case .vlc:
-                    MKVPlayerView(torrent: request.torrent, fileIndex: request.fileIndex)
                 case .none:
                     EmptyView()
                 }
@@ -317,11 +312,7 @@ struct TorrentDetailView: View {
                 ForEach(fileIndicesBySize, id: \.self) { index in
                     let file = item.metainfo.files[index]
                     let playbackKind = Torrent.playbackKind(forFileNamed: file.name)
-                    #if os(iOS)
                     let isStreamable = playbackKind != .none
-                    #else
-                    let isStreamable = playbackKind == .avPlayer
-                    #endif
                     Button {
                         if isStreamable {
                             openPlayer(fileIndex: index, kind: playbackKind)
