@@ -4,6 +4,26 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-09 — Fix: keep loopback HTTP socket I/O off Swift's cooperative executor
+
+Opening the partially-downloaded Backrooms MKV failed immediately with VLC's `Could not open http://127.0.0.1:...: Unknown error`, while the completed smoke fixture played. The same issue made all eight parallel `TorrentHTTPServerTests` hang: blocking BSD `accept()`, `read()`, and `write()` calls ran directly in unstructured Swift tasks, so active torrent peers or concurrent server tests could exhaust the cooperative executor before the loopback server responded. `TorrentHTTPServer` now bridges blocking socket operations through GCD-backed checked continuations. The HTTP tests remain parallel and complete, exercising the production concurrency behavior rather than hiding it by serializing the suite.
+
+Directly probing the live Backrooms server exposed a second large-file-only issue: an un-ranged `HEAD` request incorrectly took the 2 MB initial-GET lookahead path, returning `206` and a 2 MB `Content-Length` instead of the real 4.78 GB size. The lookahead response is now GET-only; HEAD always reports `200` with the full length. The HEAD test now uses a synthetic 4.78 GB declared length so this cannot regress behind the prior 200 KB fixture.
+
+The HTTP framing was also corrected on both sides of the tests: request headers are now read through the full `\r\n\r\n` delimiter instead of stopping after any CRLF, and the test client preserves response-body bytes received in the same read as the headers. Previously fragmented Range headers could be ignored by the server, while coalesced response bytes made the client wait forever for bytes it had already discarded.
+
+VLCKit debug logging then showed the live Backrooms stream being detected as corrupt MPEG-PS (`mpg123`/`mpeg2video`, repeated `garbage at input`) instead of Matroska. A direct range read confirmed byte zero was all zeros even though the resume sidecar marked piece 0 verified; this was the known stale sidecar left after the sparse file had previously been deleted/recreated. Streaming now SHA-1 revalidates each verified piece lazily before serving it for the first time in a process. A mismatch clears and immediately persists the verified bit, requeues the piece at jump priority, and withholds corrupt bytes until a valid piece is downloaded. If the torrent had been considered complete and its run loop already exited, invalidation restarts it so the stale piece can actually be repaired.
+
+The status now stays honest too: `Torrent.run()` re-verifies the pieces the resume sidecar marked verified before trusting them. A "complete" torrent whose data file was deleted/recreated (sparse at full size, so a size check can't catch it) has its stale bits cleared at startup and falls back into downloading — the detail view shows the real progress instead of "Complete", and the corrupt bytes are repaired before they can reach a player. Partial torrents re-verify restored pieces in the background for the same reason. The race where an invalidation landed during a previous `run()`'s teardown and the restart was swallowed is fixed by `ensureStreamingRepair()`, which waits for the teardown to finish before starting a fresh run.
+
+`MKVStreamSession` now surfaces the torrent's verified fraction (`downloadProgress`), and the player shows "Buffering — N% downloaded" while VLC is stalled on a still-downloading or repairing file, instead of an endless bare spinner. Verified on the simulator: the repaired Backrooms file plays and shows the buffering percentage during the final repair pass; a fully-verified MKV plays with controls, no spinner.
+
+Opening a player for a *downloading* torrent could show a blank full-screen cover with no controls: `TorrentDetailView` is presented via `navigationDestination(for: TorrentItem.self)`, and `TorrentItem` is `@Observable`, so every 1 s status tick recreated the detail view and reset its `@State` — the cover then presented with `activeKind`/`activeFileIndex` nil (a fresh `openPlayer` set them, but a re-init wiped them before the cover content built; a complete torrent like media.mkv never re-inited, which is why it worked). Player presentation now lives on the stable `TorrentStore.pendingPlayback` (`PlaybackRequest`) and the `.fullScreenCover(item:)` is attached to `ContentView`'s navigation stack, so a recreated detail view can't break it. The `#if !os(iOS)` host build keeps its local `.sheet` presentation.
+
+The player's `refreshState()` showed a loading spinner during normal playback: libVLC reports `.buffering` for HTTP/streaming input even while frames are rendering, and the state mapping translated that straight to the buffering UI. The mapping now treats an advancing position as the reliable "actually playing" signal (falling back to `.buffering` only when playback is requested but the position is frozen), so the spinner and Play button only appear during genuine buffering — initial load or a stall on not-yet-verified bytes — alongside the "Buffering — N% downloaded" progress text.
+
+Seeking felt broken/laggy: the seek slider called `session.seek` (a `VLCMediaPlayer.time` set, which is a fresh HTTP range request + demux re-sync on the torrent file) on *every* drag tick, flooding VLC's input for a large MKV. The scrub now records the drag position in `scrubTarget` (so the thumb follows the finger) and issues a single seek via a 400 ms debounce after the last movement, then clears the target so the slider tracks real playback again. Verified: dragging to ~31% of a 110-minute MKV seeks there and continues playing.
+
 ### 2026-08-08 — Fix: full pipelines for peers on exhausted pieces (distinct missing blocks per peer)
 
 Follow-up to the endgame re-request fix. The log showed 6,196 refills stuck at `requesting 1 blocks` while the download depended on one seeder (`185.21.216.198` = 37k/52k refills). Root cause: `nextBlockRequest` returned the same missing block to a peer on every refill, and `refillPipeline`'s `guard !outstanding.contains(key) else { break }` then truncated that peer's pipeline to **one** block per round-trip — peers on a near-complete piece (cursor exhausted) contributed a trickle while the single real seeder carried the swarm.
@@ -204,7 +224,7 @@ Key details learned while debugging:
 - Serving the whole file as a single 200 made VLC's prefetch hit EOF and stop; bounded the initial whole-file request to a 2 MB 206 lookahead so VLC issues range requests for the rest (mirrors the loader/stream lookahead).
 - VLCMediaPlayer's `VLCMediaPlayerTimeChanged`/`StateChanged` notifications don't reliably fire in this VLCKit build — `MKVStreamSession` now polls the player (250 ms) for position/duration/state instead of relying on notifications.
 
-**Verification**: `TorrentHTTPServerTests` (8) — HEAD length, full 200, 206 byte-range, open-ended, suffix, 416, progressive-serve, prioritize-follows-client. Simulator smoke test: `http://127.0.0.1` server, VLC parsed the MKV (`Duration=60023`), started h264/aac decoders, `Received first picture`, and **position advanced** 89 ms → 11325 ms over 12 s (polled from the player) — playback confirmed. Screenshots stay static because VLC's OpenGLES2VideoView layer isn't captured by `simctl screenshot` (simulator limitation, not a playback failure).
+**Verification**: `TorrentHTTPServerTests` (8) — HEAD length, full 200, 206 byte-range, open-ended, suffix, 416, progressive-serve, prioritize-follows-client. Simulator smoke test: `http://127.0.0.1` server, VLC parsed the MKV (`Duration=60023`), started h264/aac decoders, `Received first picture`, and **position advanced** 89 ms → 11325 ms over 12 s (polled from the player). A follow-up visual check on the iOS 26.3 simulator confirmed that the rendered test pattern and timeline advance on screen; screenshots six seconds apart changed 31,029 pixels. The earlier static screenshots did not indicate a VLC drawable failure.
 
 ### 2026-08-08 — Fix: app crashed with SIGPIPE during streaming + active download
 
@@ -667,12 +687,5 @@ A fresh-install app resolve timed out at 90s on the marginal Backrooms swarm whi
 3. **DHT node warm-up at app launch** (`DHTNode.warmUp()` called in `stupid_torrent_clientApp.init`): bootstraps the shared node's routing table in the background, so the first magnet resolve doesn't pay a cold 8s bootstrap inline and queries a warm table (also starts accumulating the live peer store immediately).
 
 **Verification**: cold-cache CLI resolve x3 all succeed (21.4s first, then 3.3s/3.0s as caches warm); 53 tests green. Simulator: at launch the node is already live (`DHT: announce … to 8 nodes`, warm-up ran), and adding the Cosmos Laundromat magnet resolves and persists within ~20s (sweep-cancelled `CancellationError`s confirm a peer won; `.torrent` saved; idle timer held disabled while downloading).
-
-
-
-
-
-
-
 
 
