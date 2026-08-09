@@ -23,6 +23,10 @@ public final class MKVStreamSession: ObservableObject {
     @Published public private(set) var durationMs: Int64 = 0
     @Published public private(set) var positionMs: Int64 = 0
     @Published public private(set) var isSeekable = false
+    /// Fraction (0...1) of the torrent's pieces that are verified — surfaced while buffering so a
+    /// player stalled on a still-downloading/repairing file shows progress instead of an endless
+    /// spinner.
+    @Published public private(set) var downloadProgress: Double = 0
     @Published public private(set) var audioTracks: [Track] = []
     @Published public private(set) var subtitleTracks: [Track] = []
 
@@ -32,13 +36,16 @@ public final class MKVStreamSession: ObservableObject {
         public let isSelected: Bool
     }
 
+    private let torrent: Torrent
     private let player = VLCMediaPlayer()
     private let server: TorrentHTTPServer?
     private let media: VLCMedia
     private var notificationTokens: [NSObjectProtocol] = []
     private var pollTask: Task<Void, Never>?
+    private var lastPositionMs: Int64 = 0
 
     public init(torrent: Torrent, fileIndex: Int) {
+        self.torrent = torrent
         let source = TorrentStreamSourceAdapter(torrent: torrent)
         let name = torrent.fileName(fileIndex)
         let started: TorrentHTTPServer?
@@ -70,11 +77,14 @@ public final class MKVStreamSession: ObservableObject {
                     self.refreshTime()
                     self.refreshState()
                 }
+                await self.refreshDownloadProgress()
             }
         }
     }
 
-    public func play() { player.play() }
+    public func play() {
+        player.play()
+    }
     public func pause() { player.pause() }
     public func togglePlayPause() {
         if player.isPlaying { player.pause() } else { player.play() }
@@ -117,16 +127,31 @@ public final class MKVStreamSession: ObservableObject {
     }
 
     private func refreshState() {
-        switch player.state {
-        case .stopped: state = positionMs > 0 && durationMs > 0 && positionMs >= durationMs ? .ended : .idle
-        case .opening: state = .opening
-        case .buffering: state = .buffering
-        case .playing: state = .playing
-        case .paused: state = .paused
-        case .ended: state = .ended
-        case .error: state = .failed
-        @unknown default: state = .idle
+        let now = positionMs
+        if player.state == .error {
+            state = .failed
+        } else if player.state == .ended || (durationMs > 0 && now > 0 && now >= durationMs) {
+            state = .ended
+        } else if player.isPlaying, now != lastPositionMs {
+            // libVLC reports `.buffering` for streaming input even while frames are rendering, so
+            // an advancing position is the reliable "actually playing" signal.
+            state = .playing
+        } else if player.isPlaying {
+            // Play was requested but the position is frozen: still loading or stalled on data.
+            state = .buffering
+        } else {
+            switch player.state {
+            case .stopped: state = now > 0 && durationMs > 0 && now >= durationMs ? .ended : .idle
+            case .opening: state = .opening
+            case .buffering: state = .buffering
+            case .playing: state = .playing
+            case .paused: state = .paused
+            case .ended: state = .ended
+            case .error: state = .failed
+            @unknown default: state = .idle
+            }
         }
+        lastPositionMs = now
         isSeekable = player.isSeekable
         refreshTracks()
     }
@@ -134,6 +159,12 @@ public final class MKVStreamSession: ObservableObject {
     private func refreshTime() {
         positionMs = player.time.value?.int64Value ?? 0
         durationMs = media.length.value?.int64Value ?? 0
+    }
+
+    private func refreshDownloadProgress() async {
+        let pieceCount = torrent.metainfo.pieceCount
+        guard pieceCount > 0 else { return }
+        downloadProgress = Double(await torrent.verifiedCount) / Double(pieceCount)
     }
 
     private func refreshTracks() {

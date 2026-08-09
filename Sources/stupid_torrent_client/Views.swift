@@ -81,6 +81,18 @@ struct ContentView: View {
             .navigationDestination(for: TorrentItem.self) { item in
                 TorrentDetailView(item: item, store: store)
             }
+            #if os(iOS)
+            .fullScreenCover(item: $store.pendingPlayback) { request in
+                switch request.kind {
+                case .avPlayer:
+                    PlayerView(session: TorrentStreamSession(torrent: request.torrent, fileIndex: request.fileIndex))
+                case .vlc:
+                    MKVPlayerView(torrent: request.torrent, fileIndex: request.fileIndex)
+                case .none:
+                    EmptyView()
+                }
+            }
+            #endif
             .navigationTitle("Torrents")
             .toolbar {
                 Button {
@@ -269,10 +281,13 @@ struct TorrentDetailView: View {
     let item: TorrentItem
     let store: TorrentStore
 
+    // macOS keeps the player presentation local; iOS presents from ContentView via
+    // `store.pendingPlayback` because this view is recreated on every status tick for a
+    // downloading torrent, which would reset local `@State` and break the cover.
+    #if !os(iOS)
     @State private var streamSession: TorrentStreamSession?
-    @State private var activeKind: Torrent.PlaybackKind?
-    @State private var activeFileIndex: Int?
     @State private var showPlayer = false
+    #endif
 
     private var fileIndicesBySize: [Int] {
         item.metainfo.files.indices.sorted {
@@ -328,22 +343,7 @@ struct TorrentDetailView: View {
         .toolbar {
             TorrentDetailMenu(item: item, store: store)
         }
-        #if os(iOS)
-        .fullScreenCover(isPresented: $showPlayer) {
-            if let activeKind, let activeFileIndex {
-                switch activeKind {
-                case .avPlayer:
-                    if let streamSession {
-                        PlayerView(session: streamSession)
-                    }
-                case .vlc:
-                    MKVPlayerView(torrent: item.torrent, fileIndex: activeFileIndex)
-                case .none:
-                    EmptyView()
-                }
-            }
-        }
-        #else
+        #if !os(iOS)
         .sheet(isPresented: $showPlayer) {
             if let streamSession {
                 PlayerView(session: streamSession)
@@ -354,15 +354,7 @@ struct TorrentDetailView: View {
 
     private func openPlayer(fileIndex: Int, kind: Torrent.PlaybackKind) {
         #if os(iOS)
-        activeFileIndex = fileIndex
-        activeKind = kind
-        switch kind {
-        case .avPlayer:
-            streamSession = TorrentStreamSession(torrent: item.torrent, fileIndex: fileIndex)
-        case .vlc, .none:
-            streamSession = nil
-        }
-        showPlayer = true
+        store.pendingPlayback = PlaybackRequest(torrent: item.torrent, fileIndex: fileIndex, kind: kind)
         #else
         streamSession = TorrentStreamSession(torrent: item.torrent, fileIndex: fileIndex)
         showPlayer = true

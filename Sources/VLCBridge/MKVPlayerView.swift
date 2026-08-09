@@ -12,6 +12,11 @@ import TorrentCore
 public struct MKVPlayerView: View {
     @StateObject private var session: MKVStreamSession
     @Environment(\.dismiss) private var dismiss
+    /// The slider position while the user is scrubbing, so the thumb follows the finger without
+    /// issuing VLC seeks on every tick. A debounce issues a single seek shortly after the drag
+    /// stops.
+    @State private var scrubTarget: Double?
+    @State private var seekTask: Task<Void, Never>?
 
     public init(torrent: Torrent, fileIndex: Int) {
         _session = StateObject(wrappedValue: MKVStreamSession(torrent: torrent, fileIndex: fileIndex))
@@ -49,9 +54,16 @@ public struct MKVPlayerView: View {
                     Text("Playback failed")
                         .foregroundStyle(.white)
                 } else if session.state == .opening || session.state == .buffering {
-                    ProgressView()
-                        .tint(.white)
-                        .controlSize(.large)
+                    VStack(spacing: 10) {
+                        ProgressView()
+                            .tint(.white)
+                            .controlSize(.large)
+                        if session.state == .buffering, session.downloadProgress < 1, session.downloadProgress > 0 {
+                            Text("Buffering — \(Int(session.downloadProgress * 100))% downloaded")
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.8))
+                        }
+                    }
                 }
 
                 controls
@@ -62,7 +74,22 @@ public struct MKVPlayerView: View {
             configureAudioSession()
         }
         .onDisappear {
+            seekTask?.cancel()
             session.teardown()
+        }
+    }
+
+    /// Issues a single seek after the last scrub movement, coalescing the many slider ticks a drag
+    /// produces into one VLC seek (each seek is a fresh HTTP range request on the torrent file).
+    private func scheduleSeek() {
+        seekTask?.cancel()
+        seekTask = Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            guard !Task.isCancelled, let target = scrubTarget, session.durationMs > 0 else { return }
+            await MainActor.run {
+                session.seek(toMs: Int64(Double(session.durationMs) * target))
+                scrubTarget = nil
+            }
         }
     }
 
@@ -70,8 +97,14 @@ public struct MKVPlayerView: View {
         VStack(spacing: 8) {
             Slider(
                 value: Binding(
-                    get: { session.durationMs > 0 ? Double(session.positionMs) / Double(session.durationMs) : 0 },
-                    set: { session.seek(toMs: Int64(Double(session.durationMs) * $0)) }
+                    get: {
+                        if let scrubTarget { return scrubTarget }
+                        return session.durationMs > 0 ? Double(session.positionMs) / Double(session.durationMs) : 0
+                    },
+                    set: {
+                        scrubTarget = $0
+                        scheduleSeek()
+                    }
                 ),
                 in: 0...1
             )

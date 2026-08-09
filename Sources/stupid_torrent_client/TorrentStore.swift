@@ -16,12 +16,23 @@ struct ResolvingTorrentItem: Identifiable {
     let addedAt: Date
 }
 
+/// A request to open a player for a torrent file. Held on `TorrentStore` (not the detail view,
+/// which is recreated on every status tick for a downloading torrent) so the full-screen player
+/// cover presented from `ContentView` reliably sees the request.
+struct PlaybackRequest: Identifiable {
+    let id = UUID()
+    let torrent: Torrent
+    let fileIndex: Int
+    let kind: Torrent.PlaybackKind
+}
+
 @MainActor
 @Observable
 final class TorrentStore {
     var items: [TorrentItem] = []
     var resolvingItems: [ResolvingTorrentItem] = []
     var addError: String?
+    var pendingPlayback: PlaybackRequest?
 
     private let documentsURL: URL
     let downloadsURL: URL
