@@ -75,6 +75,7 @@ public actor Torrent {
     private var networkStarted = false
     private var firstAnnounce = true
     private var verifiedDirty = false
+    var streamingValidatedPieces: Set<Int> = []
 
     private var downloadedBytes: Int64 = 0
     private var uploadedBytes: Int64 = 0
@@ -141,15 +142,28 @@ public actor Torrent {
         try? await storage.prepare()
         try? await storage.loadVerified()
         picker = PiecePicker(pieceCount: metainfo.pieceCount, verified: await storage.verifiedBitfield)
+        let restoredVerified = picker.verified.bits.enumerated().compactMap { $0.element ? $0.offset : nil }
 
         // A torrent that is already complete has nothing to do on the network: no announce, no DHT
         // peer lookup, no listener, no seeding. It just sits there so the user can access and
         // stream the downloaded files. (Streaming reads reopen file handles on demand, so we don't
         // close storage here — `stop()` closes it on removal.)
+        //
+        // Before trusting that state, re-verify the restored bits against disk: a resume sidecar
+        // can survive the data file being deleted/recreated (the file is recreated sparse at full
+        // size, so a size check won't catch it), leaving a torrent that "looks complete" while the
+        // bytes are zeros. Clear the failures so it repairs instead of seeding garbage.
         if picker.verified.allSet && !isPaused {
-            await publishStatus()
-            isRunning = false
-            return
+            await reverifyRestoredPieces(restoredVerified)
+            if picker.verified.allSet {
+                await publishStatus()
+                isRunning = false
+                return
+            }
+        } else if !restoredVerified.isEmpty {
+            // Partial (or paused) torrent: repair stale resume bits in the background so the
+            // status stays honest and playback never hits zero-filled pieces mid-stream.
+            Task { [weak self] in await self?.reverifyRestoredPieces(restoredVerified) }
         }
 
         if !isPaused {
@@ -474,6 +488,67 @@ public actor Torrent {
         pieceLastProgress.removeValue(forKey: piece)
         for key in outstanding.keys where key.index == piece {
             unregisterBlock(key)
+        }
+    }
+
+    func invalidateStaleStreamingPiece(_ piece: Int) async {
+        guard picker.verified[piece] else { return }
+        picker.verified[piece] = false
+        await storage.clearVerified(piece)
+        streamingValidatedPieces.remove(piece)
+        requeuePiece(piece)
+        picker.setPriority(piece, level: 10)
+        try? await storage.saveVerified()
+        verifiedDirty = false
+        TorrentLog.log("piece \(piece) failed streaming revalidation; cleared stale resume state")
+        await publishStatus()
+        ensureStreamingRepair()
+    }
+
+    /// Test/dev hook: mark a piece verified without downloading, to exercise the streaming-time
+    /// revalidation path in isolation (the startup re-verify would otherwise clear it first).
+    func markPieceVerified(_ piece: Int) {
+        picker.markVerified(piece)
+    }
+
+    /// Re-verifies pieces the resume sidecar marked verified, un-marking any whose on-disk data no
+    /// longer matches. A stale sidecar (data file deleted/recreated after the bits were saved)
+    /// would otherwise report a torrent as complete while serving zero-filled garbage.
+    private func reverifyRestoredPieces(_ restored: [Int]) async {
+        guard !restored.isEmpty else { return }
+        var cleared: [Int] = []
+        for piece in restored {
+            guard !Task.isCancelled else { return }
+            guard picker.verified[piece] else { continue }
+            guard let ok = try? await storage.verify(piece: piece) else { continue }
+            if !ok {
+                picker.verified[piece] = false
+                await storage.clearVerified(piece)
+                streamingValidatedPieces.remove(piece)
+                cleared.append(piece)
+            }
+        }
+        guard !cleared.isEmpty else { return }
+        try? await storage.saveVerified()
+        verifiedDirty = false
+        await publishStatus()
+        TorrentLog.log("startup re-verify cleared \(cleared.count) stale pieces")
+    }
+
+    /// Ensures the download machinery is running to re-fetch a piece invalidated by streaming
+    /// revalidation. A torrent that had completed has shut `run()` down, so a fresh run is needed;
+    /// if a previous run is still tearing down (`isRunning` stays true through teardown), wait for
+    /// it to finish first instead of swallowing the restart.
+    private func ensureStreamingRepair() {
+        Task { [weak self] in
+            guard let self else { return }
+            for _ in 0..<600 {
+                if !(await self.isRunning) {
+                    await self.run()
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
         }
     }
 

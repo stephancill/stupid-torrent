@@ -706,16 +706,44 @@ extension Data {
         await torrent.stop()
     }
 
-    @Test func pauseIsNoOpForCompleteTorrent() async throws {
-        let metainfo = try torrentMetainfo()
-        let dir = tempDir()
-        defer { try? FileManager.default.removeItem(at: dir) }
+    /// Builds a tiny torrent whose data is genuinely on disk, so the engine's startup re-verify
+    /// confirms it as complete.
+    private func syntheticCompleteTorrent(in dir: URL) throws -> Metainfo {
+        let (metainfo, data) = try syntheticTorrent()
+        try data.write(to: dir.appendingPathComponent("synth.mkv"))
+        try writeAllVerifiedSidecar(metainfo, in: dir)
+        return metainfo
+    }
+
+    private func syntheticTorrent(pieceLength: Int = 16, pieceCount: Int = 4) throws -> (Metainfo, Data) {
+        let pieces = (0..<pieceCount).map { i in
+            Data((0..<pieceLength).map { UInt8((i * pieceLength + $0) % 251) })
+        }
+        let fileData = pieces.reduce(Data(), +)
+        let info: [String: BValue] = [
+            "name": .string(Data("synth.mkv".utf8)),
+            "piece length": .int(pieceLength),
+            "length": .int(fileData.count),
+            "pieces": .string(pieces.reduce(Data()) { $0 + Data(Insecure.SHA1.hash(data: $1)) }),
+        ]
+        let metainfo = try Metainfo(infoDict: Bencode.encode(.dictionary(info)), trackers: [])
+        return (metainfo, fileData)
+    }
+
+    private func writeAllVerifiedSidecar(_ metainfo: Metainfo, in dir: URL) throws {
         var full = Data()
         full.appendUInt32BE(UInt32(metainfo.pieceCount))
         full.append(Bitfield(bits: [Bool](repeating: true, count: metainfo.pieceCount)).data())
         try full.write(to: dir.appendingPathComponent(".\(metainfo.infoHash.hexString).verified"))
+    }
+
+    @Test func pauseIsNoOpForCompleteTorrent() async throws {
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let metainfo = try syntheticCompleteTorrent(in: dir)
 
         let torrent = Torrent(directory: dir, metainfo: metainfo, enableDHT: false)
+        defer { Task { await torrent.stop() } }
         await torrent.run()
         #expect(await torrent.statusBroadcast.value.state == .seeding)
         #expect(!(await torrent.running))
@@ -725,6 +753,54 @@ extension Data {
         #expect(await torrent.statusBroadcast.value.state == .seeding)
         await torrent.resume()
         #expect(await torrent.statusBroadcast.value.state == .seeding)
+    }
+
+    @Test func completeTorrentWithStaleSidecarRepairsAtStartup() async throws {
+        // The resume sidecar claims every piece verified, but no data file exists (the file was
+        // deleted/recreated after the bits were saved). Startup re-verify must catch this and put
+        // the torrent back into downloading instead of reporting a complete-but-garbage file.
+        let (metainfo, _) = try syntheticTorrent()
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try writeAllVerifiedSidecar(metainfo, in: dir)
+
+        let torrent = Torrent(directory: dir, metainfo: metainfo, enableDHT: false)
+        let runTask = Task { await torrent.run() }
+        defer { runTask.cancel() }
+        defer { Task { await torrent.stop() } }
+        try? await Task.sleep(for: .milliseconds(300))
+
+        #expect(await torrent.statusBroadcast.value.state == .downloading)
+        #expect(await torrent.verifiedCount == 0)
+        #expect(await torrent.running)
+
+        await torrent.stop()
+    }
+
+    @Test func staleResumePieceIsInvalidatedBeforeStreaming() async throws {
+        // A piece that is marked verified but whose on-disk bytes no longer match (file truncated /
+        // deleted mid-session) must be invalidated by the streaming read — the defense for stale
+        // pieces that slip past the startup re-verify window.
+        let (metainfo, data) = try syntheticTorrent()
+        let dir = tempDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try data.write(to: dir.appendingPathComponent("synth.mkv"))
+        try Data(repeating: 0, count: 16).write(to: dir.appendingPathComponent("synth.mkv"), options: .atomic)
+
+        let torrent = Torrent(directory: dir, metainfo: metainfo, enableDHT: false)
+        await torrent.markPieceVerified(0)
+        #expect(await torrent.verifiedCount == 1)
+
+        let result = await torrent.streamingRead(fileIndex: 0, offset: 0, length: 1)
+        #expect(result == nil)
+        #expect(await torrent.verifiedCount == 0)
+        #expect(Storage.loadVerifiedCount(
+            directory: dir,
+            infoHash: metainfo.infoHash,
+            pieceCount: metainfo.pieceCount
+        ) == 0)
+        #expect(await waitUntilRunning(torrent))
+        await torrent.stop()
     }
 }
 

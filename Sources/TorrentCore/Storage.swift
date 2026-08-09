@@ -100,6 +100,10 @@ public actor Storage {
         verified[piece] = true
     }
 
+    public func clearVerified(_ piece: Int) {
+        verified[piece] = false
+    }
+
     public var verifiedBitfield: [Bool] {
         verified.bits
     }

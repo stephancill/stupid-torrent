@@ -63,6 +63,13 @@ public extension Torrent {
         let absolute = (fileStart + offset)..<(fileStart + offset + length)
         let pieces = metainfo.pieceRange(forByteRange: absolute)
         guard pieces.allSatisfy({ picker.verified[$0] }) else { return nil }
+        for piece in pieces where !streamingValidatedPieces.contains(piece) {
+            guard (try? await storage.verify(piece: piece)) == true else {
+                await invalidateStaleStreamingPiece(piece)
+                return nil
+            }
+            streamingValidatedPieces.insert(piece)
+        }
         return try? await storage.read(bytes: absolute)
     }
 
