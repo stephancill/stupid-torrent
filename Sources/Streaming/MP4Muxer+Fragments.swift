@@ -82,11 +82,11 @@ extension MP4Muxer {
     }
 
     private static func trun(samples: [TransmuxSample], dataOffset: Int) -> Data {
-        // data_offset(0x1) + sample_duration(0x100) + sample_size(0x200) + sample_flags(0x400).
-        // Composition offsets (0x800) only when any sample reorders PTS vs DTS.
-        let hasCompositionOffsets = samples.contains { $0.compositionOffsetTicks != 0 }
-        var flags: UInt32 = 0x1 | 0x100 | 0x200 | 0x400
-        if hasCompositionOffsets { flags |= 0x800 }
+        // data_offset(0x1) + sample_duration(0x100) + sample_size(0x200)
+        // + sample_flags(0x400) + sample_composition_time_offsets(0x800).
+        // Composition offsets are always present so the trun size is a pure function of the
+        // sample count (deterministic fragment sizing for the sidx); zero offsets are valid.
+        let flags: UInt32 = 0x1 | 0x100 | 0x200 | 0x400 | 0x800
         var payload = Data()
         payload.append(u32(UInt32(samples.count)))
         payload.append(u32(UInt32(dataOffset)))
@@ -94,9 +94,7 @@ extension MP4Muxer {
             payload.append(u32(UInt32(sample.durationTicks)))
             payload.append(u32(UInt32(sample.data.count)))
             payload.append(u32(sampleFlags(sample)))
-            if hasCompositionOffsets {
-                payload.append(u32(UInt32(bitPattern: Int32(sample.compositionOffsetTicks))))
-            }
+            payload.append(u32(UInt32(bitPattern: Int32(sample.compositionOffsetTicks))))
         }
         return fullBox("trun", version: 1, flags: flags, payload)
     }

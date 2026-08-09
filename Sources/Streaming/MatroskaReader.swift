@@ -464,12 +464,14 @@ public enum MatroskaParser {
 
     /// The slice of `bytes` covering the cluster element at `offset` and the absolute offset
     /// where the following element begins. Returns nil if there's no cluster at `offset`.
+    /// When the cluster is larger than `bytes`, `elementEnd` is still the true end (so callers
+    /// can detect truncation and grow their window); the returned slice covers only what fits.
     public static func readClusterRange(bytes: Data, offset: Int) throws -> MKVClusterRange? {
         guard let header = EBML.readHeader(bytes, offset: offset), header.id == EBMLID.cluster.rawValue else { return nil }
         let headerLen = EBML.headerLength(header)
         let elementEnd: Int
         if let size = header.size {
-            elementEnd = min(offset + headerLen + Int(size), bytes.count)
+            elementEnd = offset + headerLen + Int(size)
         } else {
             var end = offset + headerLen
             while end + 1 < bytes.count {
@@ -478,7 +480,8 @@ public enum MatroskaParser {
             }
             elementEnd = end
         }
-        return MKVClusterRange(elementEnd: elementEnd, bytes: bytes.subdata(in: offset..<elementEnd))
+        let sliceEnd = min(elementEnd, bytes.count)
+        return MKVClusterRange(elementEnd: elementEnd, bytes: bytes.subdata(in: offset..<sliceEnd))
     }
 
     /// Parses a SimpleBlock/Block payload (track number, timecode, flags, frame data).
@@ -541,6 +544,118 @@ public enum MatroskaParser {
             return block
         }
         return nil
+    }
+
+    /// Per-track sample stats for one cluster, used to size the resulting fMP4 fragment without
+    /// retaining payload bytes (for the sidx / deterministic layout).
+    public struct MKVClusterTrackLayout: Sendable {
+        public let sampleCount: Int
+        public let mdatSize: Int
+        public let firstPTS: Int64
+        public let lastPTS: Int64
+        public let lastDelta: Int64
+    }
+
+    public struct MKVClusterLayout: Sendable {
+        public let timestamp: UInt64
+        public let tracks: [UInt64: MKVClusterTrackLayout]
+    }
+
+    /// Parses a cluster's structure (block headers + frame sizes) without materializing sample
+    /// data, so the transmuxer can compute each fragment's exact fMP4 byte size up front.
+    public static func scanClusterLayout(bytes: Data) throws -> MKVClusterLayout {
+        guard let header = EBML.readHeader(bytes, offset: 0), header.id == EBMLID.cluster.rawValue else {
+            throw MatroskaError.corrupt("expected cluster")
+        }
+        let dataStart = EBML.headerLength(header)
+        let elementEnd: Int
+        if let size = header.size {
+            elementEnd = dataStart + Int(size)
+            guard elementEnd <= bytes.count else { throw MatroskaError.truncated("cluster data") }
+        } else {
+            var cursor = dataStart
+            var found = false
+            var end = bytes.count
+            while cursor + 1 < bytes.count {
+                if let next = EBML.readHeader(bytes, offset: cursor), isTopLevelID(next.id) {
+                    end = cursor
+                    found = true
+                    break
+                }
+                cursor += 1
+            }
+            guard found else { throw MatroskaError.truncated("cluster end") }
+            elementEnd = end
+        }
+
+        var timestamp: UInt64 = 0
+        var counts: [UInt64: Int] = [:]
+        var mdat: [UInt64: Int] = [:]
+        var firstPTS: [UInt64: Int64] = [:]
+        var lastPTS: [UInt64: Int64] = [:]
+        var lastDelta: [UInt64: Int64] = [:]
+        var lastCount: [UInt64: Int] = [:]
+
+        var cursor = dataStart
+        while cursor < elementEnd {
+            guard let blockHeader = EBML.readHeader(bytes, offset: cursor), let blockSize = blockHeader.size else { break }
+            let valueOffset = cursor + EBML.headerLength(blockHeader)
+            guard valueOffset + Int(blockSize) <= bytes.count else { break }
+            switch blockHeader.id {
+            case EBMLID.clusterTimestamp.rawValue:
+                timestamp = EBML.readUInt(bytes, offset: valueOffset, length: Int(blockSize))
+            case EBMLID.simpleBlock.rawValue, EBMLID.block.rawValue:
+                if let block = try? parseBlock(bytes, valueOffset: valueOffset, size: Int(blockSize), isSimple: blockHeader.id == EBMLID.simpleBlock.rawValue) {
+                    let frames = expandLacing(block) ?? [block]
+                    let pts = Int64(timestamp) + block.relativeTimestamp
+                    counts[block.trackNumber, default: 0] += frames.count
+                    for frame in frames {
+                        mdat[block.trackNumber, default: 0] += frame.data.count
+                    }
+                    if lastPTS[block.trackNumber] != nil {
+                        let delta = pts - lastPTS[block.trackNumber]!
+                        if delta > 0 { lastDelta[block.trackNumber] = delta }
+                    } else {
+                        firstPTS[block.trackNumber] = pts
+                    }
+                    lastPTS[block.trackNumber] = pts
+                    lastCount[block.trackNumber] = frames.count
+                }
+            case EBMLID.blockGroup.rawValue:
+                if let block = try? parseBlockGroup(bytes, dataOffset: valueOffset, size: Int(blockSize)) {
+                    let frames = expandLacing(block) ?? [block]
+                    let pts = Int64(timestamp) + block.relativeTimestamp
+                    counts[block.trackNumber, default: 0] += frames.count
+                    for frame in frames {
+                        mdat[block.trackNumber, default: 0] += frame.data.count
+                    }
+                    if lastPTS[block.trackNumber] != nil {
+                        let delta = pts - lastPTS[block.trackNumber]!
+                        if delta > 0 { lastDelta[block.trackNumber] = delta }
+                    } else {
+                        firstPTS[block.trackNumber] = pts
+                    }
+                    lastPTS[block.trackNumber] = pts
+                    lastCount[block.trackNumber] = frames.count
+                }
+            default:
+                break
+            }
+            cursor = valueOffset + Int(blockSize)
+        }
+
+        var result: [UInt64: MKVClusterTrackLayout] = [:]
+        for (track, count) in counts {
+            result[track] = MKVClusterTrackLayout(
+                sampleCount: count,
+                mdatSize: mdat[track] ?? 0,
+                firstPTS: firstPTS[track] ?? 0,
+                lastPTS: lastPTS[track] ?? 0,
+                lastDelta: lastDelta[track] ?? 0
+            )
+        }
+        _ = lastCount
+        return MKVClusterLayout(timestamp: timestamp, tracks: result)
     }
 
     /// Expands a laced block into its constituent frames (one sample per frame), distributing

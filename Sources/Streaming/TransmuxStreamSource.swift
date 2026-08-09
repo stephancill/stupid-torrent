@@ -3,31 +3,41 @@ import TorrentCore
 
 /// Presents a Matroska file's transmuxed fragmented MP4 as a `TorrentStreamSource`, so the
 /// existing resource-loader can serve `.mkv` playback through AVPlayer. Virtual layout:
-/// `[init segment][fragment 0][fragment 1]...`, one fragment per MKV cluster. Fragments are
-/// generated on demand from the real (verified) MKV bytes via `MKVRemuxer`; the virtual offset
-/// of each fragment depends on the sizes of all prior fragments, so generation is sequential
-/// from the current MKV cursor. Seeks land precisely within already-generated fragments;
-/// seeks beyond the downloaded frontier fall back to the sequential arrival (the same
-/// "seek waits, doesn't fail" contract as the loopback HTTP server).
+/// `[init segment][fragment 0][fragment 1]...`, one fragment per MKV cluster.
+///
+/// Two serving modes:
+/// - **Precomputed (complete file)**: when the whole MKV is verified, a structural scan sizes
+///   every fragment (headers only, no payload retention), a `sidx` is emitted in the init
+///   segment, and seeks jump directly to the target fragment. Exact `contentLength`, byte-range
+///   serving, and prioritization.
+/// - **Sequential (streaming)**: fragments are generated on demand from the verified MKV cursor;
+///   seeks land within already-generated fragments and beyond the frontier follow the
+///   "seek waits, doesn't fail" contract. No sidx (future fragments are unknown).
 public actor TransmuxStreamSource: TorrentStreamSource {
     private let realSource: any TorrentStreamSource
     private let fileIndex: Int
-    /// Extra headroom over the MKV size reported as the virtual content length, so the whole
-    /// virtual file (init + fragment box overhead) is always covered. Kept small so AVPlayer's
-    /// buffering/seek heuristics aren't inflated; the loader finishes at source EOF regardless.
+    /// Extra headroom over the MKV size reported as the virtual content length in streaming
+    /// mode. Kept small so AVPlayer's buffering/seek heuristics aren't inflated; the loader
+    /// finishes at source EOF regardless.
     private let margin: Int
 
     private var head: Head?
-    private var fragments: [Fragment] = []
-    /// Next MKV byte offset to scan for a cluster.
-    private var mkvCursor: Int = 0
     /// Real MKV length, fetched (blocking) during head parse.
     private var mkvLength: Int = 0
+
+    // Sequential (streaming) mode state.
+    private var fragments: [Fragment] = []
+    private var mkvCursor: Int = 0
+
+    // Precomputed (complete file) mode state.
+    private var layout: [FragmentPlan]?
+    /// Bounded cache of generated fragment bytes (evicts the oldest on insert).
+    private var cache: [Int: Data] = [:]
 
     private struct Head {
         let info: MatroskaInfo
         let remuxer: MKVRemuxer
-        let initSegment: Data
+        var initSegment: Data
     }
 
     private struct Fragment: Sendable {
@@ -35,6 +45,14 @@ public actor TransmuxStreamSource: TorrentStreamSource {
         let mkvStart: Int
         let mkvEnd: Int
         let bytes: Data
+    }
+
+    private struct FragmentPlan: Sendable {
+        let virtualOffset: Int
+        let size: Int
+        let mkvStart: Int
+        let mkvEnd: Int
+        let durationTicks: Int64
     }
 
     public init(realSource: any TorrentStreamSource, fileIndex: Int) {
@@ -47,22 +65,27 @@ public actor TransmuxStreamSource: TorrentStreamSource {
     // MARK: - TorrentStreamSource
 
     public func fileLength(fileIndex: Int) async -> Int {
-        // The virtual length needs the parsed head (it determines the real MKV length and the
-        // init segment). Ensure it so the loader reports a correct contentLength instead of the
-        // bare margin.
         _ = await ensureHead(blocking: true)
+        if let layout {
+            return (head?.initSegment.count ?? 0) + layout.reduce(0) { $0 + $1.size }
+        }
         return mkvLength > 0 ? mkvLength + margin : margin
     }
 
     public func availability(fileIndex: Int, offset: Int) async -> Int {
         guard let head = await ensureHead(blocking: false) else { return 0 }
-        var pos = offset
-        if pos < head.initSegment.count {
-            return head.initSegment.count - pos
+        if offset < head.initSegment.count {
+            return head.initSegment.count - offset
         }
+        if let layout {
+            // Complete file: every fragment is generatable, so the run extends to EOF.
+            guard plan(containing: offset) != nil else { return 0 }
+            return (head.initSegment.count + layout.reduce(0) { $0 + $1.size }) - offset
+        }
+        // Sequential mode: generate what's verifiable.
+        var pos = offset
         var run = 0
         while true {
-            // Generate the fragment covering `pos` if its MKV bytes are verified (best-effort).
             guard await ensureFragment(atVirtual: pos, blocking: false) else { break }
             guard let fragment = fragment(containing: pos) else { break }
             run += fragment.bytes.count - (pos - fragment.virtualOffset)
@@ -77,6 +100,12 @@ public actor TransmuxStreamSource: TorrentStreamSource {
             let end = min(offset + length, head.initSegment.count)
             return head.initSegment.subdata(in: offset..<end)
         }
+        if layout != nil {
+            guard let plan = plan(containing: offset), let bytes = await generateFragment(plan) else { return nil }
+            let local = offset - plan.virtualOffset
+            let end = min(local + length, bytes.count)
+            return bytes.subdata(in: local..<end)
+        }
         guard await ensureFragment(atVirtual: offset, blocking: false) else { return nil }
         guard let fragment = fragment(containing: offset) else { return nil }
         let local = offset - fragment.virtualOffset
@@ -86,8 +115,15 @@ public actor TransmuxStreamSource: TorrentStreamSource {
 
     public func prioritize(fileIndex: Int, range: Range<Int>) async {
         guard let head = await ensureHead(blocking: false) else { return }
+        let initSize = head.initSegment.count
         let mkvStart: Int
-        if range.lowerBound >= head.initSegment.count, let fragment = fragment(containing: range.lowerBound) {
+        if layout != nil {
+            if let plan = plan(containing: range.lowerBound) {
+                mkvStart = plan.mkvStart + (range.lowerBound - plan.virtualOffset)
+            } else {
+                mkvStart = mkvLength
+            }
+        } else if range.lowerBound >= initSize, let fragment = fragment(containing: range.lowerBound) {
             mkvStart = fragment.mkvStart + (range.lowerBound - fragment.virtualOffset)
         } else {
             // Not generated yet: prioritize at the sequential frontier (approximate).
@@ -98,7 +134,11 @@ public actor TransmuxStreamSource: TorrentStreamSource {
     }
 
     public func reachesEOF(fileIndex: Int, offset: Int) async -> Bool {
-        guard let head = await ensureHead(blocking: false) else { return false }
+        _ = await ensureHead(blocking: false)
+        if let layout {
+            let virtualEnd = (head?.initSegment.count ?? 0) + layout.reduce(0) { $0 + $1.size }
+            return offset >= virtualEnd
+        }
         return mkvCursor >= mkvLength && mkvLength > 0
     }
 
@@ -126,6 +166,7 @@ public actor TransmuxStreamSource: TorrentStreamSource {
                         head = Head(info: info, remuxer: remuxer, initSegment: initSegment)
                         mkvCursor = info.firstClusterOffset ?? 0
                         mkvLength = realLength
+                        await maybePrecomputeLayout()
                     }
                     return head!
                 } catch MatroskaError.truncated {
@@ -144,7 +185,99 @@ public actor TransmuxStreamSource: TorrentStreamSource {
         return nil
     }
 
-    // MARK: - Fragments
+    /// If the whole MKV is verified, scan its structure to build the exact fragment layout and a
+    /// `sidx` in the init segment (precise seeks + exact content length for complete files).
+    private func maybePrecomputeLayout() async {
+        guard let head, layout == nil else { return }
+        guard await realSource.availability(fileIndex: fileIndex, offset: 0) >= mkvLength else { return }
+        let scans = await buildLayout(head: head)
+        guard let scans, !scans.isEmpty else { return }
+
+        // Build the sidx (its size depends only on the reference list), then compute fragment
+        // virtual offsets against the final init segment (ftyp + moov + sidx).
+        let references = scans.map { MKVRemuxer.SidxReference(size: $0.size, durationTicks: $0.durationTicks) }
+        let finalInit = head.remuxer.initSegment(withSidx: references)
+        var plans: [FragmentPlan] = []
+        var virtualOffset = finalInit.count
+        for scan in scans {
+            plans.append(FragmentPlan(
+                virtualOffset: virtualOffset,
+                size: scan.size,
+                mkvStart: scan.mkvStart,
+                mkvEnd: scan.mkvEnd,
+                durationTicks: scan.durationTicks
+            ))
+            virtualOffset += scan.size
+        }
+        self.head?.initSegment = finalInit
+        self.layout = plans
+    }
+
+    private struct LayoutScan {
+        let size: Int
+        let durationTicks: Int64
+        let mkvStart: Int
+        let mkvEnd: Int
+    }
+
+    private func buildLayout(head: Head) async -> [LayoutScan]? {
+        var scans: [LayoutScan] = []
+        var offset = head.info.firstClusterOffset ?? 0
+        // MKV ticks → sidx timescale (1000): 1:1 for the standard 1 ms timestamp scale.
+        let sidxFactor = Double(1000) * Double(head.info.timestampScaleNs) / 1e9
+        while offset < mkvLength {
+            let length = min(4 * 1024 * 1024, mkvLength - offset)
+            guard let data = await realSource.read(fileIndex: fileIndex, offset: offset, length: length) else { return nil }
+            guard let range = try? MatroskaParser.readClusterRange(bytes: data, offset: 0) else { break }
+            guard range.elementEnd > 0, range.elementEnd <= data.count else { break }
+            guard let clusterLayout = try? MatroskaParser.scanClusterLayout(bytes: range.bytes) else { break }
+            let duration = MKVRemuxer.fragmentDuration(clusterLayout, info: head.info)
+            scans.append(LayoutScan(
+                size: MKVRemuxer.fragmentSize(clusterLayout),
+                durationTicks: Int64(Double(duration) * sidxFactor),
+                mkvStart: offset,
+                mkvEnd: offset + range.elementEnd
+            ))
+            offset += range.elementEnd
+        }
+        return scans
+    }
+
+    // MARK: - Fragment generation
+
+    /// Generates (and caches) a fragment's bytes for a precomputed layout plan.
+    private func generateFragment(_ plan: FragmentPlan) async -> Data? {
+        if let cached = cache[plan.virtualOffset] { return cached }
+        guard let head else { return nil }
+        guard let data = await realSource.read(fileIndex: fileIndex, offset: plan.mkvStart, length: plan.mkvEnd - plan.mkvStart) else { return nil }
+        guard let cluster = try? MatroskaParser.parseCluster(bytes: data, segmentDataStart: 0),
+              let bytes = try? head.remuxer.consume(cluster) else { return nil }
+        if cache.count >= 64, let oldest = cache.keys.min() {
+            cache.removeValue(forKey: oldest)
+        }
+        cache[plan.virtualOffset] = bytes
+        return bytes
+    }
+
+    private func plan(containing offset: Int) -> FragmentPlan? {
+        guard let layout else { return nil }
+        var lo = 0
+        var hi = layout.count - 1
+        while lo <= hi {
+            let mid = (lo + hi) / 2
+            let plan = layout[mid]
+            if offset < plan.virtualOffset {
+                hi = mid - 1
+            } else if offset >= plan.virtualOffset + plan.size {
+                lo = mid + 1
+            } else {
+                return plan
+            }
+        }
+        return nil
+    }
+
+    // MARK: - Sequential (streaming) mode
 
     /// Generates fragments sequentially from the MKV cursor until a fragment covering `target`
     /// exists, or the MKV bytes needed aren't verified yet. Non-blocking: returns false when the
@@ -180,14 +313,14 @@ public actor TransmuxStreamSource: TorrentStreamSource {
                 return false
             }
             guard let range = try? MatroskaParser.readClusterRange(bytes: data, offset: 0) else {
-                // Verified bytes but no cluster at the cursor: the cluster run is exhausted
-                // (tail elements like Cues). Consume to EOF so `reachesEOF` reports the end.
                 mkvCursor = mkvLength
                 return true
             }
             // The cluster might extend beyond the window; grow if more bytes are verified.
             if range.elementEnd > data.count {
-                if readSize >= windowCap || readSize >= available { return false }
+                if readSize >= windowCap || readSize >= available {
+                    return false
+                }
                 readSize = min(readSize * 2, windowCap, available)
                 continue
             }

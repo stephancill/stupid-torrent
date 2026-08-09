@@ -4,6 +4,18 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-09 — Feat: sidx-based precise seeking for complete MKVs
+
+Complete (fully-verified) MKVs now get exact seeking: when the whole file is verified, a structural scan of the cluster headers sizes every fragment (no payload retention), the init segment carries a `sidx`, and the transmuxer serves direct jumps from the precomputed layout (exact content length, byte-range serving, prioritization). Partial files keep the sequential streaming path (no sidx — future fragments are unknown).
+
+- `MatroskaParser.scanClusterLayout` (public) — parses a cluster's block headers + frame sizes into per-track sample counts and mdat size, without materializing sample data.
+- `MKVRemuxer.fragmentSize`/`fragmentDuration`/`sidxReferences(mkvBytes:)`/`initSegment(withSidx:)` (public) — deterministic fragment sizing (every trun now carries composition offsets, so moof size is a pure function of sample count) and sidx emission.
+- `TransmuxStreamSource` — complete-file mode builds the layout once at head parse (only when the whole MKV is verified), computes fragment virtual offsets against the final init (ftyp+moov+sidx), and serves direct jumps via a bounded fragment cache; `fileLength`/`reachesEOF`/`prioritize` use the layout. Streaming mode unchanged.
+
+Fixed a latent streaming bug surfaced while testing: `readClusterRange` clamped a cluster's `elementEnd` to the read window, so a cluster larger than the window looked "complete", `parseCluster` failed on truncated bytes, and the cursor skipped past the real cluster boundary (generation stalled ~1 fragment before the frontier). It now reports the true `elementEnd` so callers grow their window / wait for verification.
+
+Verified hermetically (virtual file == reference remux, with and without sidx; sequential streaming as bytes verify; exact content length) and on a **VBR** 30 s MKV (2 s high-bitrate + 28 s black, where content-length interpolation would land wrong): `stream-play --seek-to 25` lands at 25.8 s and plays to 30 s (`SEEK OK`). 63 tests green.
+
 ### 2026-08-09 — Fix: correct MKV playback duration/timeline through the loader
 
 In-app MKV playback stalled at ~8.3 s (AVAsset reported `duration=8.333s` for a 30 s file, capping playback and seeks). Three interacting bugs, found by bisecting the loader-path duration against ffmpeg's own `-movflags frag_keyframe+empty_moov` output:

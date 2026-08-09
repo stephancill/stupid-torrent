@@ -66,6 +66,76 @@ public final class MKVRemuxer: @unchecked Sendable {
         MP4Muxer.initSegment(tracks: tracks)
     }
 
+    /// One sidx reference: a fragment's exact byte size and its duration in the sidx timescale.
+    public struct SidxReference: Sendable {
+        public let size: Int
+        public let durationTicks: Int64
+        public init(size: Int, durationTicks: Int64) {
+            self.size = size
+            self.durationTicks = durationTicks
+        }
+    }
+
+    /// Walks an in-memory MKV's clusters and computes each fragment's exact fMP4 byte size and
+    /// presentation span (for the sidx / deterministic layout).
+    public func sidxReferences(mkvBytes: Data) -> [SidxReference]? {
+        var references: [SidxReference] = []
+        var offset = info.firstClusterOffset ?? 0
+        // MKV ticks → sidx timescale (1000): 1:1 for the standard 1 ms timestamp scale.
+        let factor = Double(1000) * Double(info.timestampScaleNs) / 1e9
+        while offset < mkvBytes.count {
+            guard let range = try? MatroskaParser.readClusterRange(bytes: mkvBytes, offset: offset) else { break }
+            guard let clusterLayout = try? MatroskaParser.scanClusterLayout(bytes: range.bytes) else { break }
+            let duration = Self.fragmentDuration(clusterLayout, info: info)
+            references.append(SidxReference(
+                size: Self.fragmentSize(clusterLayout),
+                durationTicks: Int64(Double(duration) * factor)
+            ))
+            offset = range.elementEnd
+        }
+        return references
+    }
+
+    /// Init segment with a `sidx` listing `references` (precise seeks for complete files).
+    public func initSegment(withSidx references: [SidxReference]) -> Data {
+        var data = MP4Muxer.initSegment(tracks: tracks)
+        data.append(MP4Muxer.sidx(
+            timescale: 1000,
+            references: references.map { (size: $0.size, durationTicks: $0.durationTicks) }
+        ))
+        return data
+    }
+
+    /// Exact byte size of the fMP4 fragment a cluster muxes to: moof + mdat. Deterministic since
+    /// every trun carries per-sample duration/size/flags/composition-offset (16 B/sample).
+    public static func fragmentSize(_ layout: MatroskaParser.MKVClusterLayout) -> Int {
+        let moof = 8 + 16 + layout.tracks.values.reduce(0) { $0 + (64 + 16 * $1.sampleCount) }
+        let mdat = 8 + layout.tracks.values.reduce(0) { $0 + $1.mdatSize }
+        return moof + mdat
+    }
+
+    /// Presentation span of a cluster's samples in MKV ticks (max end − min start), used for the
+    /// sidx subsegment duration.
+    public static func fragmentDuration(_ layout: MatroskaParser.MKVClusterLayout, info: MatroskaInfo) -> Int64 {
+        let scale = Int64(max(1, info.timestampScaleNs))
+        var minStart = Int64.max
+        var maxEnd = Int64.min
+        for (trackNumber, track) in layout.tracks {
+            let mkvTrack = info.track(trackNumber)
+            let defaultDur: Int64
+            if let ns = mkvTrack?.defaultDurationNs {
+                defaultDur = (Int64(ns) + scale / 2) / scale
+            } else {
+                defaultDur = 0
+            }
+            let lastDur = defaultDur > 0 ? defaultDur : track.lastDelta
+            minStart = min(minStart, track.firstPTS)
+            maxEnd = max(maxEnd, track.lastPTS + lastDur)
+        }
+        guard minStart != Int64.max, maxEnd != Int64.min else { return 0 }
+        return max(0, maxEnd - minStart)
+    }
+
     /// Consumes one cluster, returning the fragment (moof + mdat) it muxes, or nil if the cluster
     /// carried no samples for any kept track. Emits a sequence number per emitted fragment.
     public func consume(_ cluster: MKVCluster) throws -> Data? {

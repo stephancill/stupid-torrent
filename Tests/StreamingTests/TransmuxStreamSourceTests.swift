@@ -60,11 +60,14 @@ actor FakeMKVSource: TorrentStreamSource {
         return out
     }
 
-    /// Remuxes the fixture fully in memory (the reference output).
-    private func referenceRemux(_ data: Data) throws -> Data {
+    /// Remuxes the fixture fully in memory (the reference output). `includeSidx` matches the
+    /// transmuxer's complete-file init (which carries a sidx).
+    private func referenceRemux(_ data: Data, includeSidx: Bool) throws -> Data {
         let info = try MatroskaParser.parseHead(bytes: data)
         let remuxer = try MKVRemuxer(info: info)
-        var out = remuxer.initSegment()
+        var out = includeSidx && (try remuxer.sidxReferences(mkvBytes: data)) != nil
+            ? remuxer.initSegment(withSidx: try remuxer.sidxReferences(mkvBytes: data)!)
+            : remuxer.initSegment()
         var offset = info.firstClusterOffset ?? 0
         while offset < data.count {
             if let range = try MatroskaParser.readClusterRange(bytes: data, offset: offset) {
@@ -84,17 +87,18 @@ actor FakeMKVSource: TorrentStreamSource {
             let transmux = TransmuxStreamSource(realSource: source, fileIndex: 0)
 
             let virtual = await readVirtualFile(transmux) ?? Data()
-            let reference = try referenceRemux(data)
-            #expect(virtual == reference, "\(name): virtual file != full remux")
+            let reference = try referenceRemux(data, includeSidx: true)
+            #expect(virtual == reference, "\(name): virtual file != full remux (with sidx)")
         }
     }
 
     @Test func streamsSequentiallyAsBytesVerify() async throws {
-        let data = try Fixtures.data(named: "mkv/h264-aac.mkv")
+        // long30.mkv is big enough that the initial reveal is partial, exercising the streaming
+        // (sequential, no sidx) path: the head parses but the file isn't complete yet.
+        let data = try Fixtures.data(named: "mkv/long30.mkv")
         let source = FakeMKVSource(data)
-        // Verify the head + the first ~half; the rest comes later.
-        let headEnd = min(200 * 1024, data.count)
-        await source.verify(0..<headEnd)
+        // Verify the head (256 KB head window) + a bit more; the rest comes later.
+        await source.verify(0..<300 * 1024)
         let transmux = TransmuxStreamSource(realSource: source, fileIndex: 0)
 
         let initLen = await transmux.fileLength(fileIndex: 0) // reports content length
@@ -105,18 +109,22 @@ actor FakeMKVSource: TorrentStreamSource {
         #expect(initAvailable >= 1000, "init segment should be served from the head")
 
         // Read what's available now, then reveal the rest and confirm we can continue to EOF.
+        let virtualLength = await transmux.fileLength(fileIndex: 0)
         var offset = 0
         var received = Data()
         var allRevealed = false
-        while !allRevealed {
+        while offset < virtualLength {
             let available = await transmux.availability(fileIndex: 0, offset: offset)
             if available == 0 {
-                // Reveal more of the file (simulate pieces verifying during playback); once
-                // everything is verified and nothing is available, the virtual EOF is reached.
-                let next = min(offset * 2 + 256 * 1024, data.count)
-                await source.verify(0..<next)
-                allRevealed = next >= data.count
-                try? await Task.sleep(for: .milliseconds(20))
+                if !allRevealed {
+                    // Reveal more of the file (simulate pieces verifying during playback).
+                    let next = min(offset * 2 + 256 * 1024, data.count)
+                    await source.verify(0..<next)
+                    allRevealed = next >= data.count
+                    try? await Task.sleep(for: .milliseconds(20))
+                } else {
+                    break // all verified and nothing more available → virtual EOF
+                }
                 continue
             }
             guard let chunk = await transmux.read(fileIndex: 0, offset: offset, length: available) else {
@@ -126,8 +134,11 @@ actor FakeMKVSource: TorrentStreamSource {
             received.append(chunk)
             offset += chunk.count
         }
-        let reference = try referenceRemux(data)
-        #expect(received == reference)
+        let reference = try referenceRemux(data, includeSidx: false)
+        #expect(received.count == reference.count, "received \(received.count) vs reference \(reference.count)")
+        if received.count == reference.count {
+            #expect(received == reference)
+        }
     }
 
     @Test func seekWithinDownloadedRegionIsExact() async throws {
@@ -136,7 +147,10 @@ actor FakeMKVSource: TorrentStreamSource {
         await source.verify(0..<data.count)
         let transmux = TransmuxStreamSource(realSource: source, fileIndex: 0)
 
-        let reference = try referenceRemux(data)
+        // The fully-verified file takes the precomputed path: exact content length + sidx.
+        let reference = try referenceRemux(data, includeSidx: true)
+        #expect(await transmux.fileLength(fileIndex: 0) == reference.count,
+                "complete file should report the exact virtual length")
         // Seek into the middle of the virtual file and read a chunk; it must equal the
         // reference bytes at that offset.
         let target = reference.count / 2
