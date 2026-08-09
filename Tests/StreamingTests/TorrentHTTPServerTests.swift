@@ -7,14 +7,16 @@ import Streaming
 /// letting tests exercise the HTTP server's progressive-serve behavior deterministically.
 actor FakeHTTPStreamSource: TorrentStreamSource {
     let data: Data
+    let declaredLength: Int
     private var verified = Set<Int>()
     private(set) var prioritizeRanges: [Range<Int>] = []
 
-    init(bytes: [UInt8]) {
+    init(bytes: [UInt8], declaredLength: Int? = nil) {
         self.data = Data(bytes)
+        self.declaredLength = declaredLength ?? bytes.count
     }
 
-    func fileLength(fileIndex: Int) async -> Int { data.count }
+    func fileLength(fileIndex: Int) async -> Int { declaredLength }
 
     func availability(fileIndex: Int, offset: Int) async -> Int {
         guard offset >= 0, offset < data.count else { return 0 }
@@ -42,7 +44,19 @@ actor FakeHTTPStreamSource: TorrentStreamSource {
 
 /// Minimal HTTP client over BSD sockets for the tests.
 struct TestHTTPClient {
-    static func request(port: UInt16, raw: String) throws -> (status: Int, headers: [String: String], body: Data) {
+    static func request(port: UInt16, raw: String) async throws -> (status: Int, headers: [String: String], body: Data) {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    continuation.resume(returning: try blockingRequest(port: port, raw: raw))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private static func blockingRequest(port: UInt16, raw: String) throws -> (status: Int, headers: [String: String], body: Data) {
         let socket = try TCPSocket()
         defer { socket.close() }
         try socket.connect(host: "127.0.0.1", port: port, timeout: 5)
@@ -51,12 +65,16 @@ struct TestHTTPClient {
         // Read the head.
         var buffer = Data()
         var temp = [UInt8](repeating: 0, count: 4096)
-        while !buffer.contains(0x0D, then: 0x0A) {
+        let delimiter = Data("\r\n\r\n".utf8)
+        while buffer.range(of: delimiter) == nil {
             let n = try socket.receive(into: &temp, maxLength: temp.count)
             guard n > 0 else { throw NSError(domain: "http-test", code: -1) }
             buffer.append(contentsOf: temp.prefix(n))
         }
-        let head = String(decoding: buffer, as: UTF8.self)
+        guard let headEnd = buffer.range(of: delimiter)?.upperBound else {
+            throw NSError(domain: "http-test", code: -2)
+        }
+        let head = String(decoding: buffer[..<headEnd], as: UTF8.self)
         let lines = head.split(separator: "\r\n")
         guard let statusLine = lines.first, statusLine.split(separator: " ").count >= 2,
               let status = Int(statusLine.split(separator: " ")[1]) else {
@@ -69,15 +87,17 @@ struct TestHTTPClient {
         }
 
         // Read the body according to Content-Length (HEAD has no body).
-        var body = Data()
+        var body = Data(buffer[headEnd...])
         if !raw.hasPrefix("HEAD"), let len = headers["content-length"].flatMap(Int.init), len > 0 {
-            var remaining = len
+            var remaining = len - body.count
             while remaining > 0 {
                 let n = try socket.receive(into: &temp, maxLength: min(temp.count, remaining))
                 guard n > 0 else { throw NSError(domain: "http-test", code: -3) }
                 body.append(contentsOf: temp.prefix(n))
                 remaining -= n
             }
+        } else {
+            body.removeAll()
         }
         return (status, headers, body)
     }
@@ -87,15 +107,15 @@ struct TestHTTPClient {
     private let bytes: [UInt8] = Array(0..<200_000).map { UInt8($0 % 251) }
 
     @Test func headReturnsFullLength() async throws {
-        let source = FakeHTTPStreamSource(bytes: bytes)
-        await source.verify(0..<bytes.count)
+        let fileLength = 4_781_822_782
+        let source = FakeHTTPStreamSource(bytes: [], declaredLength: fileLength)
         let server = try TorrentHTTPServer(source: source, fileIndex: 0, path: "movie.mkv")
         server.start()
         defer { server.stop() }
 
-        let response = try TestHTTPClient.request(port: server.port, raw: "HEAD /movie.mkv HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        let response = try await TestHTTPClient.request(port: server.port, raw: "HEAD /movie.mkv HTTP/1.1\r\nHost: localhost\r\n\r\n")
         #expect(response.status == 200)
-        #expect(response.headers["content-length"] == "\(bytes.count)")
+        #expect(response.headers["content-length"] == "\(fileLength)")
         #expect(response.headers["accept-ranges"] == "bytes")
         #expect(response.body.isEmpty)
     }
@@ -107,7 +127,7 @@ struct TestHTTPClient {
         server.start()
         defer { server.stop() }
 
-        let response = try TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        let response = try await TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\n\r\n")
         #expect(response.status == 200)
         #expect(response.body == Data(bytes))
     }
@@ -119,7 +139,7 @@ struct TestHTTPClient {
         server.start()
         defer { server.stop() }
 
-        let response = try TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=1000-1999\r\n\r\n")
+        let response = try await TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=1000-1999\r\n\r\n")
         #expect(response.status == 206)
         #expect(response.body == Data(bytes[1000..<2000]))
         #expect(response.headers["content-range"] == "bytes 1000-1999/\(bytes.count)")
@@ -133,7 +153,7 @@ struct TestHTTPClient {
         defer { server.stop() }
 
         let start = bytes.count - 500
-        let response = try TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=\(start)-\r\n\r\n")
+        let response = try await TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=\(start)-\r\n\r\n")
         #expect(response.status == 206)
         #expect(response.body == Data(bytes[start...]))
     }
@@ -145,7 +165,7 @@ struct TestHTTPClient {
         server.start()
         defer { server.stop() }
 
-        let response = try TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=-1000\r\n\r\n")
+        let response = try await TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=-1000\r\n\r\n")
         #expect(response.status == 206)
         #expect(response.body == Data(bytes[(bytes.count - 1000)...]))
     }
@@ -157,7 +177,7 @@ struct TestHTTPClient {
         server.start()
         defer { server.stop() }
 
-        let response = try TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=999999999-\r\n\r\n")
+        let response = try await TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=999999999-\r\n\r\n")
         #expect(response.status == 416)
     }
 
@@ -170,7 +190,7 @@ struct TestHTTPClient {
         server.start()
         defer { server.stop() }
 
-        let response = try TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-4095\r\n\r\n")
+        let response = try await TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-4095\r\n\r\n")
         #expect(response.status == 206)
         #expect(response.body == Data(bytes[0..<4096]))
     }
@@ -182,7 +202,7 @@ struct TestHTTPClient {
         server.start()
         defer { server.stop() }
 
-        _ = try TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=100000-110000\r\n\r\n")
+        _ = try await TestHTTPClient.request(port: server.port, raw: "GET /movie.mkv HTTP/1.1\r\nHost: localhost\r\nRange: bytes=100000-110000\r\n\r\n")
         let ranges = await source.prioritizeSnapshot()
         #expect(ranges.contains { $0.lowerBound == 100000 })
     }

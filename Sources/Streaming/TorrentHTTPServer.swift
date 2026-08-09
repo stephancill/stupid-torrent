@@ -88,7 +88,7 @@ public final class TorrentHTTPServer: @unchecked Sendable {
         while !Task.isCancelled {
             let fd: Int32
             do {
-                fd = try listener.accept()
+                fd = try await acceptConnection()
             } catch {
                 try? await Task.sleep(for: .milliseconds(50))
                 continue
@@ -116,7 +116,7 @@ public final class TorrentHTTPServer: @unchecked Sendable {
                 head.append(contentsOf: "\(key): \(value)\r\n".utf8)
             }
             head.append(contentsOf: "\r\n".utf8)
-            guard (try? socket.send(head)) != nil else { return }
+            guard (try? await send(head, over: socket)) != nil else { return }
 
             guard !request.isHEAD, plan.status != "416 Requested Range Not Satisfiable" else {
                 if plan.status == "416 Requested Range Not Satisfiable" { return }
@@ -146,7 +146,7 @@ public final class TorrentHTTPServer: @unchecked Sendable {
                     try? await Task.sleep(for: .milliseconds(200))
                     continue
                 }
-                guard (try? socket.send(data)) != nil else { return }
+                guard (try? await send(data, over: socket)) != nil else { return }
                 offset += data.count
                 continue
             }
@@ -186,7 +186,7 @@ public final class TorrentHTTPServer: @unchecked Sendable {
         // clusters after a seek). Serve the initial whole-file request as a bounded 206 (the
         // lookahead window) so the input stays open and VLC issues range requests for the rest,
         // which we serve progressively. This mirrors the loader/stream's bounded lookahead.
-        if !ranged {
+        if !ranged && !request.isHEAD {
             let lookahead = min(fileLength, 2 * 1024 * 1024)
             if lookahead < fileLength {
                 start = 0
@@ -213,15 +213,55 @@ public final class TorrentHTTPServer: @unchecked Sendable {
     /// Reads the HTTP request head (request line + headers) from the socket.
     private func readRequest(_ socket: TCPSocket) async throws -> HTTPRequest {
         var buffer = Data()
-        var temp = [UInt8](repeating: 0, count: 4096)
-        while !buffer.contains(0x0D, then: 0x0A) {
-            let n = try socket.receive(into: &temp, maxLength: temp.count)
-            guard n > 0 else { throw HTTPError.closed }
-            buffer.append(contentsOf: temp.prefix(n))
+        let delimiter = Data("\r\n\r\n".utf8)
+        while buffer.range(of: delimiter) == nil {
+            let data = try await receive(upTo: 4096, from: socket)
+            guard !data.isEmpty else { throw HTTPError.closed }
+            buffer.append(data)
             if buffer.count > 64 * 1024 { throw HTTPError.tooLarge }
         }
-        let head = String(decoding: buffer, as: UTF8.self)
+        guard let end = buffer.range(of: delimiter)?.upperBound else { throw HTTPError.closed }
+        let head = String(decoding: buffer[..<end], as: UTF8.self)
         return try HTTPRequest.parse(head)
+    }
+
+    private func acceptConnection() async throws -> Int32 {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async { [listener] in
+                do {
+                    continuation.resume(returning: try listener.accept())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func receive(upTo maxLength: Int, from socket: TCPSocket) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var buffer = [UInt8](repeating: 0, count: maxLength)
+                do {
+                    let count = try socket.receive(into: &buffer, maxLength: maxLength)
+                    continuation.resume(returning: Data(buffer.prefix(count)))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func send(_ data: Data, over socket: TCPSocket) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try socket.send(data)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 }
 
@@ -275,15 +315,5 @@ private struct HTTPRequest {
         }
         guard let end = Int(parts[1]), end >= start else { return nil }
         return start..<(min(end, fileLength - 1) + 1)
-    }
-}
-
-extension Data {
-    public func contains(_ first: UInt8, then second: UInt8) -> Bool {
-        guard count >= 2 else { return false }
-        for i in 0..<(count - 1) {
-            if self[startIndex + i] == first, self[startIndex + i + 1] == second { return true }
-        }
-        return false
     }
 }
