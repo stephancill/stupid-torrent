@@ -12,6 +12,10 @@ public protocol TorrentStreamSource: Sendable {
     func read(fileIndex: Int, offset: Int, length: Int) async -> Data?
     /// Prioritize a byte range so it downloads ahead of the sequential cursor.
     func prioritize(fileIndex: Int, range: Range<Int>) async
+    /// Whether the source is exhausted at `offset` — no more bytes will ever be produced. The
+    /// loader uses this to finish all-to-end requests for sources whose length isn't known up
+    /// front (e.g. the transmuxer's virtual file).
+    func reachesEOF(fileIndex: Int, offset: Int) async -> Bool
 }
 
 /// Adapter that forwards to the `Torrent` actor's streaming APIs.
@@ -36,5 +40,9 @@ public struct TorrentStreamSourceAdapter: TorrentStreamSource {
 
     public func prioritize(fileIndex: Int, range: Range<Int>) async {
         await torrent.streamPriority(fileIndex: fileIndex, range: range)
+    }
+
+    public func reachesEOF(fileIndex: Int, offset: Int) async -> Bool {
+        offset >= torrent.fileSize(fileIndex)
     }
 }

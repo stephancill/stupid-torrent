@@ -4,6 +4,18 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-09 — Feat: stream MKV through AVPlayer via the transmuxer (loader integration)
+
+The transmuxer now drives real `.mkv` playback: `TorrentStreamSession` routes Matroska files to a new `TransmuxStreamSource` (a `TorrentStreamSource` presenting the virtual fragmented MP4) and serves it through the existing `AVAssetResourceLoaderDelegate`, so MKV playback uses the same AVPlayer/PiP path as MP4.
+
+- `StreamDataSource.swift` — `TorrentStreamSource` gained `reachesEOF(fileIndex:offset:)`; the loader finishes all-to-end requests when the source is exhausted (the transmuxer's virtual length is an estimate, so EOF can't come from the byte count).
+- `TransmuxStreamSource.swift` (new, actor) — parses the MKV head from a growing verified prefix (clamped to the real file length), builds the init segment + `MKVRemuxer`, then generates one fMP4 fragment per MKV cluster on demand from verified bytes. Fragment reads are sized to the verified run (a window must never extend past the download frontier — this was the "5s startup / never generates the next fragment" bug). `reachesEOF` = the whole MKV has been consumed. Content length = MKV size + 128 KB headroom (a 2 MB margin had inflated AVPlayer's buffer heuristics and produced a wrong duration).
+- `TorrentStreamSession.swift` — `TorrentResourceLoaderDelegate` now takes a `TorrentStreamSource` (the MP4 path uses `TorrentStreamSourceAdapter`); the all-to-end loop breaks on `source.reachesEOF`.
+- `Torrent.swift` — MSE/PE (BEP 10) handshake now retries plaintext on TCP when the encrypted attempt fails. Plaintext-only peers (aria2) close the connection after the crypto preamble rather than sending a plaintext handshake, so the in-session fallback never fired — outbound TCP never reached such peers. This is why the hermetic aria2 seeding broke after MSE landed.
+- `torrent-cli` — `stream-test`/`stream-play` select MKV/MKA files (`playbackKind != .none`).
+
+Hermetic proof (throttled aria2 seeder, 656 KB / 30 s MKV, `--seed-until 300000` → 5/11 pieces): `stream-test` reports `ASSET: duration=30.0s playable=true`; `stream-play` starts ~1 s and advances 1 s/s through the transmuxed stream. Playback stalls at the downloaded frontier only when the parallel download stalls — reproduced identically on the MP4 path (pre-existing dual-torrent + throttled-seeder harness flakiness, unrelated to the transmuxer). 79 tests green, including new `TransmuxStreamSourceTests` (virtual file == full remux, progressive streaming as bytes verify, exact seek within the generated region).
+
 ### 2026-08-09 — Feat: MKV → fMP4 transmuxer core (Gates 0-2: EBML, init segment, fragments)
 
 First working slice of the Matroska → fragmented-MP4 transmuxer (the AVPlayer-native MKV path in `docs/mkv-avplayer-transmuxer.md`, replacing VLCKit). Pure Foundation in `Streaming`; no VLC. Hermetic gate: all five ffmpeg MKV fixtures (H.264+AAC, H.264+B-frames, HEVC Main 10, E-AC-3 5.1, AC-3) remux to fragmented MP4s that **AVFoundation loads and decodes on the macOS host** (`AVAsset.isPlayable`, correct ~3s duration, `AVAssetReader` pulls video + audio samples for every fixture).

@@ -313,7 +313,7 @@ struct TorrentCLI {
             let metainfo = try Metainfo(data: data)
             let dirURL = URL(fileURLWithPath: dir)
             let index = fileIndex ?? metainfo.files.indices.first {
-                Torrent.contentType(forFileNamed: metainfo.files[$0].name) != nil
+                Torrent.playbackKind(forFileNamed: metainfo.files[$0].name) != .none
             } ?? 0
             let mediaName = metainfo.files[index].name
             print("Streaming file \(index): \(mediaName) (\(metainfo.files[index].length) bytes)")
@@ -410,7 +410,7 @@ struct TorrentCLI {
             let metainfo = try Metainfo(data: data)
             let dirURL = URL(fileURLWithPath: dir)
             let index = fileIndex ?? metainfo.files.indices.first {
-                Torrent.contentType(forFileNamed: metainfo.files[$0].name) != nil
+                Torrent.playbackKind(forFileNamed: metainfo.files[$0].name) != .none
             } ?? 0
 
             let partial = Torrent(directory: dirURL, metainfo: metainfo, stopAfterBytes: seedUntil)

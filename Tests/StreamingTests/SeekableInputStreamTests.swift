@@ -32,6 +32,10 @@ actor FakeStreamSource: TorrentStreamSource {
     func prioritize(fileIndex: Int, range: Range<Int>) async {
         prioritizeRanges.append(range)
     }
+    func reachesEOF(fileIndex: Int, offset: Int) async -> Bool {
+        offset >= data.count
+    }
+
 
     func verify(_ range: Range<Int>) {
         for byte in range { verified.insert(byte) }

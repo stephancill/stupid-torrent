@@ -800,6 +800,19 @@ public actor Torrent {
     }
 
     private func connectTCP(to address: PeerAddress) async -> Bool {
+        if await connectTCP(to: address, supportsMSE: true) { return true }
+        // MSE/PE (BEP 10) peers that don't support encryption just close the connection after our
+        // crypto preamble (they never send a plaintext handshake to trigger the in-session
+        // fallback). Retry plaintext once — this is how encryption-capable clients reach
+        // plaintext-only peers like aria2.
+        if await connectTCP(to: address, supportsMSE: false) {
+            TorrentLog.log("MSE fallback: plaintext handshake ok with \(address.host)")
+            return true
+        }
+        return false
+    }
+
+    private func connectTCP(to address: PeerAddress, supportsMSE: Bool) async -> Bool {
         do {
             let stream = try PeerStream(host: address.host, port: address.port)
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -819,6 +832,7 @@ public actor Torrent {
                 peerID: peerID,
                 stream: stream,
                 isInitiator: true,
+                supportsMSE: supportsMSE,
                 pieceCount: metainfo.pieceCount
             )
             pendingPeerAddresses.remove(address)

@@ -2,32 +2,42 @@ import Foundation
 import AVFoundation
 import TorrentCore
 
-/// Serves a torrent file's verified bytes to AVPlayer through a custom-scheme `AVURLAsset`,
+/// Serves a torrent file's bytes to AVPlayer through a custom-scheme `AVURLAsset`,
 /// prioritizing the byte ranges the player requests so playback can start before the file
-/// finishes downloading.
+/// finishes downloading. For Matroska files the bytes are the transmuxed fragmented MP4
+/// (see `TransmuxStreamSource`); everything else is served raw.
 public final class TorrentStreamSession: @unchecked Sendable {
     public let delegate: TorrentResourceLoaderDelegate
     public let asset: AVURLAsset
 
     public init(torrent: Torrent, fileIndex: Int) {
         let name = torrent.fileName(fileIndex)
-        let contentType = Torrent.contentType(forFileNamed: name) ?? "public.data"
-        delegate = TorrentResourceLoaderDelegate(torrent: torrent, fileIndex: fileIndex, contentType: contentType)
+        let contentType = Torrent.contentType(forFileNamed: name)
+        let ext = (name as NSString).pathExtension.lowercased()
+        let source: any TorrentStreamSource
+        if ext == "mkv" || ext == "mka" {
+            source = TransmuxStreamSource(realSource: TorrentStreamSourceAdapter(torrent: torrent), fileIndex: fileIndex)
+        } else {
+            source = TorrentStreamSourceAdapter(torrent: torrent)
+        }
+        delegate = TorrentResourceLoaderDelegate(
+            source: source,
+            fileIndex: fileIndex,
+            contentType: contentType ?? "public.mpeg-4"
+        )
         asset = delegate.makeAsset()
     }
 }
 
 public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
-    private let torrent: Torrent
+    private let source: any TorrentStreamSource
     private let fileIndex: Int
-    private let fileLength: Int
     private let contentType: String
     private let queue = DispatchQueue(label: "stupid-torrent.stream")
 
-    public init(torrent: Torrent, fileIndex: Int, contentType: String) {
-        self.torrent = torrent
+    public init(source: any TorrentStreamSource, fileIndex: Int, contentType: String) {
+        self.source = source
         self.fileIndex = fileIndex
-        self.fileLength = torrent.fileSize(fileIndex)
         self.contentType = contentType
     }
 
@@ -55,6 +65,7 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
     }
 
     private func serve(_ request: AVAssetResourceLoadingRequest) async {
+        let fileLength = await source.fileLength(fileIndex: fileIndex)
         if let info = request.contentInformationRequest {
             info.contentType = contentType
             info.contentLength = Int64(fileLength)
@@ -86,16 +97,16 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
             // requests get a bounded lookahead window; bounded requests get their exact range.
             if allToEnd {
                 let window = 2 * 1024 * 1024
-                await torrent.streamPriority(fileIndex: fileIndex, range: offset..<min(offset + window, fileLength))
+                await source.prioritize(fileIndex: fileIndex, range: offset..<min(offset + window, fileLength))
             } else if requestedLength > 0 {
-                await torrent.streamPriority(fileIndex: fileIndex, range: offset..<min(offset + requestedLength, fileLength))
+                await source.prioritize(fileIndex: fileIndex, range: offset..<min(offset + requestedLength, fileLength))
             }
 
-            let available = await torrent.streamingAvailability(fileIndex: fileIndex, offset: offset)
+            let available = await source.availability(fileIndex: fileIndex, offset: offset)
             if available > 0 {
                 let length = min(available, maxChunk, limit - served)
                 guard length > 0 else { break }
-                if let data = await torrent.streamingRead(fileIndex: fileIndex, offset: offset, length: length) {
+                if let data = await source.read(fileIndex: fileIndex, offset: offset, length: length) {
                     dataRequest.respond(with: data)
                     TorrentLog.log("stream served \(data.count) bytes at \(offset)")
                     offset += data.count
@@ -112,6 +123,11 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
                 return
             }
             if allToEnd {
+                // Finish once the source is exhausted (for the transmuxer's virtual file the
+                // content length is an estimate, so EOF must come from the source itself).
+                if await source.reachesEOF(fileIndex: fileIndex, offset: offset) {
+                    break
+                }
                 try? await Task.sleep(for: .milliseconds(200))
                 continue
             }
