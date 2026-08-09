@@ -33,22 +33,25 @@ public final class MKVStreamSession: ObservableObject {
     }
 
     private let player = VLCMediaPlayer()
+    private let server: TorrentHTTPServer?
     private let media: VLCMedia
-    private let stream: TorrentSeekableInputStream
     private var notificationTokens: [NSObjectProtocol] = []
+    private var pollTask: Task<Void, Never>?
 
     public init(torrent: Torrent, fileIndex: Int) {
         let source = TorrentStreamSourceAdapter(torrent: torrent)
-        stream = TorrentSeekableInputStream(source: source, fileIndex: fileIndex)
-        media = VLCMedia(stream: stream)
-        // Prioritize the MKV Cues index at the tail so seeks/timeline work early on a partial file
-        // (analogous to the moov-tail handling in TorrentStreamSession). The picker's jump
-        // classification promotes it above the sequential cursor.
-        let size = torrent.fileSize(fileIndex)
-        let tailStart = max(0, size - 2 * 1024 * 1024)
-        Task {
-            await source.prioritize(fileIndex: fileIndex, range: tailStart..<size)
+        let name = torrent.fileName(fileIndex)
+        let started: TorrentHTTPServer?
+        do {
+            let s = try TorrentHTTPServer(source: source, fileIndex: fileIndex, path: name)
+            s.start()
+            started = s
+        } catch {
+            started = nil
         }
+        server = started
+        // Loopback bind should never fail; if it does the player errors immediately rather than hang.
+        media = started.map { VLCMedia(url: $0.url) } ?? VLCMedia(url: URL(string: "http://127.0.0.1:1/none")!)
         player.media = media
         observe()
     }
@@ -56,6 +59,19 @@ public final class MKVStreamSession: ObservableObject {
     public func attach(drawable: UIView) {
         player.drawable = drawable
         player.play()
+        // Poll for state/time instead of relying on VLCMediaPlayer notifications (which don't
+        // reliably fire in this VLCKit build). The player is @MainActor; poll on a 250ms loop.
+        guard pollTask == nil else { return }
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard let self, !Task.isCancelled else { return }
+                await MainActor.run {
+                    self.refreshTime()
+                    self.refreshState()
+                }
+            }
+        }
     }
 
     public func play() { player.play() }
@@ -79,8 +95,10 @@ public final class MKVStreamSession: ObservableObject {
     public func teardown() {
         notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
         notificationTokens = []
+        pollTask?.cancel()
+        pollTask = nil
         player.stop()
-        stream.close()
+        server?.stop()
     }
 
     private func observe() {

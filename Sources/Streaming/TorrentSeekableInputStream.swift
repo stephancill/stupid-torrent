@@ -127,9 +127,12 @@ private final class TorrentStreamBuffer: @unchecked Sendable {
             guard let state = currentLoopState() else { break }
             if state.closed { break }
             guard state.lengthKnown else { continue }
-            // True EOF: the consumer has drained everything. Until then keep running so a
-            // backward seek can re-feed the buffer.
-            if state.fileOffset >= state.fileLength && state.buffered == 0 { break }
+            // True EOF: the consumer has drained everything. Stay alive (sleeping) so a
+            // backward seek can re-feed the buffer; only `close()` or cancellation ends the task.
+            if state.fileOffset >= state.fileLength && state.buffered == 0 {
+                try? await Task.sleep(for: .milliseconds(200))
+                continue
+            }
             if state.fetchOffset >= state.fileLength || state.buffered >= bufferCap {
                 try? await Task.sleep(for: .milliseconds(200))
                 continue

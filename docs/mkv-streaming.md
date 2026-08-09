@@ -42,7 +42,7 @@ subs:   4x SRT (embedded)
      - *Native Matroska demux + remux*: no binary dependency, but very large, codec-limited, and high maintenance risk. Deferred as a follow-up if VLCKit proves untenable after the packaging gate.
      - *"Backrooms-minimum" (parse just this file)*: not real MKV support; the user chose broad VLCKit support.
 2. **VLC only on iOS; never in `TorrentCore`/`Streaming`/`torrent-cli`.** The macOS host build (`swift build`, `swift test`, the CLI harness) must not link MobileVLCKit. Achieved with a platform-conditional dependency chain in `Package.swift` (see [Packaging](#packaging)). All VLC interaction lives behind a thin iOS-only bridge target.
-3. **Feed VLC through a custom seekable `NSInputStream`** connected to the torrent's verified-byte APIs, mirroring how `TorrentResourceLoaderDelegate` feeds AVPlayer. VLC exposes `VLCMedia(initWithStream:)` whose `libvlc_media_new_callbacks` bridge calls back into the stream for open/read/seek/close — no local HTTP server, no filesystem shadow copy.
+3. **Feed VLC over a loopback HTTP server with a real `Content-Length`** (`TorrentHTTPServer`), not `initWithStream`. VLCKit's `open_cb` for `initWithStream:` reports `UINT64_MAX` size, which breaks VLC's Matroska demuxer (needs a known size for duration/seek table → stalls at 0:00). The server serves verified bytes with byte-range support over the existing BSD sockets, so VLC's HTTP input gets a real size and seekable ranges.
 4. **Reuse the existing priority machinery for streaming.** No new picker concepts. Sequential read windows use the existing 2 MB lookahead; seeks and the MKV Cues index (typically at the end of the file) ride the existing jump classification in `Torrent.streamPriority`.
 5. **Classification, not content-type, drives the file rows.** Replace the `contentType != nil` streamability check with a `PlaybackKind` enum: `.avPlayer`, `.vlc`, `.none`. `.mkv`/`.mka` → `.vlc` on iOS (`.none` on macOS, where the CLI keeps working without VLC).
 
@@ -54,19 +54,20 @@ subs:   4x SRT (embedded)
                  | (AVAssetResourceLoader)|        +-------------------------+
    ──────────────┴───────────────────────┘
    ┌─────────────┬───────────────────────────────────────────────────────────┐
-   │ MKV path    │  TorrentSeekableInputStream (Foundation, NSInputStream)   │
-   │ (iOS only)  │    ├─ reads  via Torrent.streamingAvailability/Read       │
-   │             │    ├─ seeks  via NSStreamFileCurrentOffsetKey (setProperty)│
+   │ MKV path    │  TorrentHTTPServer (Foundation, loopback HTTP/1.1)        │
+   │ (iOS only)  │    ├─ Content-Length = real file length                   │
+   │             │    ├─ Accept-Ranges: bytes, 206/Content-Range, keep-alive │
    │             │    ├─ prior via Torrent.streamPriority (jump vs window)   │
-   │             │    └─ blocked until verified bytes land (never fake EOF)  │
+   │             │    └─ progressive: ranges block until verified            │
    │             ▼                                                            │
    │   VLCBridge (iOS-only target)                                            │
-   │     VLCMedia(initWithStream:)  ──>  VLCMediaPlayer  ──>  UIView (drawable)│
+   │     VLCMedia(url: http://127.0.0.1:<port>/<file>)  ──>  VLCMediaPlayer   │
+   │       ──>  UIView (drawable)                                             │
    └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 - `TorrentCore` — untouched except `contentType` gains a sibling `playbackKind` helper (still dependency-free).
-- `Streaming` — gains `TorrentSeekableInputStream` + its data-source protocol. Foundation-only, so it compiles on macOS and is unit-testable hermetically.
+- `Streaming` — gains `TorrentHTTPServer` (+ the `TorrentStreamSource` protocol it consumes). Foundation-only, so it compiles on macOS and is unit-testable hermetically.
 - `VLCBridge` (new target) — the only code that imports MobileVLCKit. Contains the playback session + the SwiftUI-facing `MKVPlayerView`.
 - App (`stupid_torrent_client`) — routes file rows to `.avPlayer` or `.vlc` and presents the matching player.
 

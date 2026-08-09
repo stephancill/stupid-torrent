@@ -190,6 +190,22 @@ Track the offset locally (follow `currentOffset` only if the player jumps ahead)
 
 ## Unreleased
 
+### 2026-08-08 — Fix: MKV streaming via loopback HTTP server (VLC MediaKit)
+
+MKV streaming still showed 0:00 / wouldn't play even with fully-verified data and after the SIGPIPE fix. Isolated the cause by testing VLC against a **real file path** (played perfectly: `dur=60023ms`, position advanced) vs `VLCMedia(initWithStream:)` (stalled at `dur=0`) — proving the problem was the stream API, not the engine or the codec.
+
+**Root cause**: VLCKit's `open_cb` for `VLCMedia(initWithStream:)` reports the stream size as `UINT64_MAX` (unknown). VLC's Matroska demuxer needs a known size to build the seek table / compute duration; with an unknown-size input it reads to the prefetch EOF and stalls at 0:00 (also explains why the tiny 348 KB gate-0 `test.mkv` "worked" — it fit in one read).
+
+**Fix** (`Streaming`): new `TorrentHTTPServer` — a loopback HTTP/1.1 server over the existing BSD sockets that serves verified bytes with a real `Content-Length`, `Accept-Ranges: bytes`, byte-range support (`206`/`Content-Range`, suffix + open-ended ranges, `416` with `Content-Range: bytes */<size>`), and keep-alive. Requested ranges are prioritized in the picker and responses block until verified (progressive serve). `MKVStreamSession` now points `VLCMedia` at `http://127.0.0.1:<port>/<file>` instead of `initWithStream`.
+
+Key details learned while debugging:
+- VLC's HTTP input seeks to exact EOF (`bytes=<size>-`) to probe size; it accepts `416`, so return `Content-Range: bytes */<size>`.
+- VLC's h1conn logs `connection failed` when `Connection: close` is sent on ranged responses — keep the connection alive (no `Connection: close`; loop serving requests on the socket).
+- Serving the whole file as a single 200 made VLC's prefetch hit EOF and stop; bounded the initial whole-file request to a 2 MB 206 lookahead so VLC issues range requests for the rest (mirrors the loader/stream lookahead).
+- VLCMediaPlayer's `VLCMediaPlayerTimeChanged`/`StateChanged` notifications don't reliably fire in this VLCKit build — `MKVStreamSession` now polls the player (250 ms) for position/duration/state instead of relying on notifications.
+
+**Verification**: `TorrentHTTPServerTests` (8) — HEAD length, full 200, 206 byte-range, open-ended, suffix, 416, progressive-serve, prioritize-follows-client. Simulator smoke test: `http://127.0.0.1` server, VLC parsed the MKV (`Duration=60023`), started h264/aac decoders, `Received first picture`, and **position advanced** 89 ms → 11325 ms over 12 s (polled from the player) — playback confirmed. Screenshots stay static because VLC's OpenGLES2VideoView layer isn't captured by `simctl screenshot` (simulator limitation, not a playback failure).
+
 ### 2026-08-08 — Fix: app crashed with SIGPIPE during streaming + active download
 
 The MKV player crashed while waiting to stream a partially-downloaded file (Backrooms QxR `749c6111…`): the app died ~100 s after opening the player. Simulator repro (auto-open the player on the partial torrent) reproduced it — `launchd_sim` reported `exited due to SIGPIPE | sent by stupid_torrent_client`.
