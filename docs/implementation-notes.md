@@ -4,6 +4,26 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-09 — Feat: MKV → fMP4 transmuxer core (Gates 0-2: EBML, init segment, fragments)
+
+First working slice of the Matroska → fragmented-MP4 transmuxer (the AVPlayer-native MKV path in `docs/mkv-avplayer-transmuxer.md`, replacing VLCKit). Pure Foundation in `Streaming`; no VLC. Hermetic gate: all five ffmpeg MKV fixtures (H.264+AAC, H.264+B-frames, HEVC Main 10, E-AC-3 5.1, AC-3) remux to fragmented MP4s that **AVFoundation loads and decodes on the macOS host** (`AVAsset.isPlayable`, correct ~3s duration, `AVAssetReader` pulls video + audio samples for every fixture).
+
+New files in `Sources/Streaming/`:
+- `EBML.swift` — EBML primitives over `Data`: VINT/size/ID parsing, element headers, ints/floats/strings. Key subtlety: element IDs carry the VINT marker bit (unlike size fields).
+- `MatroskaReader.swift` — `MatroskaParser`: head parse (EBML header, Segment, Info → timestampScale/duration, Tracks → codec/codecPrivate/DefaultDuration/params, Cues), cluster + SimpleBlock/Block/BlockGroup parsing, lacing expansion (Xiph/fixed/EBML), and `readClusterRange` for incremental iteration. `MKVBlock` timestamps are confirmed **presentation** times stored in decode order (verified against ffprobe on the B-frame fixture).
+- `MP4Muxer.swift` + `MP4Muxer+Fragments.swift` — ISO-BMFF writer: ftyp/moov (mvhd/tkhd/mdhd/hdlr/minf/stbl/stsd + mvex/trex), sample entries avc1/hvc1 (CodecPrivate copied verbatim as avcC/hvcC — it *is* the record, per spec), mp4a (esds wrapping the AudioSpecificConfig), ec-3/ac-3 (dec3/dac3 built from the E-AC-3/AC-3 syncframe header), moof/mfhd/tfhd/tfdt/trun + mdat, and a `sidx` builder for later seek support.
+- `Transmuxer.swift` — `MKVRemuxer`: converts clusters to samples (DTS = running sum; composition offsets = PTS − DTS), one fragment per cluster, audio frames forced to sync. B-frame tracks use DefaultDuration for a monotonic DTS (composition offsets preserve exact PTS); audio and no-B-frame video use exact PTS deltas (no DefaultDuration → first-sample-duration bug fixed this way).
+
+Fixes that `ffprobe` + AVAsset bisection (swapping boxes against ffmpeg's own `-movflags frag_keyframe+empty_moov+default_base_moof` output) surfaced:
+- EBML element IDs include the marker bit (my VINT reader was stripping it → `not a Matroska`).
+- `dref` is a FullBox (was missing version+flags) and its `url ` entry must be *inside* dref, not a sibling (this was the "0 tracks" / not-playable bug).
+- `esds` was double-wrapped; audio sample entry was missing 4 bytes (version+revision+vendor); `stsz` was missing its sample_count field; `tkhd` flags were written as a data field, shifting the box.
+- mvhd/tkhd/mdhd durations must be 0 for fragmented files (AVFoundation sums them with the fragment duration → doubled playback length).
+
+Reference implementations cloned into `third-party/` (gitignored): `Vanilagy/mediabunny` (MKV demux + fMP4 mux, primary), `webmproject/libwebm` (EBML), `shaka-project/shaka-packager` (sparse: webm demux + mp4 mux), `DolbyLaboratories/dlb_mp4base` (dec3/dac3 layouts). Empirically verified 2026-08-09 (see `docs/mkv-avplayer-transmuxer.md` Verification log): AVFoundation decodes E-AC-3/AC-3 in ISO-BMFF on macOS + iOS 26.3 sim, and AVC/HEVC/AAC CodecPrivate is the config record verbatim.
+
+Next: wire the transmuxer into `TorrentStreamSession` so `.mkv` streams through AVPlayer (virtual-fMP4 byte-range serving), then seeking (sidx), live/partial, app routing, and VLCKit removal.
+
 ### 2026-08-09 — Feat: prefill magnet link from clipboard when the add sheet opens
 
 Opening the "Add torrent" sheet now reads the pasteboard and, if it parses as a valid magnet link via `MagnetLinkParser.parse`, prefills the magnet field so the user can tap Add directly. A new `clipboardString()` helper wraps `UIPasteboard`/`NSPasteboard` behind the platform `#if`, mirroring the existing `copyMagnet()` pattern. Non-magnet clipboard contents are ignored and the field stays empty.
