@@ -117,19 +117,17 @@ public actor TransmuxStreamSource: TorrentStreamSource {
         guard let head = await ensureHead(blocking: false) else { return }
         let initSize = head.initSegment.count
         let mkvStart: Int
-        if layout != nil {
-            if let plan = plan(containing: range.lowerBound) {
-                mkvStart = plan.mkvStart + (range.lowerBound - plan.virtualOffset)
-            } else {
-                mkvStart = mkvLength
-            }
-        } else if range.lowerBound >= initSize, let fragment = fragment(containing: range.lowerBound) {
-            mkvStart = fragment.mkvStart + (range.lowerBound - fragment.virtualOffset)
+        if let plan = plan(containing: range.lowerBound) {
+            mkvStart = plan.mkvStart + (range.lowerBound - plan.virtualOffset)
+        } else if range.lowerBound >= initSize {
+            // Beyond the generated layout: jump to the estimated MKV position so a far seek
+            // target downloads ahead of the sequential frontier (virtual ≈ MKV after the init).
+            let estimate = (head.info.firstClusterOffset ?? 0) + (range.lowerBound - initSize)
+            mkvStart = max(0, min(estimate, mkvLength))
         } else {
-            // Not generated yet: prioritize at the sequential frontier (approximate).
             mkvStart = mkvCursor
         }
-        let end = min(mkvStart + max(range.count, 2 * 1024 * 1024), mkvLength)
+        let end = min(max(mkvStart, mkvCursor) + max(range.count, 2 * 1024 * 1024), mkvLength)
         await realSource.prioritize(fileIndex: fileIndex, range: mkvStart..<end)
     }
 

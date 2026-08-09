@@ -4,6 +4,15 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-09 — Fix: far seeks on partially downloaded MKVs no longer wait for sequential arrival
+
+A seek beyond the downloaded frontier of a partial MKV answered the loader's bounded request with nothing and AVPlayer reverted to the buffered position, even as the seek target's pieces downloaded. Two changes:
+
+1. **`TorrentStreamSession` loader**: bounded (seek / read-ahead) requests now **wait** for their bytes (poll like all-to-end, finishing at source EOF) instead of finishing empty — so a far seek's range is served the moment it verifies, and AVPlayer resumes at the target.
+2. **`TransmuxStreamSource.prioritize`**: ranges beyond the generated layout now jump-prioritize the estimated MKV position (`firstClusterOffset + (virtual − initSize)`, since the virtual file ≈ MKV after the init) rather than the sequential frontier — so the seek target downloads ahead of playback order.
+
+Verified on a 30 s MKV with a throttled seeder: partial download (5/11), `stream-play --seek-to 25` — the playhead resumes at 25.0 s and plays to 29.9 s once the region downloads (previously stuck at the 13.3 s frontier). New hermetic test `farSeekServesOnceTargetVerifies`: a far target reads as unavailable until its bytes verify, then serves the exact reference bytes. 63 tests green.
+
 ### 2026-08-09 — Feat: sidx-based precise seeking for complete MKVs
 
 Complete (fully-verified) MKVs now get exact seeking: when the whole file is verified, a structural scan of the cluster headers sizes every fragment (no payload retention), the init segment carries a `sidx`, and the transmuxer serves direct jumps from the precomputed layout (exact content length, byte-range serving, prioritization). Partial files keep the sequential streaming path (no sidx — future fragments are unknown).

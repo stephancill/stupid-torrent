@@ -134,7 +134,17 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
                 try? await Task.sleep(for: .milliseconds(200))
                 continue
             }
-            // Bounded request with no data right now: give what we have; AVPlayer re-requests.
+            if requestedLength > 0 {
+                // Bounded (seek / read-ahead) request: wait for the bytes rather than finishing
+                // empty — otherwise a far seek on a still-downloading file is answered with
+                // nothing and AVPlayer reverts to the buffered position.
+                if await source.reachesEOF(fileIndex: fileIndex, offset: offset) {
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(200))
+                continue
+            }
+            // Probe request (requestedLength == 0): give what's available; AVPlayer re-requests.
             break
         }
         TorrentLog.log("stream finish start=\(startOffset) served=\(served) allToEnd=\(allToEnd)")

@@ -141,25 +141,36 @@ actor FakeMKVSource: TorrentStreamSource {
         }
     }
 
-    @Test func seekWithinDownloadedRegionIsExact() async throws {
-        let data = try Fixtures.data(named: "mkv/h264-aac.mkv")
+    @Test func farSeekServesOnceTargetVerifies() async throws {
+        // long30 is big enough to seek beyond an initial partial verify; the target's bytes come
+        // later, and the virtual read must then return the fragment at the requested offset.
+        let data = try Fixtures.data(named: "mkv/long30.mkv")
+        let reference = try referenceRemux(data, includeSidx: false)
         let source = FakeMKVSource(data)
-        await source.verify(0..<data.count)
+        // Only the head + a bit verified initially.
+        await source.verify(0..<300 * 1024)
         let transmux = TransmuxStreamSource(realSource: source, fileIndex: 0)
 
-        // The fully-verified file takes the precomputed path: exact content length + sidx.
-        let reference = try referenceRemux(data, includeSidx: true)
-        #expect(await transmux.fileLength(fileIndex: 0) == reference.count,
-                "complete file should report the exact virtual length")
-        // Seek into the middle of the virtual file and read a chunk; it must equal the
-        // reference bytes at that offset.
-        let target = reference.count / 2
-        _ = await transmux.availability(fileIndex: 0, offset: target)
-        if let chunk = await transmux.read(fileIndex: 0, offset: target, length: 4096) {
-            let expected = reference.subdata(in: target..<min(target + 4096, reference.count))
-            #expect(chunk == expected)
+        // A seek far beyond the downloaded frontier has no bytes yet.
+        let seekTarget = Int(Double(reference.count) * 0.8)
+        #expect(await transmux.availability(fileIndex: 0, offset: seekTarget) == 0,
+                "far seek target should not be available before its bytes verify")
+
+        // Once the rest verifies, the target fragment must serve the exact reference bytes.
+        await source.verify(0..<data.count)
+        // Let the transmuxer catch up (sequential generation walks to the target).
+        var available = 0
+        for _ in 0..<20 {
+            available = await transmux.availability(fileIndex: 0, offset: seekTarget)
+            if available > 0 { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(available > 0, "far seek target should become available after verification")
+        if let chunk = await transmux.read(fileIndex: 0, offset: seekTarget, length: 4096) {
+            let expected = reference.subdata(in: seekTarget..<min(seekTarget + 4096, reference.count))
+            #expect(chunk == expected, "served bytes must match the reference at the seek target")
         } else {
-            Issue.record("read at seek target returned nil")
+            Issue.record("read at far seek target returned nil")
         }
     }
 }
