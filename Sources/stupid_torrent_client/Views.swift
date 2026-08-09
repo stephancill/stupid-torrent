@@ -251,6 +251,11 @@ struct AddTorrentView: View {
                 }
             }
             .navigationTitle("Add torrent")
+            .onAppear {
+                if magnet.isEmpty, let clipboard = clipboardString(), (try? MagnetLinkParser.parse(clipboard)) != nil {
+                    magnet = String(clipboard.drop(while: \.isWhitespace))
+                }
+            }
             .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.data]) { result in
                 if case .success(let url) = result {
                     add(.file(url))
@@ -483,6 +488,14 @@ struct VideoPlayerView: View {
     }
 }
 #endif
+
+func clipboardString() -> String? {
+    #if os(iOS)
+    return UIPasteboard.general.string
+    #else
+    return NSPasteboard.general.string(forType: .string)
+    #endif
+}
 
 func magnetLink(_ metainfo: Metainfo) -> String {
     var parts = ["xt=urn:btih:\(metainfo.infoHash.hexString)"]

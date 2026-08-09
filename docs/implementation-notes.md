@@ -4,6 +4,10 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-09 — Feat: prefill magnet link from clipboard when the add sheet opens
+
+Opening the "Add torrent" sheet now reads the pasteboard and, if it parses as a valid magnet link via `MagnetLinkParser.parse`, prefills the magnet field so the user can tap Add directly. A new `clipboardString()` helper wraps `UIPasteboard`/`NSPasteboard` behind the platform `#if`, mirroring the existing `copyMagnet()` pattern. Non-magnet clipboard contents are ignored and the field stays empty.
+
 ### 2026-08-09 — Fix: keep loopback HTTP socket I/O off Swift's cooperative executor
 
 Opening the partially-downloaded Backrooms MKV failed immediately with VLC's `Could not open http://127.0.0.1:...: Unknown error`, while the completed smoke fixture played. The same issue made all eight parallel `TorrentHTTPServerTests` hang: blocking BSD `accept()`, `read()`, and `write()` calls ran directly in unstructured Swift tasks, so active torrent peers or concurrent server tests could exhaust the cooperative executor before the loopback server responded. `TorrentHTTPServer` now bridges blocking socket operations through GCD-backed checked continuations. The HTTP tests remain parallel and complete, exercising the production concurrency behavior rather than hiding it by serializing the suite.
