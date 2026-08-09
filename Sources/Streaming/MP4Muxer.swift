@@ -122,7 +122,8 @@ public enum MP4Muxer {
     }
 
     public static func moov(tracks: [TransmuxTrack]) -> Data {
-        let timescale = tracks.first?.timescale ?? 1000
+        // mvhd uses its own timescale (1000); per-track mdhd carries the media timescales.
+        let timescale = 1000
         let duration = tracks.map { Int($0.durationTicks) }.max() ?? 0
 
         var payload = Data()

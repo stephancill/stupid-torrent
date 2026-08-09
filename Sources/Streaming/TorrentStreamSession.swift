@@ -80,7 +80,10 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
         let allToEnd = dataRequest.requestsAllDataToEndOfResource
         let maxChunk = 512 * 1024
         let startOffset = Int(dataRequest.currentOffset)
-        let limit = requestedLength > 0 ? requestedLength : Int.max
+        // For all-to-end requests `requestedLength` is only AVPlayer's initial buffer hint, not
+        // a bound — serve until the source is exhausted (finishes at `reachesEOF` / file end).
+        // Bounded requests get exactly their requested range.
+        let limit = allToEnd ? Int.max : requestedLength
         var offset = startOffset
         var served = 0
 

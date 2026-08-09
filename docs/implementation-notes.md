@@ -4,6 +4,16 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-09 — Fix: correct MKV playback duration/timeline through the loader
+
+In-app MKV playback stalled at ~8.3 s (AVAsset reported `duration=8.333s` for a 30 s file, capping playback and seeks). Three interacting bugs, found by bisecting the loader-path duration against ffmpeg's own `-movflags frag_keyframe+empty_moov` output:
+
+1. **`TransmuxStreamSource.fileLength` returned just the 128 KB margin** when the head hadn't been parsed yet (`mkvLength` was still 0). The loader used it for `contentLength` *and* as the all-to-end serve bound, so AVAsset saw a 128 KB file (~8.3 s). `fileLength` now ensures the head is parsed first, so `contentLength = mkvLength + margin`.
+2. **The loader capped all-to-end requests at `requestedLength`** (AVPlayer's initial 128 KB buffer hint). Changed to serve unbounded (the hint is not a bound); the request now finishes at `reachesEOF`/file end.
+3. **Coarse per-track timescale (1000) made AVAsset mis-estimate duration.** Video now uses a standard 16000 timescale (timestamps ×16, exact since 16000 = 1000·16), audio keeps the MKV tick scale; `mvhd` uses 1000 regardless. With the file-based path this alone fixed duration; all three together fixed the loader path.
+
+Verified: `stream-test` reports `ASSET: duration=30.0s playable=true` (complete download), seeks to 20 s land and resume on a 30 s MKV, and — decisively — the **iOS app plays the transmuxed MKV through native AVPlayer** on the simulator (screenshots 5 s apart differ by 28.95%, i.e. the testsrc pattern is rendering). 63 tests green.
+
 ### 2026-08-09 — Feat: rip out VLCKit, route MKV to AVPlayer (Gates 5)
 
 VLCKit is gone. `.mkv`/`.mka` now play through native AVPlayer via the transmuxer (`PlaybackKind.vlc` removed; mkv/mka → `.avPlayer`; `Views.swift` routes every streamable file to `PlayerView`). Deleted: `Sources/VLCBridge/` (MKVPlayerView, MKVStreamSession), `Sources/Streaming/TorrentSeekableInputStream.swift`, `Sources/Streaming/TorrentHTTPServer.swift`, their tests, the `MobileVLCKit` binary target + `VLCBridge` target + linker settings in `Package.swift`, and the gitignored `Vendor/` framework. The iOS app now builds at **3.3 MB** (was 225+ MB) with no embedded framework, and launches in the iOS 26.3 simulator. `docs/mkv-streaming.md` marked superseded; `docs/planning.md` and `docs/mkv-avplayer-transmuxer.md` updated. 63 tests green (removed the VLC-specific suite).

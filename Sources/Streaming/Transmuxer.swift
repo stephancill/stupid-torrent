@@ -18,7 +18,11 @@ public final class MKVRemuxer: @unchecked Sendable {
         var trackId = 1
         for mkvTrack in info.tracks where mkvTrack.isTransmuxable {
             guard let codec = Self.codec(for: mkvTrack) else { continue }
-            let timescale = Self.timescale(timestampScaleNs: info.timestampScaleNs)
+            // Per-track timescale. Video uses a standard 16,000 (AVAsset's duration computation
+            // mis-estimates with a coarse 1000-scale; timestamps map exactly since it's ×1000·16).
+            // Audio keeps the MKV tick scale (sample-rate conversion would re-introduce rounding
+            // drift on the frame durations).
+            let timescale = mkvTrack.trackType == 1 ? 16000 : Self.timescale(timestampScaleNs: info.timestampScaleNs)
             var audioConfig: Data?
             if codec == .eac3, let privateData = mkvTrack.codecPrivate {
                 audioConfig = MP4Muxer.eac3Config(fromSyncframe: privateData)
@@ -42,7 +46,12 @@ public final class MKVRemuxer: @unchecked Sendable {
             )
             tracks.append(track)
             indexByMKVNumber[mkvTrack.number] = trackId
-            states[mkvTrack.number] = TrackState(timescale: timescale, mkvTrack: mkvTrack)
+            let baseTimescale = Self.timescale(timestampScaleNs: info.timestampScaleNs)
+            states[mkvTrack.number] = TrackState(
+                timescale: timescale,
+                scale: Int64(timescale) / Int64(max(1, baseTimescale)),
+                mkvTrack: mkvTrack
+            )
             trackId += 1
         }
         self.tracks = tracks
@@ -95,9 +104,12 @@ public final class MKVRemuxer: @unchecked Sendable {
         Int(1_000_000_000 / max(1, timestampScaleNs))
     }
 
-    /// Per-track running mux state.
+    /// Per-track running mux state. Timestamps are accumulated in MKV tick units and scaled to
+    /// the track timescale at emit time.
     private final class TrackState: @unchecked Sendable {
         let timescale: Int
+        /// Multiplier from MKV ticks to the track's timescale (video 16, audio 1).
+        private let scale: Int64
         let mkvTrack: MKVTrack
         private var nextDecodeTime: Int64 = 0
         private var lastDelta: Int64?
@@ -105,8 +117,9 @@ public final class MKVRemuxer: @unchecked Sendable {
         /// need a constant frame duration for their DTS instead of PTS deltas.
         private var hasReorder: Bool?
 
-        init(timescale: Int, mkvTrack: MKVTrack) {
+        init(timescale: Int, scale: Int64, mkvTrack: MKVTrack) {
             self.timescale = timescale
+            self.scale = scale
             self.mkvTrack = mkvTrack
         }
 
@@ -157,9 +170,9 @@ public final class MKVRemuxer: @unchecked Sendable {
                 let isKeyframe = isVideo ? frame.isKeyframe : true
                 result.append(TransmuxSample(
                     data: frame.data,
-                    durationTicks: duration,
-                    decodeTimeTicks: nextDecodeTime,
-                    compositionOffsetTicks: frame.pts - nextDecodeTime,
+                    durationTicks: duration * scale,
+                    decodeTimeTicks: nextDecodeTime * scale,
+                    compositionOffsetTicks: (frame.pts - nextDecodeTime) * scale,
                     isKeyframe: isKeyframe
                 ))
                 nextDecodeTime += duration

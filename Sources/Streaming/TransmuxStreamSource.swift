@@ -47,10 +47,11 @@ public actor TransmuxStreamSource: TorrentStreamSource {
     // MARK: - TorrentStreamSource
 
     public func fileLength(fileIndex: Int) async -> Int {
-        // The virtual fMP4 is close to the MKV size (fragments ≈ cluster payloads); add headroom
-        // so the whole virtual file is covered. AVPlayer uses this for byte-range seek
-        // interpolation; imprecision is acceptable (documented).
-        mkvLength > 0 ? mkvLength + margin : margin
+        // The virtual length needs the parsed head (it determines the real MKV length and the
+        // init segment). Ensure it so the loader reports a correct contentLength instead of the
+        // bare margin.
+        _ = await ensureHead(blocking: true)
+        return mkvLength > 0 ? mkvLength + margin : margin
     }
 
     public func availability(fileIndex: Int, offset: Int) async -> Int {
@@ -98,7 +99,6 @@ public actor TransmuxStreamSource: TorrentStreamSource {
 
     public func reachesEOF(fileIndex: Int, offset: Int) async -> Bool {
         guard let head = await ensureHead(blocking: false) else { return false }
-        // EOF once the whole MKV has been consumed into fragments (mkvCursor passed the tail).
         return mkvCursor >= mkvLength && mkvLength > 0
     }
 
