@@ -217,6 +217,80 @@ actor FakeMKVSource: TorrentStreamSource {
         #expect(abs(CMTimeGetSeconds(item.duration) - declaredDuration) < 0.01)
     }
 
+    @Test @MainActor func farSeekThroughPlayerRequestsTarget() async throws {
+        let data = try Fixtures.data(named: "mkv/long30.mkv")
+        let source = FakeMKVSource(data)
+        await source.verify(0..<300 * 1024)
+        let transmux = TransmuxStreamSource(realSource: source, fileIndex: 0)
+        let delegate = TorrentResourceLoaderDelegate(
+            source: transmux,
+            fileIndex: 0,
+            contentType: "public.mpeg-4",
+            finishesAllToEndAtFrontier: true
+        )
+        let asset = delegate.makeAsset()
+        _ = try await asset.load(.duration)
+        var info = try MatroskaParser.parseHead(bytes: data)
+        let declaredDuration = info.durationSeconds ?? 0
+        let cuesOffset = try #require(info.cuesOffset)
+        let cuesHeader = try #require(EBML.readHeader(data, offset: cuesOffset))
+        let cuesSize = try #require(cuesHeader.size)
+        let cuesEnd = cuesOffset + EBML.headerLength(cuesHeader) + Int(cuesSize)
+        try MatroskaParser.parseCues(
+            data,
+            dataOffset: cuesOffset + EBML.headerLength(cuesHeader),
+            size: Int(cuesSize),
+            into: &info
+        )
+        let videoTrack = try #require(info.tracks.first { $0.trackType == 1 && $0.isEnabled })
+        #expect(info.cuePoints.contains { $0.trackNumber == videoTrack.number })
+        let targetTicks = UInt64(25 * 1e9 / Double(info.timestampScaleNs))
+        let targetCue = try #require(info.cuePoints.last {
+            $0.trackNumber == videoTrack.number && $0.time <= targetTicks
+        })
+        let targetOffset = (info.segmentDataStart ?? 0) + targetCue.clusterPosition
+        _ = try #require(try MatroskaParser.readClusterRange(bytes: data, offset: targetOffset))
+        let item = DeclaredDurationPlayerItem(
+            asset: asset,
+            declaredDuration: CMTime(seconds: declaredDuration, preferredTimescale: 600)
+        )
+        let player = TorrentSeekingPlayer(playerItem: item) { seconds in
+            guard let timelineOffset = await transmux.prepareForSeek(seconds: seconds) else { return nil }
+            let seekAsset = delegate.makeAsset()
+            _ = try? await seekAsset.load(.duration)
+            let seekItem = DeclaredDurationPlayerItem(
+                asset: seekAsset,
+                declaredDuration: CMTime(seconds: declaredDuration, preferredTimescale: 600)
+            )
+            return PreparedTorrentSeek(item: seekItem, timelineOffset: timelineOffset)
+        }
+
+        let seekTask = Task { @MainActor in
+            await player.seek(
+                to: CMTime(seconds: 25, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+        }
+        for _ in 0..<20 {
+            if await source.prioritizeRanges.contains(where: { $0.contains(cuesOffset) }) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(await source.prioritizeRanges.contains(where: { $0.contains(cuesOffset) }))
+        #expect(abs(CMTimeGetSeconds(player.currentTime()) - 25) < 0.1)
+        await source.verify(cuesOffset..<cuesEnd)
+        for _ in 0..<20 {
+            if await source.prioritizeRanges.contains(where: { $0.contains(targetOffset) }) { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(await source.prioritizeRanges.contains(where: { $0.contains(targetOffset) }))
+        await source.verify(targetOffset..<min(targetOffset + 2 * 1024 * 1024, data.count))
+        _ = await seekTask.value
+        try await Task.sleep(for: .milliseconds(200))
+
+        #expect(abs(CMTimeGetSeconds(player.currentTime()) - 25) < 0.1)
+    }
+
     @Test func precomputedLayoutIgnoresDroppedTracks() throws {
         let data = try Fixtures.data(named: "mkv/long30.mkv")
         let info = try MatroskaParser.parseHead(bytes: data)
@@ -244,6 +318,27 @@ actor FakeMKVSource: TorrentStreamSource {
 
         #expect(remuxer.fragmentSizeForKeptTracks(mixed) == 8 + 16 + 64 + 32 + 8 + 200)
         #expect(remuxer.fragmentSizeForKeptTracks(droppedOnly) == nil)
+    }
+
+    @Test func cuesLessPartialSourceDisablesFarSeeking() async throws {
+        var data = try Fixtures.data(named: "mkv/long30.mkv")
+        let originalInfo = try MatroskaParser.parseHead(bytes: data)
+        #expect(originalInfo.cuesOffset != nil)
+        let cueID = Data([0x1C, 0x53, 0xBB, 0x6B])
+        let headEnd = try #require(originalInfo.firstClusterOffset)
+        let seekIDRange = try #require(data[..<headEnd].range(of: cueID))
+        data[seekIDRange.lowerBound] = 0x1D
+        #expect(try MatroskaParser.parseHead(bytes: data).cuesOffset == nil)
+
+        let partialSource = FakeMKVSource(data)
+        await partialSource.verify(0..<300 * 1024)
+        let partialTransmux = TransmuxStreamSource(realSource: partialSource, fileIndex: 0)
+        #expect(await partialTransmux.supportsFarSeeking() == false)
+
+        let completeSource = FakeMKVSource(data)
+        await completeSource.verify(0..<data.count)
+        let completeTransmux = TransmuxStreamSource(realSource: completeSource, fileIndex: 0)
+        #expect(await completeTransmux.supportsFarSeeking())
     }
 
 }

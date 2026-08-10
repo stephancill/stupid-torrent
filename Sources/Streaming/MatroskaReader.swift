@@ -58,14 +58,16 @@ public struct MatroskaInfo {
     /// Duration in segment timestamp ticks.
     public var durationTicks: Double?
     public var tracks: [MKVTrack] = []
-    /// Sorted cue points: (segment time ticks, absolute cluster byte offset).
-    public var cuePoints: [(time: UInt64, clusterPosition: Int)] = []
+    /// Sorted cue points: (segment time ticks, cluster position relative to Segment data, track number).
+    public var cuePoints: [(time: UInt64, clusterPosition: Int, trackNumber: UInt64)] = []
     /// Byte offset of the first Cluster element (absolute in the file).
     public var firstClusterOffset: Int?
     /// Absolute file offset where the Segment element's data begins.
     public var segmentDataStart: Int?
     /// Absolute file offset where the Segment element ends (nil if undefined size).
     public var segmentDataEnd: Int?
+    /// Absolute file offset of the Cues element, when advertised by SeekHead.
+    public var cuesOffset: Int?
 
     public var durationSeconds: Double? {
         guard let ticks = durationTicks else { return nil }
@@ -195,7 +197,9 @@ public enum MatroskaParser {
                 return info
             case EBMLID.cues.rawValue:
                 try parseCues(bytes, dataOffset: dataOffset, size: Int(elementSize), into: &info)
-            case EBMLID.seekHead.rawValue, EBMLID.chapters.rawValue, EBMLID.tags.rawValue,
+            case EBMLID.seekHead.rawValue:
+                try parseSeekHead(bytes, dataOffset: dataOffset, size: Int(elementSize), into: &info)
+            case EBMLID.chapters.rawValue, EBMLID.tags.rawValue,
                  EBMLID.attachments.rawValue, EBMLID.void.rawValue, EBMLID.crc32.rawValue:
                 break // Skipped.
             default:
@@ -240,6 +244,38 @@ public enum MatroskaParser {
                 info.durationTicks = EBML.readFloat(bytes, offset: valueOffset, length: Int(elementSize))
             default:
                 break
+            }
+            cursor = valueOffset + Int(elementSize)
+        }
+    }
+
+    private static func parseSeekHead(_ bytes: Data, dataOffset: Int, size: Int, into info: inout MatroskaInfo) throws {
+        var cursor = dataOffset
+        let end = dataOffset + size
+        while cursor < end {
+            guard let header = EBML.readHeader(bytes, offset: cursor) else { throw MatroskaError.truncated("SeekHead") }
+            guard let elementSize = header.size else { throw MatroskaError.undefinedSize("SeekHead child") }
+            let valueOffset = cursor + EBML.headerLength(header)
+            if header.id == EBMLID.seek.rawValue {
+                var seekID: UInt64?
+                var seekPosition: Int?
+                var child = valueOffset
+                let childEnd = valueOffset + Int(elementSize)
+                while child < childEnd {
+                    guard let childHeader = EBML.readHeader(bytes, offset: child), let childSize = childHeader.size else {
+                        throw MatroskaError.truncated("Seek")
+                    }
+                    let childValue = child + EBML.headerLength(childHeader)
+                    if childHeader.id == EBMLID.seekID.rawValue {
+                        seekID = EBML.readUInt(bytes, offset: childValue, length: Int(childSize))
+                    } else if childHeader.id == EBMLID.seekPosition.rawValue {
+                        seekPosition = Int(EBML.readUInt(bytes, offset: childValue, length: Int(childSize)))
+                    }
+                    child = childValue + Int(childSize)
+                }
+                if seekID == EBMLID.cues.rawValue, let seekPosition, let segmentDataStart = info.segmentDataStart {
+                    info.cuesOffset = segmentDataStart + seekPosition
+                }
             }
             cursor = valueOffset + Int(elementSize)
         }
@@ -341,10 +377,18 @@ public enum MatroskaParser {
             switch header.id {
             case EBMLID.cuePoint.rawValue:
                 var time: UInt64?
-                var clusterPosition: Int?
-                try parseCuePoint(bytes, dataOffset: valueOffset, size: Int(elementSize), time: &time, clusterPosition: &clusterPosition)
-                if let time, let clusterPosition {
-                    info.cuePoints.append((time: time, clusterPosition: clusterPosition))
+                var positions: [(trackNumber: UInt64, clusterPosition: Int)] = []
+                try parseCuePoint(
+                    bytes,
+                    dataOffset: valueOffset,
+                    size: Int(elementSize),
+                    time: &time,
+                    positions: &positions
+                )
+                if let time {
+                    info.cuePoints.append(contentsOf: positions.map {
+                        (time: time, clusterPosition: $0.clusterPosition, trackNumber: $0.trackNumber)
+                    })
                 }
 
             default:
@@ -355,7 +399,13 @@ public enum MatroskaParser {
         info.cuePoints.sort { $0.time < $1.time }
     }
 
-    private static func parseCuePoint(_ bytes: Data, dataOffset: Int, size: Int, time: inout UInt64?, clusterPosition: inout Int?) throws {
+    private static func parseCuePoint(
+        _ bytes: Data,
+        dataOffset: Int,
+        size: Int,
+        time: inout UInt64?,
+        positions: inout [(trackNumber: UInt64, clusterPosition: Int)]
+    ) throws {
         var cursor = dataOffset
         let end = dataOffset + size
         while cursor < end {
@@ -366,10 +416,18 @@ public enum MatroskaParser {
             case EBMLID.cueTime.rawValue:
                 time = EBML.readUInt(bytes, offset: valueOffset, length: Int(elementSize))
             case EBMLID.cueTrackPositions.rawValue:
-                // CueClusterPosition is relative to the Segment data start.
                 var cp: Int?
-                try parseCueTrackPositions(bytes, dataOffset: valueOffset, size: Int(elementSize), clusterPosition: &cp)
-                if let cp { clusterPosition = cp }
+                var trackNumber: UInt64?
+                try parseCueTrackPositions(
+                    bytes,
+                    dataOffset: valueOffset,
+                    size: Int(elementSize),
+                    trackNumber: &trackNumber,
+                    clusterPosition: &cp
+                )
+                if let trackNumber, let cp {
+                    positions.append((trackNumber: trackNumber, clusterPosition: cp))
+                }
             default:
                 break
             }
@@ -377,14 +435,22 @@ public enum MatroskaParser {
         }
     }
 
-    private static func parseCueTrackPositions(_ bytes: Data, dataOffset: Int, size: Int, clusterPosition: inout Int?) throws {
+    private static func parseCueTrackPositions(
+        _ bytes: Data,
+        dataOffset: Int,
+        size: Int,
+        trackNumber: inout UInt64?,
+        clusterPosition: inout Int?
+    ) throws {
         var cursor = dataOffset
         let end = dataOffset + size
         while cursor < end {
             guard let header = EBML.readHeader(bytes, offset: cursor) else { throw MatroskaError.truncated("CueTrackPositions") }
             guard let elementSize = header.size else { throw MatroskaError.undefinedSize("CueTrackPositions child") }
             let valueOffset = cursor + EBML.headerLength(header)
-            if header.id == EBMLID.cueClusterPosition.rawValue {
+            if header.id == EBMLID.cueTrack.rawValue {
+                trackNumber = EBML.readUInt(bytes, offset: valueOffset, length: Int(elementSize))
+            } else if header.id == EBMLID.cueClusterPosition.rawValue {
                 clusterPosition = Int(EBML.readUInt(bytes, offset: valueOffset, length: Int(elementSize)))
             }
             cursor = valueOffset + Int(elementSize)

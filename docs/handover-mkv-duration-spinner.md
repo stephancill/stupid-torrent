@@ -15,6 +15,14 @@ The experimental `mehd` production changes and scratch test were removed. A real
 
 Follow-up: MTP's default 5.1 audio plus two commentary tracks were all emitted as independently enabled MP4 tracks, which made AVFoundation mix them. `MKVRemuxer` now emits only the enabled default audio track (falling back to the first supported audio track); the real-file harness reports `audioTracks=1`.
 
+Far-seek follow-up: overriding `AVPlayerItem.duration` changed the displayed duration but AVFoundation still clamped seeks to its raw readable-fragment duration. `TorrentSeekingPlayer` now intercepts native seeks, uses the Matroska `SeekHead`/Cues index to prioritize and remux from the target keyframe, replaces the item with a fresh local-timeline asset, and translates item time back to global movie time. The MTP harness jumps from 5.5 s to 5000.3 s and continues playback; the partial `long30.mkv` regression verifies that the middle byte range is not downloaded.
+
+Cues-less partial MKVs do not use the declared-duration override or `TorrentSeekingPlayer`; native controls are limited to the currently readable timeline. Fully downloaded Cues-less files remain seekable through the precomputed structural layout.
+
+Playback-stall follow-up: never finish an AVFoundation `requestsAllDataToEndOfResource` playback request at an arbitrary byte cap. iOS treats that as EOF and stopped MTP at the first fragment. Playback requests remain open and suspend briefly every 4 MiB to provide backpressure. Laced AAC frames also use a 48 kHz track timescale and exact 1024-sample durations instead of zero-duration samples.
+
+Far-seek video follow-up: preserve `CueTrack`, select the retained video track's Cue position, and rebase the target segment's PTS/DTS to zero. Each seek uses an isolated transmux source and unique asset URL, waits for that playback asset's `.isPlayable`, and applies the global time offset only in `TorrentSeekingPlayer.currentTime()`. Reusing the original source/URL or exposing global timestamps inside `AVPlayerItem.currentTime()` produced a moving progress bar with an unchanged frame.
+
 ## The bug (as reported)
 
 Open the "Meet the Parents 2000 REMASTERED 1080p BluRay HEVC x265 5.1 BONE" MKV (`.mkv`,

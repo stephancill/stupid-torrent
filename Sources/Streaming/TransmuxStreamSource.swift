@@ -28,6 +28,7 @@ public actor TransmuxStreamSource: TorrentStreamSource {
     // Sequential (streaming) mode state.
     private var fragments: [Fragment] = []
     private var mkvCursor: Int = 0
+    private var streamMkvStart: Int = 0
 
     // Precomputed (complete file) mode state.
     private var layout: [FragmentPlan]?
@@ -35,8 +36,8 @@ public actor TransmuxStreamSource: TorrentStreamSource {
     private var cache: [Int: Data] = [:]
 
     private struct Head {
-        let info: MatroskaInfo
-        let remuxer: MKVRemuxer
+        var info: MatroskaInfo
+        var remuxer: MKVRemuxer
         var initSegment: Data
     }
 
@@ -69,7 +70,7 @@ public actor TransmuxStreamSource: TorrentStreamSource {
         if let layout {
             return (head?.initSegment.count ?? 0) + layout.reduce(0) { $0 + $1.size }
         }
-        return mkvLength > 0 ? mkvLength + margin : margin
+        return mkvLength > 0 ? mkvLength - streamMkvStart + margin : margin
     }
 
     public func availability(fileIndex: Int, offset: Int) async -> Int {
@@ -122,7 +123,7 @@ public actor TransmuxStreamSource: TorrentStreamSource {
         } else if range.lowerBound >= initSize {
             // Beyond the generated layout: jump to the estimated MKV position so a far seek
             // target downloads ahead of the sequential frontier (virtual ≈ MKV after the init).
-            let estimate = (head.info.firstClusterOffset ?? 0) + (range.lowerBound - initSize)
+            let estimate = streamMkvStart + (range.lowerBound - initSize)
             mkvStart = max(0, min(estimate, mkvLength))
         } else {
             mkvStart = mkvCursor
@@ -142,6 +143,107 @@ public actor TransmuxStreamSource: TorrentStreamSource {
 
     func declaredDurationSeconds() async -> Double? {
         await ensureHead(blocking: true)?.info.durationSeconds
+    }
+
+    func supportsFarSeeking() async -> Bool {
+        guard let head = await ensureHead(blocking: true) else { return false }
+        return layout != nil || head.info.cuesOffset != nil || !head.info.cuePoints.isEmpty
+    }
+
+    func prepareForSeek(seconds: Double) async -> Double? {
+        guard seconds >= 0, var head = await ensureHead(blocking: true),
+              let cue = await cuePoint(for: seconds, head: &head) else { return nil }
+        let clusterOffset = (head.info.segmentDataStart ?? 0) + cue.clusterPosition
+        let cluster = await loadCluster(at: clusterOffset)
+        guard let cluster,
+              cluster.blocks.contains(where: { $0.trackNumber == cue.trackNumber && $0.isKeyframe }) else {
+            return nil
+        }
+        guard let remuxer = try? MKVRemuxer(info: head.info, timelineOffsetTicks: Int64(cluster.timestamp)) else {
+            return nil
+        }
+        head.remuxer = remuxer
+        head.initSegment = remuxer.initSegment()
+        self.head = head
+        fragments.removeAll(keepingCapacity: true)
+        cache.removeAll(keepingCapacity: true)
+        layout = nil
+        streamMkvStart = clusterOffset
+        mkvCursor = clusterOffset
+        guard await generateNextFragment(head: head) else { return nil }
+        return Double(cluster.timestamp) * Double(head.info.timestampScaleNs) / 1e9
+    }
+
+    private func cuePoint(
+        for seconds: Double,
+        head: inout Head
+    ) async -> (time: UInt64, clusterPosition: Int, trackNumber: UInt64)? {
+        if head.info.cuePoints.isEmpty {
+            guard let cuesOffset = head.info.cuesOffset else { return nil }
+            await realSource.prioritize(
+                fileIndex: fileIndex,
+                range: cuesOffset..<min(cuesOffset + 4 * 1024 * 1024, mkvLength)
+            )
+            var requiredSize: Int?
+            while !Task.isCancelled {
+                let available = await realSource.availability(fileIndex: fileIndex, offset: cuesOffset)
+                if available > 0 {
+                    let readSize = min(available, 4 * 1024 * 1024, mkvLength - cuesOffset)
+                    if let data = await realSource.read(fileIndex: fileIndex, offset: cuesOffset, length: readSize),
+                       let header = EBML.readHeader(data, offset: 0), header.id == EBMLID.cues.rawValue,
+                       let size = header.size {
+                        let totalSize = EBML.headerLength(header) + Int(size)
+                        requiredSize = totalSize
+                        if data.count >= totalSize {
+                            var info = head.info
+                            try? MatroskaParser.parseCues(
+                                data,
+                                dataOffset: EBML.headerLength(header),
+                                size: Int(size),
+                                into: &info
+                            )
+                            head.info = info
+                            self.head?.info = info
+                            break
+                        }
+                    }
+                }
+                if let requiredSize {
+                    await realSource.prioritize(
+                        fileIndex: fileIndex,
+                        range: cuesOffset..<min(cuesOffset + requiredSize, mkvLength)
+                    )
+                }
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+        let videoTrack = head.info.tracks.first { $0.trackType == 1 && $0.isEnabled && $0.isDefault }
+            ?? head.info.tracks.first { $0.trackType == 1 && $0.isEnabled }
+        guard let videoTrack else { return nil }
+        let videoCuePoints = head.info.cuePoints.filter { $0.trackNumber == videoTrack.number }
+        guard !videoCuePoints.isEmpty else { return nil }
+        let targetTicks = UInt64(seconds * 1e9 / Double(head.info.timestampScaleNs))
+        return videoCuePoints.last { $0.time <= targetTicks } ?? videoCuePoints.first
+    }
+
+    private func loadCluster(at offset: Int) async -> MKVCluster? {
+        await realSource.prioritize(
+            fileIndex: fileIndex,
+            range: offset..<min(offset + 4 * 1024 * 1024, mkvLength)
+        )
+        while !Task.isCancelled {
+            let available = await realSource.availability(fileIndex: fileIndex, offset: offset)
+            if available > 0 {
+                let readSize = min(available, 4 * 1024 * 1024, mkvLength - offset)
+                if let data = await realSource.read(fileIndex: fileIndex, offset: offset, length: readSize),
+                   let range = try? MatroskaParser.readClusterRange(bytes: data, offset: 0),
+                   range.elementEnd <= data.count {
+                    return try? MatroskaParser.parseCluster(bytes: range.bytes, segmentDataStart: 0)
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+        }
+        return nil
     }
 
     // MARK: - Head
@@ -167,6 +269,7 @@ public actor TransmuxStreamSource: TorrentStreamSource {
                     if head == nil {
                         head = Head(info: info, remuxer: remuxer, initSegment: initSegment)
                         mkvCursor = info.firstClusterOffset ?? 0
+                        streamMkvStart = mkvCursor
                         mkvLength = realLength
                         await maybePrecomputeLayout()
                     }

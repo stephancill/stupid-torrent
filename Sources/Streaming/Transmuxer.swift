@@ -11,7 +11,7 @@ public final class MKVRemuxer: @unchecked Sendable {
     private var states: [UInt64: TrackState] = [:]
     private var sequence = 0
 
-    public init(info: MatroskaInfo) throws {
+    public init(info: MatroskaInfo, timelineOffsetTicks: Int64 = 0) throws {
         self.info = info
         var tracks: [TransmuxTrack] = []
         var indexByMKVNumber: [UInt64: Int] = [:]
@@ -25,11 +25,11 @@ public final class MKVRemuxer: @unchecked Sendable {
         }
         for mkvTrack in selectedTracks {
             guard let codec = Self.codec(for: mkvTrack) else { continue }
-            // Per-track timescale. Video uses a standard 16,000 (AVAsset's duration computation
-            // mis-estimates with a coarse 1000-scale; timestamps map exactly since it's ×1000·16).
-            // Audio keeps the MKV tick scale (sample-rate conversion would re-introduce rounding
-            // drift on the frame durations).
-            let timescale = mkvTrack.trackType == 1 ? 16000 : Self.timescale(timestampScaleNs: info.timestampScaleNs)
+            // Per-track timescale. Video uses a standard 16,000; audio uses its sample rate so
+            // fixed-duration codec frames remain exact (AAC = 1024 samples).
+            let timescale = mkvTrack.trackType == 1
+                ? 16000
+                : Int((mkvTrack.samplingFrequency ?? 48000).rounded())
             var audioConfig: Data?
             if codec == .eac3, let privateData = mkvTrack.codecPrivate {
                 audioConfig = MP4Muxer.eac3Config(fromSyncframe: privateData)
@@ -53,11 +53,13 @@ public final class MKVRemuxer: @unchecked Sendable {
             )
             tracks.append(track)
             indexByMKVNumber[mkvTrack.number] = trackId
-            let baseTimescale = Self.timescale(timestampScaleNs: info.timestampScaleNs)
             states[mkvTrack.number] = TrackState(
                 timescale: timescale,
-                scale: Int64(timescale) / Int64(max(1, baseTimescale)),
-                mkvTrack: mkvTrack
+                mkvTrack: mkvTrack,
+                nextDecodeTime: 0,
+                presentationTimeOffset: Int64(
+                    (Double(timelineOffsetTicks) * Double(info.timestampScaleNs) * Double(timescale) / 1e9).rounded()
+                )
             )
             trackId += 1
         }
@@ -207,25 +209,30 @@ public final class MKVRemuxer: @unchecked Sendable {
     /// the track timescale at emit time.
     private final class TrackState: @unchecked Sendable {
         let timescale: Int
-        /// Multiplier from MKV ticks to the track's timescale (video 16, audio 1).
-        private let scale: Int64
         let mkvTrack: MKVTrack
-        private var nextDecodeTime: Int64 = 0
+        let presentationTimeOffset: Int64
+        private var nextDecodeTime: Int64
         private var lastDelta: Int64?
         /// True once a negative decode-order PTS delta is seen (video with B-frames); such tracks
         /// need a constant frame duration for their DTS instead of PTS deltas.
         private var hasReorder: Bool?
 
-        init(timescale: Int, scale: Int64, mkvTrack: MKVTrack) {
+        init(timescale: Int, mkvTrack: MKVTrack, nextDecodeTime: Int64, presentationTimeOffset: Int64) {
             self.timescale = timescale
-            self.scale = scale
             self.mkvTrack = mkvTrack
+            self.nextDecodeTime = nextDecodeTime
+            self.presentationTimeOffset = presentationTimeOffset
         }
 
         private func defaultDurationTicks(info: MatroskaInfo) -> Int64? {
             guard let ns = mkvTrack.defaultDurationNs else { return nil }
-            let scale = Int64(max(1, info.timestampScaleNs))
-            return (Int64(ns) + scale / 2) / scale
+            return Int64((Double(ns) * Double(timescale) / 1e9).rounded())
+        }
+
+        private func presentationTicks(_ mkvTicks: Int64, info: MatroskaInfo) -> Int64 {
+            Int64(
+                (Double(mkvTicks) * Double(info.timestampScaleNs) * Double(timescale) / 1e9).rounded()
+            ) - presentationTimeOffset
         }
 
         func samples(from blocks: [MKVBlock], clusterTimestamp: UInt64, info: MatroskaInfo) throws -> [TransmuxSample] {
@@ -233,7 +240,11 @@ public final class MKVRemuxer: @unchecked Sendable {
             for block in blocks {
                 let expanded = MatroskaParser.expandLacing(block) ?? [block]
                 for frame in expanded {
-                    frames.append((Int64(clusterTimestamp) + frame.relativeTimestamp, frame.data, frame.isKeyframe))
+                    frames.append((
+                        presentationTicks(Int64(clusterTimestamp) + frame.relativeTimestamp, info: info),
+                        frame.data,
+                        frame.isKeyframe
+                    ))
                 }
             }
             guard !frames.isEmpty else { return [] }
@@ -248,12 +259,15 @@ public final class MKVRemuxer: @unchecked Sendable {
             }
             let isVideo = mkvTrack.trackType == 1
             let defaultDur = defaultDurationTicks(info: info)
+            let codecFrameDuration = mkvTrack.codecID == "A_AAC" ? Int64(1024) : nil
 
             var result: [TransmuxSample] = []
             result.reserveCapacity(frames.count)
             for (index, frame) in frames.enumerated() {
                 let duration: Int64
-                if hasReorder == true && isVideo {
+                if let codecFrameDuration {
+                    duration = codecFrameDuration
+                } else if hasReorder == true && isVideo {
                     // B-frame video: constant frame duration keeps DTS monotonic; composition
                     // offsets preserve the exact PTS. Prefer the track's declared duration.
                     duration = defaultDur ?? (lastDelta ?? 0)
@@ -269,9 +283,9 @@ public final class MKVRemuxer: @unchecked Sendable {
                 let isKeyframe = isVideo ? frame.isKeyframe : true
                 result.append(TransmuxSample(
                     data: frame.data,
-                    durationTicks: duration * scale,
-                    decodeTimeTicks: nextDecodeTime * scale,
-                    compositionOffsetTicks: (frame.pts - nextDecodeTime) * scale,
+                    durationTicks: duration,
+                    decodeTimeTicks: nextDecodeTime,
+                    compositionOffsetTicks: frame.pts - nextDecodeTime,
                     isKeyframe: isKeyframe
                 ))
                 nextDecodeTime += duration

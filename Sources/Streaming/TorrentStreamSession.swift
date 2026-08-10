@@ -10,27 +10,35 @@ public final class TorrentStreamSession: @unchecked Sendable {
     public let delegate: TorrentResourceLoaderDelegate
     public let asset: AVURLAsset
     private let transmuxSource: TransmuxStreamSource?
+    private let realSource: any TorrentStreamSource
+    private let fileIndex: Int
+    private let contentType: String
+    @MainActor private var seekDelegates: [TorrentResourceLoaderDelegate] = []
 
     public init(torrent: Torrent, fileIndex: Int) {
         let name = torrent.fileName(fileIndex)
-        let contentType = Torrent.contentType(forFileNamed: name)
+        let contentType = Torrent.contentType(forFileNamed: name) ?? "public.mpeg-4"
         let ext = (name as NSString).pathExtension.lowercased()
+        let realSource = TorrentStreamSourceAdapter(torrent: torrent)
         let source: any TorrentStreamSource
         if ext == "mkv" || ext == "mka" {
             let transmuxSource = TransmuxStreamSource(
-                realSource: TorrentStreamSourceAdapter(torrent: torrent),
+                realSource: realSource,
                 fileIndex: fileIndex
             )
             source = transmuxSource
             self.transmuxSource = transmuxSource
         } else {
-            source = TorrentStreamSourceAdapter(torrent: torrent)
+            source = realSource
             transmuxSource = nil
         }
+        self.realSource = realSource
+        self.fileIndex = fileIndex
+        self.contentType = contentType
         delegate = TorrentResourceLoaderDelegate(
             source: source,
             fileIndex: fileIndex,
-            contentType: contentType ?? "public.mpeg-4",
+            contentType: contentType,
             finishesAllToEndAtFrontier: ext == "mkv" || ext == "mka"
         )
         asset = delegate.makeAsset()
@@ -41,13 +49,46 @@ public final class TorrentStreamSession: @unchecked Sendable {
     }
 
     @MainActor public func makePlayerItem() async -> AVPlayerItem {
-        guard let duration = await declaredDurationSeconds() else {
+        let supportsFarSeeking = await transmuxSource?.supportsFarSeeking() ?? false
+        return await makePlayerItem(overridesDuration: supportsFarSeeking)
+    }
+
+    @MainActor private func makePlayerItem(overridesDuration: Bool) async -> AVPlayerItem {
+        guard overridesDuration, let duration = await declaredDurationSeconds() else {
             return AVPlayerItem(asset: asset)
         }
         return DeclaredDurationPlayerItem(
             asset: asset,
             declaredDuration: CMTime(seconds: duration, preferredTimescale: 600)
         )
+    }
+
+    @MainActor public func makePlayer() async -> AVPlayer {
+        let supportsFarSeeking = await transmuxSource?.supportsFarSeeking() ?? false
+        let item = await makePlayerItem(overridesDuration: supportsFarSeeking)
+        guard supportsFarSeeking else { return AVPlayer(playerItem: item) }
+        return TorrentSeekingPlayer(playerItem: item) { [self] seconds in
+            delegate.cancelAllLoading()
+            seekDelegates.forEach { $0.cancelAllLoading() }
+            seekDelegates.removeAll()
+            let seekSource = TransmuxStreamSource(realSource: realSource, fileIndex: fileIndex)
+            guard let timelineOffset = await seekSource.prepareForSeek(seconds: seconds),
+                  let duration = await declaredDurationSeconds() else { return nil }
+            let seekDelegate = TorrentResourceLoaderDelegate(
+                source: seekSource,
+                fileIndex: fileIndex,
+                contentType: contentType,
+                finishesAllToEndAtFrontier: true
+            )
+            seekDelegates.append(seekDelegate)
+            let seekAsset = seekDelegate.makeAsset()
+            guard (try? await seekAsset.load(.isPlayable)) == true else { return nil }
+            let item = DeclaredDurationPlayerItem(
+                asset: seekAsset,
+                declaredDuration: CMTime(seconds: duration, preferredTimescale: 600)
+            )
+            return PreparedTorrentSeek(item: item, timelineOffset: timelineOffset)
+        }
     }
 }
 
@@ -68,12 +109,204 @@ private final class DeclaredDurationPlayerItem: AVPlayerItem, @unchecked Sendabl
     }
 }
 
+struct PreparedTorrentSeek: @unchecked Sendable {
+    let item: AVPlayerItem
+    let timelineOffset: Double
+}
+
+private final class LockedSeekTime: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: CMTime?
+    private var timelineOffset = 0.0
+
+    func get() -> CMTime? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set(_ value: CMTime?) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+
+    func clear(ifMatching expected: CMTime) {
+        lock.lock()
+        if value == expected { value = nil }
+        lock.unlock()
+    }
+
+    func getTimelineOffset() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return timelineOffset
+    }
+
+    func setTimelineOffset(_ timelineOffset: Double) {
+        lock.lock()
+        self.timelineOffset = timelineOffset
+        lock.unlock()
+    }
+}
+
+@MainActor final class TorrentSeekingPlayer: AVPlayer, @unchecked Sendable {
+    typealias PrepareSeek = @MainActor @Sendable (Double) async -> PreparedTorrentSeek?
+
+    private var prepareSeek: PrepareSeek?
+    private var timelineOffset = 0.0
+    private var seekTask: Task<Void, Never>?
+    private let pendingSeekTime = LockedSeekTime()
+
+    init(playerItem: AVPlayerItem, prepareSeek: @escaping PrepareSeek) {
+        self.prepareSeek = prepareSeek
+        super.init()
+        replaceCurrentItem(with: playerItem)
+    }
+
+    override init() {
+        prepareSeek = nil
+        super.init()
+    }
+
+    required init?(coder: NSCoder) {
+        prepareSeek = nil
+        super.init()
+    }
+
+    nonisolated override func currentTime() -> CMTime {
+        if let pending = pendingSeekTime.get() { return pending }
+        return super.currentTime() + CMTime(
+            seconds: pendingSeekTime.getTimelineOffset(),
+            preferredTimescale: 600
+        )
+    }
+
+    nonisolated override func seek(to time: CMTime) {
+        seek(to: time, toleranceBefore: .positiveInfinity, toleranceAfter: .positiveInfinity)
+    }
+
+    nonisolated override func seek(
+        to time: CMTime,
+        toleranceBefore: CMTime,
+        toleranceAfter: CMTime
+    ) {
+        seek(to: time, toleranceBefore: toleranceBefore, toleranceAfter: toleranceAfter) { _ in }
+    }
+
+    nonisolated override func seek(to time: CMTime, completionHandler: @escaping @Sendable (Bool) -> Void) {
+        seek(
+            to: time,
+            toleranceBefore: .positiveInfinity,
+            toleranceAfter: .positiveInfinity,
+            completionHandler: completionHandler
+        )
+    }
+
+    nonisolated override func seek(
+        to time: CMTime,
+        toleranceBefore: CMTime,
+        toleranceAfter: CMTime,
+        completionHandler: @escaping @Sendable (Bool) -> Void
+    ) {
+        Task { @MainActor [weak self] in
+            await self?.handleSeek(
+                to: time,
+                toleranceBefore: toleranceBefore,
+                toleranceAfter: toleranceAfter,
+                completionHandler: completionHandler
+            )
+        }
+    }
+
+    private func handleSeek(
+        to time: CMTime,
+        toleranceBefore: CMTime,
+        toleranceAfter: CMTime,
+        completionHandler: @escaping @Sendable (Bool) -> Void
+    ) async {
+        let seconds = CMTimeGetSeconds(time)
+        guard seconds.isFinite, seconds >= 0 else {
+            performSeek(
+                to: time,
+                toleranceBefore: toleranceBefore,
+                toleranceAfter: toleranceAfter,
+                completionHandler: completionHandler
+            )
+            return
+        }
+
+        let localSeconds = seconds - timelineOffset
+        let localDuration = if let asset = currentItem?.asset,
+                               let duration = try? await asset.load(.duration) {
+            CMTimeGetSeconds(duration)
+        } else {
+            0.0
+        }
+        if localSeconds >= 0, localSeconds <= localDuration {
+            performSeek(
+                to: CMTime(seconds: localSeconds, preferredTimescale: 600),
+                toleranceBefore: toleranceBefore,
+                toleranceAfter: toleranceAfter,
+                completionHandler: completionHandler
+            )
+            return
+        }
+
+        seekTask?.cancel()
+        let shouldResume = rate != 0
+        pendingSeekTime.set(time)
+        pause()
+        currentItem?.asset.cancelLoading()
+        seekTask = Task { @MainActor [weak self] in
+            guard let self, let prepareSeek, let prepared = await prepareSeek(seconds), !Task.isCancelled else {
+                self?.pendingSeekTime.clear(ifMatching: time)
+                completionHandler(false)
+                return
+            }
+            let resumeAfterSeek = shouldResume || rate != 0
+            timelineOffset = prepared.timelineOffset
+            pendingSeekTime.setTimelineOffset(prepared.timelineOffset)
+            replaceCurrentItem(with: prepared.item)
+            pendingSeekTime.set(nil)
+            let translatedTime = CMTime(
+                seconds: max(0, seconds - prepared.timelineOffset),
+                preferredTimescale: 600
+            )
+            performSeek(
+                to: translatedTime,
+                toleranceBefore: toleranceBefore,
+                toleranceAfter: toleranceAfter
+            ) { [weak self] finished in
+                if resumeAfterSeek { self?.play() }
+                completionHandler(finished)
+            }
+        }
+    }
+
+    private func performSeek(
+        to time: CMTime,
+        toleranceBefore: CMTime,
+        toleranceAfter: CMTime,
+        completionHandler: @escaping @Sendable (Bool) -> Void
+    ) {
+        super.seek(
+            to: time,
+            toleranceBefore: toleranceBefore,
+            toleranceAfter: toleranceAfter,
+            completionHandler: completionHandler
+        )
+    }
+}
+
 public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
     private let source: any TorrentStreamSource
     private let fileIndex: Int
     private let contentType: String
     private let finishesAllToEndAtFrontier: Bool
     private let queue = DispatchQueue(label: "stupid-torrent.stream")
+    private let taskLock = NSLock()
+    private var loadingTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
 
     public init(
         source: any TorrentStreamSource,
@@ -88,17 +321,25 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
     }
 
     public func makeAsset() -> AVURLAsset {
-        let url = URL(string: "stupidtorrent://local/\(fileIndex)")!
+        let url = URL(string: "stupidtorrent://local/\(fileIndex)?id=\(UUID().uuidString)")!
         let asset = AVURLAsset(url: url)
         asset.resourceLoader.setDelegate(self, queue: queue)
         return asset
+    }
+
+    public func cancelAllLoading() {
+        taskLock.lock()
+        let tasks = Array(loadingTasks.values)
+        loadingTasks.removeAll()
+        taskLock.unlock()
+        tasks.forEach { $0.cancel() }
     }
 
     public func resourceLoader(
         _ resourceLoader: AVAssetResourceLoader,
         shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
     ) -> Bool {
-        Task { await self.serve(loadingRequest) }
+        startServing(loadingRequest)
         return true
     }
 
@@ -106,8 +347,36 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
         _ resourceLoader: AVAssetResourceLoader,
         shouldWaitForRenewalOfRequestedResource renewalRequest: AVAssetResourceRenewalRequest
     ) -> Bool {
-        Task { await self.serve(renewalRequest) }
+        startServing(renewalRequest)
         return true
+    }
+
+    public func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        didCancel loadingRequest: AVAssetResourceLoadingRequest
+    ) {
+        let id = ObjectIdentifier(loadingRequest)
+        taskLock.lock()
+        let task = loadingTasks.removeValue(forKey: id)
+        taskLock.unlock()
+        task?.cancel()
+    }
+
+    private func startServing(_ request: AVAssetResourceLoadingRequest) {
+        let id = ObjectIdentifier(request)
+        let task = Task { [weak self] in
+            await self?.serve(request)
+            self?.removeLoadingTask(id: id)
+        }
+        taskLock.lock()
+        loadingTasks[id] = task
+        taskLock.unlock()
+    }
+
+    private func removeLoadingTask(id: ObjectIdentifier) {
+        taskLock.lock()
+        loadingTasks.removeValue(forKey: id)
+        taskLock.unlock()
     }
 
     private func serve(_ request: AVAssetResourceLoadingRequest) async {
@@ -132,9 +401,11 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
         let limit = allToEnd ? Int.max : requestedLength
         var offset = startOffset
         var served = 0
+        var nextYield = 4 * 1024 * 1024
 
         TorrentLog.log("stream req start=\(startOffset) len=\(requestedLength) allToEnd=\(allToEnd) fileLen=\(fileLength)")
         while true {
+            if Task.isCancelled { return }
             // Follow the player if it jumped its offset on its own.
             let current = Int(dataRequest.currentOffset)
             if current > offset { offset = current }
@@ -160,16 +431,12 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
                     TorrentLog.log("stream served \(data.count) bytes at \(offset)")
                     offset += data.count
                     served += data.count
+                    if allToEnd, served >= nextYield {
+                        try? await Task.sleep(for: .milliseconds(10))
+                        nextYield = served + 4 * 1024 * 1024
+                    }
                     continue
                 }
-            }
-            if Task.isCancelled {
-                request.finishLoading(with: NSError(
-                    domain: "stupid-torrent.stream",
-                    code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "stream cancelled"]
-                ))
-                return
             }
             if allToEnd {
                 // Finish once the source is exhausted (for the transmuxer's virtual file the
@@ -196,6 +463,7 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
             // Probe request (requestedLength == 0): give what's available; AVPlayer re-requests.
             break
         }
+        if Task.isCancelled { return }
         TorrentLog.log("stream finish start=\(startOffset) served=\(served) allToEnd=\(allToEnd)")
         request.finishLoading()
     }

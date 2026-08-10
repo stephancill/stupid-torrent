@@ -431,8 +431,7 @@ struct TorrentCLI {
             let streamTask = Task { await stream.run() }
 
             let session = TorrentStreamSession(torrent: stream, fileIndex: index)
-            let playerItem = await session.makePlayerItem()
-            let player = AVPlayer(playerItem: playerItem)
+            let player = await session.makePlayer()
             player.play()
 
             var maxTime: Double = 0

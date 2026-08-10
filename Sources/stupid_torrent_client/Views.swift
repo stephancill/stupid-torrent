@@ -411,21 +411,21 @@ private struct TorrentDetailMenu: View {
 
 struct PlayerView: View {
     let session: TorrentStreamSession
-    @State private var playerItem: AVPlayerItem?
+    @State private var player: AVPlayer?
 
     var body: some View {
         Group {
-            if let playerItem {
+            if let player {
                 #if os(iOS)
-                AVPlayerControllerRepresentable(playerItem: playerItem)
+                AVPlayerControllerRepresentable(player: player)
                     .ignoresSafeArea()
                 #else
-                VideoPlayerView(playerItem: playerItem)
+                VideoPlayerView(player: player)
                 #endif
             } else {
                 ProgressView()
                     .task {
-                        playerItem = await session.makePlayerItem()
+                        player = await session.makePlayer()
                     }
             }
         }
@@ -434,11 +434,10 @@ struct PlayerView: View {
 
 #if os(iOS)
 struct AVPlayerControllerRepresentable: UIViewControllerRepresentable {
-    let playerItem: AVPlayerItem
+    let player: AVPlayer
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         configureAudioSession()
-        let player = AVPlayer(playerItem: playerItem)
         let controller = AVPlayerViewController()
         controller.player = player
         // System PiP button appears automatically when supported and content allows it.
@@ -475,16 +474,13 @@ struct AVPlayerControllerRepresentable: UIViewControllerRepresentable {
 }
 #else
 struct VideoPlayerView: View {
-    let playerItem: AVPlayerItem
-    @State private var player: AVPlayer?
+    let player: AVPlayer
 
     var body: some View {
         VideoPlayer(player: player)
             .ignoresSafeArea()
             .onAppear {
-                let newPlayer = AVPlayer(playerItem: playerItem)
-                player = newPlayer
-                newPlayer.play()
+                player.play()
             }
     }
 }
