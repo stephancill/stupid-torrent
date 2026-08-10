@@ -412,19 +412,25 @@ private struct TorrentDetailMenu: View {
 struct PlayerView: View {
     let session: TorrentStreamSession
     @State private var player: AVPlayer?
+    @State private var usesSegmentedTimeline = false
 
     var body: some View {
         Group {
             if let player {
                 #if os(iOS)
-                AVPlayerControllerRepresentable(player: player)
-                    .ignoresSafeArea()
+                if usesSegmentedTimeline {
+                    SegmentedPlayerView(player: player)
+                } else {
+                    AVPlayerControllerRepresentable(player: player)
+                        .ignoresSafeArea()
+                }
                 #else
                 VideoPlayerView(player: player)
                 #endif
             } else {
                 ProgressView()
                     .task {
+                        usesSegmentedTimeline = await session.usesSegmentedTimeline()
                         player = await session.makePlayer()
                     }
             }
@@ -435,11 +441,13 @@ struct PlayerView: View {
 #if os(iOS)
 struct AVPlayerControllerRepresentable: UIViewControllerRepresentable {
     let player: AVPlayer
+    var showsPlaybackControls = true
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         configureAudioSession()
         let controller = AVPlayerViewController()
         controller.player = player
+        controller.showsPlaybackControls = showsPlaybackControls
         // System PiP button appears automatically when supported and content allows it.
         controller.allowsPictureInPicturePlayback = true
         let loadingIndicator = UIActivityIndicatorView(style: .large)
@@ -470,6 +478,120 @@ struct AVPlayerControllerRepresentable: UIViewControllerRepresentable {
         let audioSession = AVAudioSession.sharedInstance()
         try? audioSession.setCategory(.playback, mode: .moviePlayback)
         try? audioSession.setActive(true)
+    }
+}
+
+private struct SegmentedPlayerView: View {
+    let player: AVPlayer
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var playhead = 0.0
+    @State private var duration = 1.0
+    @State private var isPlaying = false
+    @State private var isScrubbing = false
+
+    var body: some View {
+        ZStack {
+            AVPlayerControllerRepresentable(player: player, showsPlaybackControls: false)
+                .ignoresSafeArea()
+
+            VStack {
+                HStack {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .frame(width: 44, height: 44)
+                    }
+                    .accessibilityLabel("Close")
+                    Spacer()
+                }
+                .padding(.horizontal)
+
+                Spacer()
+
+                VStack(spacing: 12) {
+                    HStack(spacing: 36) {
+                        Button {
+                            seek(to: playhead - 10)
+                        } label: {
+                            Image(systemName: "gobackward.10")
+                        }
+                        Button {
+                            if isPlaying {
+                                player.pause()
+                            } else {
+                                player.play()
+                            }
+                        } label: {
+                            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                                .font(.title2)
+                                .frame(width: 44, height: 44)
+                        }
+                        .accessibilityLabel(isPlaying ? "Pause" : "Play")
+                        Button {
+                            seek(to: playhead + 10)
+                        } label: {
+                            Image(systemName: "goforward.10")
+                        }
+                    }
+
+                    Slider(
+                        value: $playhead,
+                        in: 0...max(duration, 1),
+                        onEditingChanged: { editing in
+                            isScrubbing = editing
+                            if !editing { seek(to: playhead) }
+                        }
+                    )
+                    .accessibilityLabel("Current position")
+
+                    HStack {
+                        Text(formattedTime(playhead))
+                        Spacer()
+                        Text("-" + formattedTime(max(0, duration - playhead)))
+                    }
+                    .font(.caption.monospacedDigit())
+                }
+                .padding()
+                .background(.black.opacity(0.65))
+            }
+            .foregroundStyle(.white)
+        }
+        .background(.black)
+        .task {
+            while !Task.isCancelled {
+                if !isScrubbing {
+                    let current = CMTimeGetSeconds(player.currentTime())
+                    if current.isFinite { playhead = max(0, current) }
+                }
+                let itemDuration = CMTimeGetSeconds(player.currentItem?.duration ?? .invalid)
+                if itemDuration.isFinite, itemDuration > 0 { duration = itemDuration }
+                isPlaying = player.timeControlStatus == .playing
+                try? await Task.sleep(for: .milliseconds(200))
+            }
+        }
+    }
+
+    private func seek(to seconds: Double) {
+        let target = min(max(0, seconds), duration)
+        playhead = target
+        player.seek(
+            to: CMTime(seconds: target, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        )
+    }
+
+    private func formattedTime(_ seconds: Double) -> String {
+        let value = max(0, Int(seconds.rounded()))
+        let hours = value / 3600
+        let minutes = (value % 3600) / 60
+        let seconds = value % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%d:%02d", minutes, seconds)
     }
 }
 #else

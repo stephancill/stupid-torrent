@@ -291,6 +291,117 @@ actor FakeMKVSource: TorrentStreamSource {
         #expect(abs(CMTimeGetSeconds(player.currentTime()) - 25) < 0.1)
     }
 
+    @Test @MainActor func latestFarSeekSupersedesPendingSeek() async throws {
+        let data = try Fixtures.data(named: "mkv/long30.mkv")
+        let source = FakeMKVSource(data)
+        await source.verify(0..<300 * 1024)
+        let transmux = TransmuxStreamSource(realSource: source, fileIndex: 0)
+        let delegate = TorrentResourceLoaderDelegate(
+            source: transmux,
+            fileIndex: 0,
+            contentType: "public.mpeg-4",
+            finishesAllToEndAtFrontier: true
+        )
+        let asset = delegate.makeAsset()
+        _ = try await asset.load(.duration)
+        let duration = try MatroskaParser.parseHead(bytes: data).durationSeconds ?? 0
+        let item = DeclaredDurationPlayerItem(
+            asset: asset,
+            declaredDuration: CMTime(seconds: duration, preferredTimescale: 600)
+        )
+        var preparedTargets: [Double] = []
+        let player = TorrentSeekingPlayer(playerItem: item) { seconds in
+            preparedTargets.append(seconds)
+            if seconds == 25 {
+                do {
+                    try await Task.sleep(for: .seconds(2))
+                } catch {
+                    return nil
+                }
+            }
+            let seekItem = DeclaredDurationPlayerItem(
+                asset: delegate.makeAsset(),
+                declaredDuration: CMTime(seconds: duration, preferredTimescale: 600)
+            )
+            return PreparedTorrentSeek(item: seekItem, timelineOffset: seconds - 1)
+        }
+
+        player.play()
+        let firstSeek = Task { @MainActor in
+            await player.seek(
+                to: CMTime(seconds: 25, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+        }
+        for _ in 0..<20 {
+            if preparedTargets == [25] { break }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let secondSeek = Task { @MainActor in
+            await player.seek(
+                to: CMTime(seconds: 20, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+        }
+
+        _ = await secondSeek.value
+        _ = await firstSeek.value
+        try await Task.sleep(for: .milliseconds(200))
+
+        #expect(preparedTargets == [25, 20])
+        #expect(abs(CMTimeGetSeconds(player.currentTime()) - 20) < 0.1)
+        #expect(player.rate != 0)
+    }
+
+    @Test @MainActor func completedFarSeekDoesNotAbsorbNextSeek() async throws {
+        let data = try Fixtures.data(named: "mkv/long30.mkv")
+        let source = FakeMKVSource(data)
+        await source.verify(0..<300 * 1024)
+        let transmux = TransmuxStreamSource(realSource: source, fileIndex: 0)
+        let delegate = TorrentResourceLoaderDelegate(
+            source: transmux,
+            fileIndex: 0,
+            contentType: "public.mpeg-4",
+            finishesAllToEndAtFrontier: true
+        )
+        let asset = delegate.makeAsset()
+        _ = try await asset.load(.duration)
+        let duration = try MatroskaParser.parseHead(bytes: data).durationSeconds ?? 0
+        let item = DeclaredDurationPlayerItem(
+            asset: asset,
+            declaredDuration: CMTime(seconds: duration, preferredTimescale: 600)
+        )
+        var preparedTargets: [Double] = []
+        let player = TorrentSeekingPlayer(playerItem: item) { seconds in
+            preparedTargets.append(seconds)
+            return PreparedTorrentSeek(
+                item: DeclaredDurationPlayerItem(
+                    asset: delegate.makeAsset(),
+                    declaredDuration: CMTime(seconds: duration, preferredTimescale: 600)
+                ),
+                timelineOffset: seconds - 1
+            )
+        }
+
+        await player.seek(
+            to: CMTime(seconds: 25, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        )
+        try await Task.sleep(for: .milliseconds(100))
+        await player.seek(
+            to: CMTime(seconds: 28, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        )
+        try await Task.sleep(for: .milliseconds(100))
+
+        #expect(preparedTargets == [25, 28])
+        #expect(abs(CMTimeGetSeconds(player.currentTime()) - 28) < 0.1)
+    }
+
     @Test func precomputedLayoutIgnoresDroppedTracks() throws {
         let data = try Fixtures.data(named: "mkv/long30.mkv")
         let info = try MatroskaParser.parseHead(bytes: data)

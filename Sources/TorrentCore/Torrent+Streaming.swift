@@ -29,11 +29,14 @@ public extension Torrent {
         let isJump = pieces.lowerBound > progress
         if isJump {
             // Jumps (seek targets, moov tail) download first and move the sequential frontier
-            // so the in-order stream resumes from the target once the jump window drains.
+            // so the in-order stream resumes from the target once the jump window drains. Replace
+            // older stream windows so sequential seeks do not keep downloading obsolete targets.
             picker.cursor = pieces.lowerBound
+            picker.replacePriorities(with: pieces, level: 10)
+            return
         }
         for piece in pieces {
-            picker.setPriority(piece, level: isJump ? 10 : 0)
+            picker.setPriority(piece, level: 0)
         }
     }
 

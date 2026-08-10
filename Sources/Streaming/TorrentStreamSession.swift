@@ -90,6 +90,10 @@ public final class TorrentStreamSession: @unchecked Sendable {
             return PreparedTorrentSeek(item: item, timelineOffset: timelineOffset)
         }
     }
+
+    public func usesSegmentedTimeline() async -> Bool {
+        await transmuxSource?.supportsFarSeeking() ?? false
+    }
 }
 
 private final class DeclaredDurationPlayerItem: AVPlayerItem, @unchecked Sendable {
@@ -156,6 +160,8 @@ private final class LockedSeekTime: @unchecked Sendable {
     private var prepareSeek: PrepareSeek?
     private var timelineOffset = 0.0
     private var seekTask: Task<Void, Never>?
+    private var seekGeneration = 0
+    private var resumeAfterPendingSeek = false
     private let pendingSeekTime = LockedSeekTime()
 
     init(playerItem: AVPlayerItem, prepareSeek: @escaping PrepareSeek) {
@@ -236,39 +242,30 @@ private final class LockedSeekTime: @unchecked Sendable {
             return
         }
 
-        let localSeconds = seconds - timelineOffset
-        let localDuration = if let asset = currentItem?.asset,
-                               let duration = try? await asset.load(.duration) {
-            CMTimeGetSeconds(duration)
-        } else {
-            0.0
-        }
-        if localSeconds >= 0, localSeconds <= localDuration {
-            performSeek(
-                to: CMTime(seconds: localSeconds, preferredTimescale: 600),
-                toleranceBefore: toleranceBefore,
-                toleranceAfter: toleranceAfter,
-                completionHandler: completionHandler
-            )
-            return
-        }
-
+        seekGeneration += 1
+        let generation = seekGeneration
+        let hadPendingSeek = seekTask != nil || pendingSeekTime.get() != nil
+        resumeAfterPendingSeek = rate != 0 || (hadPendingSeek && resumeAfterPendingSeek)
         seekTask?.cancel()
-        let shouldResume = rate != 0
+        seekTask = nil
         pendingSeekTime.set(time)
+
         pause()
         currentItem?.asset.cancelLoading()
         seekTask = Task { @MainActor [weak self] in
-            guard let self, let prepareSeek, let prepared = await prepareSeek(seconds), !Task.isCancelled else {
-                self?.pendingSeekTime.clear(ifMatching: time)
+            guard let self, let prepareSeek, let prepared = await prepareSeek(seconds),
+                  !Task.isCancelled, generation == seekGeneration else {
+                if self?.seekGeneration == generation {
+                    self?.pendingSeekTime.clear(ifMatching: time)
+                    self?.seekTask = nil
+                    self?.resumeAfterPendingSeek = false
+                }
                 completionHandler(false)
                 return
             }
-            let resumeAfterSeek = shouldResume || rate != 0
             timelineOffset = prepared.timelineOffset
             pendingSeekTime.setTimelineOffset(prepared.timelineOffset)
             replaceCurrentItem(with: prepared.item)
-            pendingSeekTime.set(nil)
             let translatedTime = CMTime(
                 seconds: max(0, seconds - prepared.timelineOffset),
                 preferredTimescale: 600
@@ -278,8 +275,18 @@ private final class LockedSeekTime: @unchecked Sendable {
                 toleranceBefore: toleranceBefore,
                 toleranceAfter: toleranceAfter
             ) { [weak self] finished in
-                if resumeAfterSeek { self?.play() }
-                completionHandler(finished)
+                Task { @MainActor in
+                    guard let self, generation == self.seekGeneration else {
+                        completionHandler(false)
+                        return
+                    }
+                    self.pendingSeekTime.clear(ifMatching: time)
+                    let shouldResume = self.resumeAfterPendingSeek
+                    self.resumeAfterPendingSeek = false
+                    self.seekTask = nil
+                    if shouldResume { self.play() }
+                    completionHandler(finished)
+                }
             }
         }
     }

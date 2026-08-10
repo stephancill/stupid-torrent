@@ -227,6 +227,17 @@ extension Data {
         #expect(picker.priority[1] == nil)
         #expect(picker.nextPiece() == 0)
     }
+
+    @Test func replacingPrioritiesDropsEarlierSeekWindow() {
+        var picker = PiecePicker(pieceCount: 10, verified: Array(repeating: false, count: 10))
+        picker.setPriority(2, level: 0)
+        picker.setPriority(3, level: 10)
+
+        picker.replacePriorities(with: 7..<9, level: 10)
+
+        #expect(picker.priority == [7: 10, 8: 10])
+        #expect(picker.nextPiece() == 7)
+    }
 }
 
 @Suite struct MetainfoTests {

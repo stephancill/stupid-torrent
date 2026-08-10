@@ -57,6 +57,13 @@ public struct PiecePicker: Sendable {
         priority[piece] = max(priority[piece] ?? 0, level)
     }
 
+    public mutating func replacePriorities(with pieces: Range<Int>, level: Int) {
+        priority.removeAll(keepingCapacity: true)
+        for piece in pieces where !verified[piece] {
+            priority[piece] = level
+        }
+    }
+
     public mutating func markRequested(_ piece: Int) {
         requested[piece] = true
     }
