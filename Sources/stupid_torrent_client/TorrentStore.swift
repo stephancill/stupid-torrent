@@ -129,6 +129,15 @@ final class TorrentStore {
         Task { try? await add(metainfo: metainfo, persist: true) }
     }
 
+    /// The per-torrent data directory under `downloads/`. Named `<display name> <hash-prefix>` so
+    /// each torrent owns a unique folder (files and the resume sidecar live inside it) and
+    /// same-named torrents cannot collide.
+    private func torrentDirectory(for metainfo: Metainfo) -> URL {
+        let name = metainfo.displayName.replacingOccurrences(of: "/", with: "-")
+        let prefix = metainfo.infoHash.hexString.prefix(8)
+        return downloadsURL.appendingPathComponent("\(name) \(prefix)", isDirectory: true)
+    }
+
     private func add(metainfo: Metainfo, persist: Bool, injectedPeer: PeerAddress? = nil) async throws {
         guard !items.contains(where: { $0.id == metainfo.infoHash.hexString }) else {
             throw TorrentStoreError.alreadyAdded
@@ -141,14 +150,15 @@ final class TorrentStore {
             addedDates[key] = .now
             saveDates()
         }
-        let torrent = Torrent(directory: downloadsURL, metainfo: metainfo, startPaused: pausedIDs.contains(key))
+        let directory = torrentDirectory(for: metainfo)
+        let torrent = Torrent(directory: directory, metainfo: metainfo, startPaused: pausedIDs.contains(key))
         if let injectedPeer {
             // The metadata-serving peer is a verified-reachable seeder; feed it straight into the
             // download instead of re-discovering the (mostly-dead) swarm.
             await torrent.addPeer(host: injectedPeer.host, port: injectedPeer.port)
         }
         let verifiedCount = Storage.loadVerifiedCount(
-            directory: downloadsURL,
+            directory: directory,
             infoHash: metainfo.infoHash,
             pieceCount: metainfo.pieceCount
         )
@@ -189,15 +199,9 @@ final class TorrentStore {
                 break
             }
         }
-        // Also remove the downloaded data and the resume sidecar so nothing is orphaned.
-        for file in item.metainfo.files {
-            var fileURL = downloadsURL
-            for component in file.pathComponents {
-                fileURL.appendPathComponent(component)
-            }
-            try? FileManager.default.removeItem(at: fileURL)
-        }
-        try? FileManager.default.removeItem(at: downloadsURL.appendingPathComponent(".\(item.id).verified"))
+        // Also remove the per-torrent data directory (files + resume sidecar live inside it) so
+        // nothing is orphaned.
+        try? FileManager.default.removeItem(at: torrentDirectory(for: item.metainfo))
     }
 
     /// Pauses/resumes a torrent and persists the paused state so it survives a relaunch.

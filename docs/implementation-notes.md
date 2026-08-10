@@ -4,7 +4,11 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
-### 2026-08-09 — Fix: far seeks on partially downloaded MKVs no longer wait for sequential arrival
+### 2026-08-10 — Feat: group each torrent's files in its own directory under Downloads
+
+Each torrent's data now lives in `Documents/downloads/<display name> <8-char hash prefix>/` instead of being written flat into `Documents/downloads/` (multi-file torrents were previously only grouped by their internal `file.pathString` structure, so two torrents sharing a filename collided). `TorrentStore` gained `torrentDirectory(for:)` (sanitized display name + hash prefix for uniqueness); `add(metainfo:)` passes it to `Torrent(directory:)` and `Storage.loadVerifiedCount`, and `remove(_:)` deletes the whole per-torrent directory (data + `.verified` sidecar) instead of reconstructing file URLs. The engine needed no changes — `Storage` already scopes files and the resume sidecar under its `directory` (`Storage.swift:26,116`). Note: existing downloads at the old flat layout are not migrated (early-stage dev app; they will just re-download).
+
+
 
 A seek beyond the downloaded frontier of a partial MKV answered the loader's bounded request with nothing and AVPlayer reverted to the buffered position, even as the seek target's pieces downloaded. Two changes:
 
