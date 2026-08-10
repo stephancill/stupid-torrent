@@ -1,8 +1,25 @@
 import Testing
 import Foundation
 import AVFoundation
-import Streaming
+@testable import Streaming
 import TorrentTestingSupport
+
+private final class DeclaredDurationPlayerItem: AVPlayerItem, @unchecked Sendable {
+    private let declaredDuration: CMTime
+
+    init(asset: AVAsset, declaredDuration: CMTime) {
+        self.declaredDuration = declaredDuration
+        super.init(asset: asset, automaticallyLoadedAssetKeys: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var duration: CMTime {
+        declaredDuration
+    }
+}
 
 /// Controllable `TorrentStreamSource` whose verified ranges are revealed incrementally.
 actor FakeMKVSource: TorrentStreamSource {
@@ -173,4 +190,60 @@ actor FakeMKVSource: TorrentStreamSource {
             Issue.record("read at far seek target returned nil")
         }
     }
+
+    @Test @MainActor func partialDurationProbeFinishesAtCurrentFrontier() async throws {
+        let data = try Fixtures.data(named: "mkv/long30.mkv")
+        let source = FakeMKVSource(data)
+        await source.verify(0..<300 * 1024)
+        let transmux = TransmuxStreamSource(realSource: source, fileIndex: 0)
+        let delegate = TorrentResourceLoaderDelegate(
+            source: transmux,
+            fileIndex: 0,
+            contentType: "public.mpeg-4",
+            finishesAllToEndAtFrontier: true
+        )
+        let asset = delegate.makeAsset()
+        let clock = ContinuousClock()
+        let started = clock.now
+        let duration = try await asset.load(.duration)
+        let declaredDuration = try MatroskaParser.parseHead(bytes: data).durationSeconds ?? 0
+        let item = DeclaredDurationPlayerItem(
+            asset: asset,
+            declaredDuration: CMTime(seconds: declaredDuration, preferredTimescale: 600)
+        )
+
+        #expect(CMTimeGetSeconds(duration) > 0)
+        #expect(started.duration(to: clock.now) < .seconds(2))
+        #expect(abs(CMTimeGetSeconds(item.duration) - declaredDuration) < 0.01)
+    }
+
+    @Test func precomputedLayoutIgnoresDroppedTracks() throws {
+        let data = try Fixtures.data(named: "mkv/long30.mkv")
+        let info = try MatroskaParser.parseHead(bytes: data)
+        let remuxer = try MKVRemuxer(info: info)
+        let keptTrack = info.tracks.first(where: \.isTransmuxable)!.number
+        let kept = MatroskaParser.MKVClusterTrackLayout(
+            sampleCount: 2,
+            mdatSize: 200,
+            firstPTS: 0,
+            lastPTS: 40,
+            lastDelta: 40
+        )
+        let dropped = MatroskaParser.MKVClusterTrackLayout(
+            sampleCount: 10,
+            mdatSize: 1_000,
+            firstPTS: 0,
+            lastPTS: 90,
+            lastDelta: 10
+        )
+        let mixed = MatroskaParser.MKVClusterLayout(
+            timestamp: 0,
+            tracks: [keptTrack: kept, 999: dropped]
+        )
+        let droppedOnly = MatroskaParser.MKVClusterLayout(timestamp: 0, tracks: [999: dropped])
+
+        #expect(remuxer.fragmentSizeForKeptTracks(mixed) == 8 + 16 + 64 + 32 + 8 + 200)
+        #expect(remuxer.fragmentSizeForKeptTracks(droppedOnly) == nil)
+    }
+
 }

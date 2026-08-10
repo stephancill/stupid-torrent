@@ -4,6 +4,23 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-10 — Fix: prevent overlapping MKV audio tracks
+
+The MTP MKV has three AAC tracks: the default 5.1 movie mix and two non-default stereo commentary tracks. `MKVRemuxer` previously emitted every supported audio track as an independently enabled MP4 track without an alternate group, so AVFoundation mixed all three during playback. The remuxer now carries one enabled, supported track per media type, preferring Matroska's `FlagDefault` track and otherwise the first eligible track. This intentionally omits alternate audio tracks because the app does not yet provide an audio-track selector.
+
+Added `selectsOnlyDefaultAudioTrack`, covering disabled/default/non-default selection. The real MTP `stream-test` now reports `audioTracks=1` while retaining the six-channel default selected by the parser. Full suite: 66 tests green; `xtool dev build` green.
+
+### 2026-08-10 — Fix: prompt partial-MKV startup with the declared movie duration
+
+AVFoundation derives fragmented-MP4 duration from the fragments it can currently read, so a partial MKV's raw `AVAsset.duration` only covers the downloaded prefix and its all-to-end duration probe previously waited at the verification frontier. Header mechanisms (`mehd`, nonzero track durations, and `sidx`) do not change that behavior.
+
+- MKV/MKA all-to-end loader requests now finish after serving the current readable frontier, allowing AVFoundation to complete its probe and re-request data later. Raw MP4 behavior is unchanged, and bounded far-seek requests still wait for their target bytes.
+- `TorrentStreamSession.makePlayerItem()` reads the duration already declared in the Matroska head and returns an `AVPlayerItem` that exposes it to native player controls. The app and `stream-play` now use this item, so the timeline shows the full movie duration even while the asset itself only sees the verified prefix.
+- Complete-file layout and `sidx` calculations now exclude dropped tracks. The MTP file contains subtitle-only clusters; advertising those as fMP4 fragments caused generation to return empty bytes and trapped the loader at the first such cluster. Empty source reads are also rejected defensively.
+- The disproven experimental `mehd` changes were removed. The CLI `stream-test` now prints raw asset and player-item durations separately.
+
+Verified with the loader-path `long30.mkv` regression: the partial duration probe completes in about 0.5 s (asserted below 2 s), reports readable media, and the player item reports the declared 30.023 s while `farSeekServesOnceTargetVerifies` remains green. The real MTP harness reports `PLAYER ITEM: duration=6459.1967s`; its dual-torrent raw asset duration remains unstable (`37.871s` in the final run), so it is not used for player UI. Full suite remains green; `xtool dev build` green.
+
 ### 2026-08-10 — Feat: group each torrent's files in its own directory under Downloads
 
 Each torrent's data now lives in `Documents/downloads/<display name> <8-char hash prefix>/` instead of being written flat into `Documents/downloads/` (multi-file torrents were previously only grouped by their internal `file.pathString` structure, so two torrents sharing a filename collided). `TorrentStore` gained `torrentDirectory(for:)` (sanitized display name + hash prefix for uniqueness); `add(metainfo:)` passes it to `Torrent(directory:)` and `Storage.loadVerifiedCount`, and `remove(_:)` deletes the whole per-torrent directory (data + `.verified` sidecar) instead of reconstructing file URLs. The engine needed no changes — `Storage` already scopes files and the resume sidecar under its `directory` (`Storage.swift:26,116`). Note: existing downloads at the old flat layout are not migrated (early-stage dev app; they will just re-download).
@@ -762,5 +779,3 @@ A fresh-install app resolve timed out at 90s on the marginal Backrooms swarm whi
 3. **DHT node warm-up at app launch** (`DHTNode.warmUp()` called in `stupid_torrent_clientApp.init`): bootstraps the shared node's routing table in the background, so the first magnet resolve doesn't pay a cold 8s bootstrap inline and queries a warm table (also starts accumulating the live peer store immediately).
 
 **Verification**: cold-cache CLI resolve x3 all succeed (21.4s first, then 3.3s/3.0s as caches warm); 53 tests green. Simulator: at launch the node is already live (`DHT: announce … to 8 nodes`, warm-up ran), and adding the Cosmos Laundromat magnet resolves and persists within ~20s (sweep-cancelled `CancellationError`s confirm a peer won; `.torrent` saved; idle timer held disabled while downloading).
-
-

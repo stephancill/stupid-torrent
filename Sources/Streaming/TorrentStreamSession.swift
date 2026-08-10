@@ -9,6 +9,7 @@ import TorrentCore
 public final class TorrentStreamSession: @unchecked Sendable {
     public let delegate: TorrentResourceLoaderDelegate
     public let asset: AVURLAsset
+    private let transmuxSource: TransmuxStreamSource?
 
     public init(torrent: Torrent, fileIndex: Int) {
         let name = torrent.fileName(fileIndex)
@@ -16,16 +17,54 @@ public final class TorrentStreamSession: @unchecked Sendable {
         let ext = (name as NSString).pathExtension.lowercased()
         let source: any TorrentStreamSource
         if ext == "mkv" || ext == "mka" {
-            source = TransmuxStreamSource(realSource: TorrentStreamSourceAdapter(torrent: torrent), fileIndex: fileIndex)
+            let transmuxSource = TransmuxStreamSource(
+                realSource: TorrentStreamSourceAdapter(torrent: torrent),
+                fileIndex: fileIndex
+            )
+            source = transmuxSource
+            self.transmuxSource = transmuxSource
         } else {
             source = TorrentStreamSourceAdapter(torrent: torrent)
+            transmuxSource = nil
         }
         delegate = TorrentResourceLoaderDelegate(
             source: source,
             fileIndex: fileIndex,
-            contentType: contentType ?? "public.mpeg-4"
+            contentType: contentType ?? "public.mpeg-4",
+            finishesAllToEndAtFrontier: ext == "mkv" || ext == "mka"
         )
         asset = delegate.makeAsset()
+    }
+
+    private func declaredDurationSeconds() async -> Double? {
+        await transmuxSource?.declaredDurationSeconds()
+    }
+
+    @MainActor public func makePlayerItem() async -> AVPlayerItem {
+        guard let duration = await declaredDurationSeconds() else {
+            return AVPlayerItem(asset: asset)
+        }
+        return DeclaredDurationPlayerItem(
+            asset: asset,
+            declaredDuration: CMTime(seconds: duration, preferredTimescale: 600)
+        )
+    }
+}
+
+private final class DeclaredDurationPlayerItem: AVPlayerItem, @unchecked Sendable {
+    private let declaredDuration: CMTime
+
+    init(asset: AVAsset, declaredDuration: CMTime) {
+        self.declaredDuration = declaredDuration
+        super.init(asset: asset, automaticallyLoadedAssetKeys: nil)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override var duration: CMTime {
+        declaredDuration
     }
 }
 
@@ -33,12 +72,19 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
     private let source: any TorrentStreamSource
     private let fileIndex: Int
     private let contentType: String
+    private let finishesAllToEndAtFrontier: Bool
     private let queue = DispatchQueue(label: "stupid-torrent.stream")
 
-    public init(source: any TorrentStreamSource, fileIndex: Int, contentType: String) {
+    public init(
+        source: any TorrentStreamSource,
+        fileIndex: Int,
+        contentType: String,
+        finishesAllToEndAtFrontier: Bool = false
+    ) {
         self.source = source
         self.fileIndex = fileIndex
         self.contentType = contentType
+        self.finishesAllToEndAtFrontier = finishesAllToEndAtFrontier
     }
 
     public func makeAsset() -> AVURLAsset {
@@ -109,7 +155,7 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
             if available > 0 {
                 let length = min(available, maxChunk, limit - served)
                 guard length > 0 else { break }
-                if let data = await source.read(fileIndex: fileIndex, offset: offset, length: length) {
+                if let data = await source.read(fileIndex: fileIndex, offset: offset, length: length), !data.isEmpty {
                     dataRequest.respond(with: data)
                     TorrentLog.log("stream served \(data.count) bytes at \(offset)")
                     offset += data.count
@@ -129,6 +175,9 @@ public final class TorrentResourceLoaderDelegate: NSObject, AVAssetResourceLoade
                 // Finish once the source is exhausted (for the transmuxer's virtual file the
                 // content length is an estimate, so EOF must come from the source itself).
                 if await source.reachesEOF(fileIndex: fileIndex, offset: offset) {
+                    break
+                }
+                if finishesAllToEndAtFrontier, served > 0 {
                     break
                 }
                 try? await Task.sleep(for: .milliseconds(200))

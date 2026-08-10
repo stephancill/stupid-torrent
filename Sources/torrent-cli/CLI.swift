@@ -350,8 +350,12 @@ struct TorrentCLI {
                 }
                 let seconds = CMTimeGetSeconds(duration)
                 let playable = (try? await session.asset.load(.isPlayable)) ?? false
-                print("ASSET: duration=\(seconds)s playable=\(playable)")
-                if seconds > 0 {
+                let audioTracks = (try? await session.asset.loadTracks(withMediaType: .audio)) ?? []
+                let playerItem = await session.makePlayerItem()
+                let playerSeconds = CMTimeGetSeconds(playerItem.duration)
+                print("ASSET: duration=\(seconds)s playable=\(playable) audioTracks=\(audioTracks.count)")
+                print("PLAYER ITEM: duration=\(playerSeconds)s")
+                if playerSeconds > 0 {
                     print("STREAM OK: media loads and is playable before 100% download")
                 } else {
                     print("STREAM FAIL: duration is 0")
@@ -427,7 +431,8 @@ struct TorrentCLI {
             let streamTask = Task { await stream.run() }
 
             let session = TorrentStreamSession(torrent: stream, fileIndex: index)
-            let player = AVPlayer(playerItem: AVPlayerItem(asset: session.asset))
+            let playerItem = await session.makePlayerItem()
+            let player = AVPlayer(playerItem: playerItem)
             player.play()
 
             var maxTime: Double = 0

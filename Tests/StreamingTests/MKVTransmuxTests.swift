@@ -1,7 +1,7 @@
 import Testing
 import Foundation
 import AVFoundation
-import Streaming
+@testable import Streaming
 import TorrentTestingSupport
 
 /// End-to-end hermetic gate for the MKV → fMP4 transmuxer: parse a fixture's head, remux every
@@ -128,5 +128,33 @@ import TorrentTestingSupport
         let sorted = psts.sorted()
         #expect(psts.count > 4)
         #expect(psts != sorted, "B-frame fixture should be out of presentation order")
+    }
+
+    @Test func selectsOnlyDefaultAudioTrack() throws {
+        var disabled = MKVTrack(number: 1, trackType: 2)
+        disabled.codecID = "A_AAC"
+        disabled.codecPrivate = Data([0x12, 0x10])
+        disabled.channels = 8
+        disabled.isDefault = true
+        disabled.isEnabled = false
+
+        var commentary = MKVTrack(number: 2, trackType: 2)
+        commentary.codecID = "A_AAC"
+        commentary.codecPrivate = Data([0x12, 0x10])
+        commentary.channels = 2
+        commentary.isDefault = false
+
+        var primary = MKVTrack(number: 3, trackType: 2)
+        primary.codecID = "A_AAC"
+        primary.codecPrivate = Data([0x12, 0x10])
+        primary.channels = 6
+        primary.isDefault = true
+
+        var info = MatroskaInfo()
+        info.tracks = [disabled, commentary, primary]
+        let remuxer = try MKVRemuxer(info: info)
+
+        #expect(remuxer.tracks.count == 1)
+        #expect(remuxer.tracks.first?.channels == 6)
     }
 }

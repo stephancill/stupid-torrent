@@ -16,7 +16,14 @@ public final class MKVRemuxer: @unchecked Sendable {
         var tracks: [TransmuxTrack] = []
         var indexByMKVNumber: [UInt64: Int] = [:]
         var trackId = 1
-        for mkvTrack in info.tracks where mkvTrack.isTransmuxable {
+        let supportedTracks = info.tracks.filter {
+            $0.isEnabled && $0.isTransmuxable && Self.codec(for: $0) != nil
+        }
+        let selectedTracks = [UInt64(1), UInt64(2)].compactMap { trackType in
+            supportedTracks.first { $0.trackType == trackType && $0.isDefault }
+                ?? supportedTracks.first { $0.trackType == trackType }
+        }
+        for mkvTrack in selectedTracks {
             guard let codec = Self.codec(for: mkvTrack) else { continue }
             // Per-track timescale. Video uses a standard 16,000 (AVAsset's duration computation
             // mis-estimates with a coarse 1000-scale; timestamps map exactly since it's ×1000·16).
@@ -86,11 +93,13 @@ public final class MKVRemuxer: @unchecked Sendable {
         while offset < mkvBytes.count {
             guard let range = try? MatroskaParser.readClusterRange(bytes: mkvBytes, offset: offset) else { break }
             guard let clusterLayout = try? MatroskaParser.scanClusterLayout(bytes: range.bytes) else { break }
-            let duration = Self.fragmentDuration(clusterLayout, info: info)
-            references.append(SidxReference(
-                size: Self.fragmentSize(clusterLayout),
-                durationTicks: Int64(Double(duration) * factor)
-            ))
+            if let size = fragmentSizeForKeptTracks(clusterLayout) {
+                let duration = fragmentDurationForKeptTracks(clusterLayout)
+                references.append(SidxReference(
+                    size: size,
+                    durationTicks: Int64(Double(duration) * factor)
+                ))
+            }
             offset = range.elementEnd
         }
         return references
@@ -117,10 +126,30 @@ public final class MKVRemuxer: @unchecked Sendable {
     /// Presentation span of a cluster's samples in MKV ticks (max end − min start), used for the
     /// sidx subsegment duration.
     public static func fragmentDuration(_ layout: MatroskaParser.MKVClusterLayout, info: MatroskaInfo) -> Int64 {
+        fragmentDuration(layout.tracks, info: info)
+    }
+
+    func fragmentSizeForKeptTracks(_ layout: MatroskaParser.MKVClusterLayout) -> Int? {
+        let tracks = layout.tracks.filter { indexByMKVNumber[$0.key] != nil }
+        guard !tracks.isEmpty else { return nil }
+        let moof = 8 + 16 + tracks.values.reduce(0) { $0 + (64 + 16 * $1.sampleCount) }
+        let mdat = 8 + tracks.values.reduce(0) { $0 + $1.mdatSize }
+        return moof + mdat
+    }
+
+    func fragmentDurationForKeptTracks(_ layout: MatroskaParser.MKVClusterLayout) -> Int64 {
+        let tracks = layout.tracks.filter { indexByMKVNumber[$0.key] != nil }
+        return Self.fragmentDuration(tracks, info: info)
+    }
+
+    private static func fragmentDuration(
+        _ tracks: [UInt64: MatroskaParser.MKVClusterTrackLayout],
+        info: MatroskaInfo
+    ) -> Int64 {
         let scale = Int64(max(1, info.timestampScaleNs))
         var minStart = Int64.max
         var maxEnd = Int64.min
-        for (trackNumber, track) in layout.tracks {
+        for (trackNumber, track) in tracks {
             let mkvTrack = info.track(trackNumber)
             let defaultDur: Int64
             if let ns = mkvTrack?.defaultDurationNs {

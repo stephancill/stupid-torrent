@@ -140,6 +140,10 @@ public actor TransmuxStreamSource: TorrentStreamSource {
         return mkvCursor >= mkvLength && mkvLength > 0
     }
 
+    func declaredDurationSeconds() async -> Double? {
+        await ensureHead(blocking: true)?.info.durationSeconds
+    }
+
     // MARK: - Head
 
     private func ensureHead(blocking: Bool) async -> Head? {
@@ -229,13 +233,15 @@ public actor TransmuxStreamSource: TorrentStreamSource {
             guard let range = try? MatroskaParser.readClusterRange(bytes: data, offset: 0) else { break }
             guard range.elementEnd > 0, range.elementEnd <= data.count else { break }
             guard let clusterLayout = try? MatroskaParser.scanClusterLayout(bytes: range.bytes) else { break }
-            let duration = MKVRemuxer.fragmentDuration(clusterLayout, info: head.info)
-            scans.append(LayoutScan(
-                size: MKVRemuxer.fragmentSize(clusterLayout),
-                durationTicks: Int64(Double(duration) * sidxFactor),
-                mkvStart: offset,
-                mkvEnd: offset + range.elementEnd
-            ))
+            if let size = head.remuxer.fragmentSizeForKeptTracks(clusterLayout) {
+                let duration = head.remuxer.fragmentDurationForKeptTracks(clusterLayout)
+                scans.append(LayoutScan(
+                    size: size,
+                    durationTicks: Int64(Double(duration) * sidxFactor),
+                    mkvStart: offset,
+                    mkvEnd: offset + range.elementEnd
+                ))
+            }
             offset += range.elementEnd
         }
         return scans
@@ -250,6 +256,9 @@ public actor TransmuxStreamSource: TorrentStreamSource {
         guard let data = await realSource.read(fileIndex: fileIndex, offset: plan.mkvStart, length: plan.mkvEnd - plan.mkvStart) else { return nil }
         guard let cluster = try? MatroskaParser.parseCluster(bytes: data, segmentDataStart: 0),
               let bytes = try? head.remuxer.consume(cluster) else { return nil }
+        if bytes.count != plan.size {
+            TorrentLog.log("transmux fragment size mismatch planned=\(plan.size) actual=\(bytes.count) mkv=\(plan.mkvStart)..<\(plan.mkvEnd)")
+        }
         if cache.count >= 64, let oldest = cache.keys.min() {
             cache.removeValue(forKey: oldest)
         }

@@ -411,24 +411,34 @@ private struct TorrentDetailMenu: View {
 
 struct PlayerView: View {
     let session: TorrentStreamSession
+    @State private var playerItem: AVPlayerItem?
 
     var body: some View {
-        #if os(iOS)
-        AVPlayerControllerRepresentable(session: session)
-            .ignoresSafeArea()
-        #else
-        VideoPlayerView(session: session)
-        #endif
+        Group {
+            if let playerItem {
+                #if os(iOS)
+                AVPlayerControllerRepresentable(playerItem: playerItem)
+                    .ignoresSafeArea()
+                #else
+                VideoPlayerView(playerItem: playerItem)
+                #endif
+            } else {
+                ProgressView()
+                    .task {
+                        playerItem = await session.makePlayerItem()
+                    }
+            }
+        }
     }
 }
 
 #if os(iOS)
 struct AVPlayerControllerRepresentable: UIViewControllerRepresentable {
-    let session: TorrentStreamSession
+    let playerItem: AVPlayerItem
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         configureAudioSession()
-        let player = AVPlayer(playerItem: AVPlayerItem(asset: session.asset))
+        let player = AVPlayer(playerItem: playerItem)
         let controller = AVPlayerViewController()
         controller.player = player
         // System PiP button appears automatically when supported and content allows it.
@@ -465,14 +475,14 @@ struct AVPlayerControllerRepresentable: UIViewControllerRepresentable {
 }
 #else
 struct VideoPlayerView: View {
-    let session: TorrentStreamSession
+    let playerItem: AVPlayerItem
     @State private var player: AVPlayer?
 
     var body: some View {
         VideoPlayer(player: player)
             .ignoresSafeArea()
             .onAppear {
-                let newPlayer = AVPlayer(playerItem: AVPlayerItem(asset: session.asset))
+                let newPlayer = AVPlayer(playerItem: playerItem)
                 player = newPlayer
                 newPlayer.play()
             }
