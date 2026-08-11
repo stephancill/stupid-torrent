@@ -4,6 +4,17 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-11 — Fix: player rotates to landscape, app stays portrait
+
+The player never rotated because xtool hardcodes `UISupportedInterfaceOrientations = [portrait]` for iPhone in its generated Info.plist (PackLib/Planner.swift), and the repo's Info.plist didn't override it, so the whole app was portrait-locked. The fix advertises landscape in the plist and gates it at runtime so only the presented player rotates.
+
+- `Info.plist`: added `UISupportedInterfaceOrientations` = Portrait + LandscapeLeft + LandscapeRight (xtool merges this over its portrait-only default).
+- `OrientationManager.swift` (new): `AppDelegate.application(_:supportedInterfaceOrientationsFor:)` returns `.portrait` normally and `.allButUpsideDown` while the player is presented (`OrientationLock.playerPresented`); iPad keeps `.all` to preserve its existing behavior. UIKit usage guarded by `#if os(iOS)` so the macOS build still compiles.
+- `stupid_torrent_clientApp.swift`: `@UIApplicationDelegateAdaptor(AppDelegate.self)` (iOS only).
+- `Views.swift`: `PlayerView` flips `OrientationLock.playerPresented` on appear/disappear, so the full-screen cover can rotate while the torrent list stays portrait. `AVPlayerViewController` on iOS 16+ rotates automatically once the presenting context supports landscape, so no player-specific orientation code is needed.
+
+Verification: `swift build` (macOS) and `xtool dev build` clean; the packed app's Info.plist now lists the three orientations. Not yet verified on-device (device locked during deploy; install succeeded).
+
 ### 2026-08-10 — Feat: preserve native AVKit controls for sparse MKV seeks
 
 The replacement-item MKV seek path decoded the correct target frame but could not give `AVPlayerViewController` a global progress clock: each decoder-safe fMP4 segment starts near local zero, and AVKit observes the current item rather than `TorrentSeekingPlayer.currentTime()`. Cue-indexed MKVs now use one static full-duration VOD HLS presentation over a loopback-only HTTP server. The playlist owns the global movie timeline, while every requested cue interval is independently transmuxed with local decode timestamps and preceded by `EXT-X-DISCONTINUITY`. One stable `AVURLAsset`/`AVPlayerItem` therefore survives every native scrub, preserving the native timeline, transport controls, fullscreen, and PiP behavior without downloading intervening MKV payload.

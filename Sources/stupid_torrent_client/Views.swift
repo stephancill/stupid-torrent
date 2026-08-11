@@ -438,7 +438,15 @@ struct PlayerView: View {
                     }
             }
         }
+        .onAppear {
+            #if os(iOS)
+            OrientationLock.playerPresented = true
+            #endif
+        }
         .onDisappear {
+            #if os(iOS)
+            OrientationLock.playerPresented = false
+            #endif
             player?.pause()
             player?.replaceCurrentItem(with: nil)
             session.stop()

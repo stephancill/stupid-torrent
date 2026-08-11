@@ -32,6 +32,12 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connects to peers and trackers on your local network for torrenting.</string>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
 	<key>CFBundleIconName</key>
 	<string>AppIcon</string>
 	<key>CFBundleIcons</key>
