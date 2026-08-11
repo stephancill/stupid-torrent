@@ -26,6 +26,7 @@ actor FakeMKVSource: TorrentStreamSource {
     let data: Data
     private var verified = Set<Int>()
     private(set) var prioritizeRanges: [Range<Int>] = []
+    private(set) var readRanges: [Range<Int>] = []
 
     init(_ data: Data) {
         self.data = data
@@ -43,6 +44,7 @@ actor FakeMKVSource: TorrentStreamSource {
     func read(fileIndex: Int, offset: Int, length: Int) async -> Data? {
         guard offset >= 0, offset + length <= data.count,
               (offset..<(offset + length)).allSatisfy({ verified.contains($0) }) else { return nil }
+        readRanges.append(offset..<offset + length)
         return data.subdata(in: offset..<(offset + length))
     }
 

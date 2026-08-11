@@ -116,6 +116,17 @@ public final class TCPSocket: @unchecked Sendable {
         return n
     }
 
+    public func isPeerClosed() -> Bool {
+        guard fd >= 0 else { return true }
+        var descriptor = pollfd(fd: fd, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0)
+        guard poll(&descriptor, 1, 0) > 0 else { return false }
+        if descriptor.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 { return true }
+        guard descriptor.revents & Int16(POLLIN) != 0 else { return false }
+        var byte: UInt8 = 0
+        let result = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
+        return result == 0
+    }
+
     public func close() {
         closeSocket()
     }
@@ -235,14 +246,14 @@ public final class TCPListener: @unchecked Sendable {
     private var fd: Int32
     public let port: UInt16
 
-    public init(port requestedPort: UInt16) throws {
+    public init(port requestedPort: UInt16, loopbackOnly: Bool = false) throws {
         let socketFD = socket(AF_INET, SOCK_STREAM, 0)
         guard socketFD >= 0 else { throw SocketError.create(errno) }
         var reuse: Int32 = 1
         setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_addr.s_addr = INADDR_ANY
+        addr.sin_addr.s_addr = loopbackOnly ? inet_addr("127.0.0.1") : INADDR_ANY
         addr.sin_port = requestedPort.bigEndian
         let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {

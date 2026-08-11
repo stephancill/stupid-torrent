@@ -2,7 +2,27 @@
 
 Date: 2026-08-10
 
-Status: MKV playback through AVPlayer works by transmuxing Matroska to fragmented MP4. Partial-file far seeking also works. Native `AVPlayerViewController` timeline controls do not work correctly with the segmented partial-MKV seek architecture, so seekable MKVs currently use app-owned SwiftUI controls over an `AVPlayerViewController` whose native controls are hidden.
+Status: Resolved on 2026-08-10. Cue-indexed MKVs now use a static full-duration VOD HLS presentation over loopback HTTP. One stable `AVPlayerItem` owns the global movie timeline, while each requested Matroska cue interval is independently transmuxed to a decoder-safe local-timeline fMP4 segment under `EXT-X-DISCONTINUITY`. Native `AVPlayerViewController` controls remain enabled and keep global time across sparse far seeks. The file row waits for and validates the prioritized Cues index; missing or invalid Cues disable the play button while the download is partial. Completed MKVs remain playable through the exact complete-file fMP4 path. The app-owned MKV player UI is no longer selected.
+
+## Resolution
+
+The conflict documented below was real for a single virtual fMP4 asset, but HLS supplies the missing public timeline mapping:
+
+1. Matroska Cues define the complete VOD playlist timeline and map segment URLs to sparse MKV byte ranges.
+2. The HLS playlist, not an individual fMP4 segment's timestamps, owns the native AVKit current time and declared duration.
+3. Every cue interval uses a fresh `MKVRemuxer`, so video/audio decode timestamps safely start at local zero.
+4. `EXT-X-DISCONTINUITY` tells AVFoundation that each segment's media timestamp sequence resets while playlist time remains continuous.
+5. The playlist, init segment, and on-demand `.m4s` resources are served from a loopback-only HTTP server; custom-scheme resource loading remains for non-HLS media and completed-MKV playback when Cues are unusable.
+
+Verification:
+
+- Sparse hermetic source: preparing the full playlist requires only the head and Cues; requesting a far segment does not read the intervening media interval.
+- Throttled production torrent: playback began from `long30.mkv` at 5/11 verified pieces, was advancing at 7/11, and a seek to 25 seconds resumed at 25.9 seconds after the sparse target pieces verified.
+- macOS AVFoundation: the HLS asset reports 30.023 seconds; two completed seeks retain the same item and advance afterward.
+- iOS 26.3 native AVKit: the MTP timeline displayed `1:47:39`; native scrubs reached `20:19` and `1:05:34`, decoded different frames, and continued past `1:05:59` without a clock reset. Reopening it while genuinely partial at 96/1016 pieces (9%) still selected native controls after the row's Cues capability check enabled the button.
+- Full suite: 77 tests across 16 suites.
+
+The remainder of this document preserves the failed single-fMP4 investigation and the constraints that led to the HLS solution.
 
 ## Problem statement
 

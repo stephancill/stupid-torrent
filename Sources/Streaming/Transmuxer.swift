@@ -6,6 +6,7 @@ import Foundation
 public final class MKVRemuxer: @unchecked Sendable {
     public let info: MatroskaInfo
     public let tracks: [TransmuxTrack]
+    public let selectedMKVTrackNumbers: [UInt64]
     /// MKV track number → index into `tracks`.
     private let indexByMKVNumber: [UInt64: Int]
     private var states: [UInt64: TrackState] = [:]
@@ -65,6 +66,7 @@ public final class MKVRemuxer: @unchecked Sendable {
         }
         self.tracks = tracks
         self.indexByMKVNumber = indexByMKVNumber
+        self.selectedMKVTrackNumbers = selectedTracks.map(\.number)
     }
 
     /// Whether at least one track was carried into the fMP4.

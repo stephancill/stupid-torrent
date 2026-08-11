@@ -363,6 +363,7 @@ struct TorrentCLI {
             } catch {
                 print("asset load error: \(error)")
             }
+            await session.stop()
             streamTask.cancel()
             await stream.stop()
         } catch {
@@ -463,6 +464,7 @@ struct TorrentCLI {
                 print(maxTime > 5 ? "STREAM-PLAY OK: played past 5s" : "STREAM-PLAY FAIL: stalled early")
             }
             player.pause()
+            await session.stop()
             streamTask.cancel()
             await stream.stop()
         } catch {

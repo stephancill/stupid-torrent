@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Streaming
 import TorrentCore
 
 @MainActor
@@ -17,6 +18,8 @@ final class TorrentItem: Identifiable, Hashable {
 
     private var statusTask: Task<Void, Never>?
     private var runTask: Task<Void, Never>?
+    private var playbackAvailability: [Int: Bool] = [:]
+    private var playbackAvailabilityTasks: [Int: Task<Void, Never>] = [:]
 
     init(torrent: Torrent, initialVerifiedCount: Int = 0, addedAt: Date = .now) {
         self.torrent = torrent
@@ -44,6 +47,31 @@ final class TorrentItem: Identifiable, Hashable {
 
     var isComplete: Bool { status?.isComplete ?? false }
 
+    func isPlaybackAvailable(fileIndex: Int) -> Bool {
+        let kind = Torrent.playbackKind(forFileNamed: metainfo.files[fileIndex].name)
+        guard kind != .none else { return false }
+        let ext = (metainfo.files[fileIndex].name as NSString).pathExtension.lowercased()
+        guard ext == "mkv" || ext == "mka" else { return true }
+        return isComplete || playbackAvailability[fileIndex] == true
+    }
+
+    func preparePlaybackAvailability(fileIndex: Int) {
+        guard metainfo.files.indices.contains(fileIndex), !isComplete,
+              playbackAvailability[fileIndex] == nil,
+              playbackAvailabilityTasks[fileIndex] == nil else { return }
+        let ext = (metainfo.files[fileIndex].name as NSString).pathExtension.lowercased()
+        guard ext == "mkv" || ext == "mka" else { return }
+        playbackAvailabilityTasks[fileIndex] = Task { [weak self, torrent] in
+            let available = await TorrentStreamSession.isPlaybackAvailable(
+                torrent: torrent,
+                fileIndex: fileIndex
+            )
+            guard !Task.isCancelled, let self else { return }
+            playbackAvailability[fileIndex] = available
+            playbackAvailabilityTasks[fileIndex] = nil
+        }
+    }
+
     func start() {
         guard statusTask == nil else { return }
         statusTask = Task { [weak self] in
@@ -64,6 +92,8 @@ final class TorrentItem: Identifiable, Hashable {
     func stop() {
         runTask?.cancel()
         statusTask?.cancel()
+        playbackAvailabilityTasks.values.forEach { $0.cancel() }
+        playbackAvailabilityTasks.removeAll()
         Task { await torrent.stop() }
         statusTask = nil
         runTask = nil

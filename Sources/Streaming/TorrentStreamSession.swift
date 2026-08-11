@@ -10,10 +10,14 @@ public final class TorrentStreamSession: @unchecked Sendable {
     public let delegate: TorrentResourceLoaderDelegate
     public let asset: AVURLAsset
     private let transmuxSource: TransmuxStreamSource?
+    private let hlsStream: MKVHLSStream?
     private let realSource: any TorrentStreamSource
     private let fileIndex: Int
-    private let contentType: String
-    @MainActor private var seekDelegates: [TorrentResourceLoaderDelegate] = []
+    @MainActor private var hlsServer: HLSLoopbackServer?
+    @MainActor private var hlsAsset: AVURLAsset?
+    @MainActor private var hlsUnavailable = false
+    @MainActor private var lifecycleGeneration = 0
+    @MainActor private var isStopped = false
 
     public init(torrent: Torrent, fileIndex: Int) {
         let name = torrent.fileName(fileIndex)
@@ -28,13 +32,14 @@ public final class TorrentStreamSession: @unchecked Sendable {
             )
             source = transmuxSource
             self.transmuxSource = transmuxSource
+            hlsStream = MKVHLSStream(source: realSource, fileIndex: fileIndex)
         } else {
             source = realSource
             transmuxSource = nil
+            hlsStream = nil
         }
         self.realSource = realSource
         self.fileIndex = fileIndex
-        self.contentType = contentType
         delegate = TorrentResourceLoaderDelegate(
             source: source,
             fileIndex: fileIndex,
@@ -49,6 +54,12 @@ public final class TorrentStreamSession: @unchecked Sendable {
     }
 
     @MainActor public func makePlayerItem() async -> AVPlayerItem {
+        if await prepareHLS(), let hlsAsset {
+            let item = AVPlayerItem(asset: hlsAsset)
+            item.preferredForwardBufferDuration = 12
+            return item
+        }
+        if Task.isCancelled || isStopped { return AVPlayerItem(asset: asset) }
         let supportsFarSeeking = await transmuxSource?.supportsFarSeeking() ?? false
         return await makePlayerItem(overridesDuration: supportsFarSeeking)
     }
@@ -64,35 +75,72 @@ public final class TorrentStreamSession: @unchecked Sendable {
     }
 
     @MainActor public func makePlayer() async -> AVPlayer {
-        let supportsFarSeeking = await transmuxSource?.supportsFarSeeking() ?? false
-        let item = await makePlayerItem(overridesDuration: supportsFarSeeking)
-        guard supportsFarSeeking else { return AVPlayer(playerItem: item) }
-        return TorrentSeekingPlayer(playerItem: item) { [self] seconds in
-            delegate.cancelAllLoading()
-            seekDelegates.forEach { $0.cancelAllLoading() }
-            seekDelegates.removeAll()
-            let seekSource = TransmuxStreamSource(realSource: realSource, fileIndex: fileIndex)
-            guard let timelineOffset = await seekSource.prepareForSeek(seconds: seconds),
-                  let duration = await declaredDurationSeconds() else { return nil }
-            let seekDelegate = TorrentResourceLoaderDelegate(
-                source: seekSource,
-                fileIndex: fileIndex,
-                contentType: contentType,
-                finishesAllToEndAtFrontier: true
-            )
-            seekDelegates.append(seekDelegate)
-            let seekAsset = seekDelegate.makeAsset()
-            guard (try? await seekAsset.load(.isPlayable)) == true else { return nil }
-            let item = DeclaredDurationPlayerItem(
-                asset: seekAsset,
-                declaredDuration: CMTime(seconds: duration, preferredTimescale: 600)
-            )
-            return PreparedTorrentSeek(item: item, timelineOffset: timelineOffset)
+        if await prepareHLS(), let hlsAsset {
+            let item = AVPlayerItem(asset: hlsAsset)
+            item.preferredForwardBufferDuration = 12
+            return AVPlayer(playerItem: item)
+        }
+        if Task.isCancelled || isStopped { return AVPlayer() }
+        if hlsStream != nil {
+            guard await sourceIsComplete() else { return AVPlayer() }
+            return AVPlayer(playerItem: AVPlayerItem(asset: asset))
+        }
+        return AVPlayer(playerItem: AVPlayerItem(asset: asset))
+    }
+
+    public static func isPlaybackAvailable(torrent: Torrent, fileIndex: Int) async -> Bool {
+        let name = torrent.fileName(fileIndex)
+        guard Torrent.playbackKind(forFileNamed: name) != .none else { return false }
+        let ext = (name as NSString).pathExtension.lowercased()
+        guard ext == "mkv" || ext == "mka" else { return true }
+
+        let source = TorrentStreamSourceAdapter(torrent: torrent)
+        let length = await source.fileLength(fileIndex: fileIndex)
+        guard length > 0 else { return false }
+        if await source.availability(fileIndex: fileIndex, offset: 0) >= length { return true }
+        do {
+            try await MKVHLSStream(source: source, fileIndex: fileIndex).prepare()
+            return true
+        } catch {
+            return false
         }
     }
 
-    public func usesSegmentedTimeline() async -> Bool {
-        await transmuxSource?.supportsFarSeeking() ?? false
+    @MainActor public func stop() {
+        lifecycleGeneration += 1
+        isStopped = true
+        delegate.cancelAllLoading()
+        hlsServer?.stop()
+        hlsServer = nil
+        hlsAsset = nil
+    }
+
+    @MainActor private func prepareHLS() async -> Bool {
+        if hlsAsset != nil { return true }
+        guard !hlsUnavailable, !isStopped, let hlsStream else { return false }
+        let generation = lifecycleGeneration
+        do {
+            try await hlsStream.prepare()
+            try Task.checkCancellation()
+            guard !isStopped, generation == lifecycleGeneration else {
+                throw CancellationError()
+            }
+            let server = try HLSLoopbackServer(stream: hlsStream)
+            server.start()
+            hlsServer = server
+            hlsAsset = AVURLAsset(url: server.playlistURL)
+            return true
+        } catch {
+            hlsUnavailable = true
+            TorrentLog.log("HLS preparation failed: \(error)")
+            return false
+        }
+    }
+
+    private func sourceIsComplete() async -> Bool {
+        let length = await realSource.fileLength(fileIndex: fileIndex)
+        guard length > 0 else { return false }
+        return await realSource.availability(fileIndex: fileIndex, offset: 0) >= length
     }
 }
 
