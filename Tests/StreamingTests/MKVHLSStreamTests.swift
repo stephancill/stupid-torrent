@@ -78,9 +78,8 @@ import TorrentTestingSupport
         )
         #expect(abs(CMTimeGetSeconds(player.currentTime()) - 20) < 0.2)
         player.play()
-        try await Task.sleep(for: .seconds(1))
+        #expect(await advancePlaying(player, beyond: 20.5, within: 3))
         player.pause()
-        #expect(CMTimeGetSeconds(player.currentTime()) > 20.5)
 
         await player.seek(
             to: CMTime(seconds: 8.5, preferredTimescale: 600),
@@ -90,9 +89,20 @@ import TorrentTestingSupport
         #expect(ObjectIdentifier(try #require(player.currentItem)) == itemID)
         #expect(abs(CMTimeGetSeconds(player.currentTime()) - 8.5) < 0.2)
         player.play()
-        try await Task.sleep(for: .seconds(1))
+        #expect(await advancePlaying(player, beyond: 9, within: 3))
         player.pause()
-        #expect(CMTimeGetSeconds(player.currentTime()) > 9)
+    }
+
+    /// Waits (up to `within` wall-clock seconds) for playback to advance past `beyond`. A fixed
+    /// sleep is load-sensitive: AVPlayer's segment-fetch + decoder startup eats into it under a
+    /// busy test host, so assert on reaching the target rather than on a wall-clock threshold.
+    private func advancePlaying(_ player: AVPlayer, beyond: Double, within: Double) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(within)
+        while ContinuousClock.now < deadline {
+            if CMTimeGetSeconds(player.currentTime()) > beyond { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return false
     }
 
     @Test func loopbackServerSupportsHeadAndByteRanges() async throws {

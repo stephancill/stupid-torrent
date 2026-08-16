@@ -444,7 +444,10 @@ struct TorrentCLI {
                 maxTime = max(maxTime, time)
                 if didSeek { postSeekMax = max(postSeekMax, time) }
                 let verified = await stream.verifiedCount
-                print("t=\(tick)s playhead=\(String(format: "%.1f", time))s verified=\(verified)/\(metainfo.pieceCount)")
+                let itemStatus = player.currentItem?.status ?? .unknown
+                let itemError = player.currentItem?.error?.localizedDescription ?? "nil"
+                let waiting = player.reasonForWaitingToPlay?.rawValue ?? "nil"
+                print("t=\(tick)s playhead=\(String(format: "%.1f", time))s verified=\(verified)/\(metainfo.pieceCount) itemStatus=\(itemStatus.rawValue) reason=\(waiting) err=\(itemError)")
                 if !didSeek, let seekTo, tick == 6 {
                     print("SEEKING to \(seekTo)s...")
                     await player.seek(to: CMTime(seconds: seekTo, preferredTimescale: 600))

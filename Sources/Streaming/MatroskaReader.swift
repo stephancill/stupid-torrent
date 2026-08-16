@@ -726,7 +726,9 @@ public enum MatroskaParser {
 
     /// Expands a laced block into its constituent frames (one sample per frame), distributing
     /// timestamps evenly across the block's duration. Returns nil if the block is not laced.
-    public static func expandLacing(_ block: MKVBlock) -> [MKVBlock]? {
+    /// Laced SimpleBlocks carry no `BlockDuration`, so when the block has no explicit duration the
+    /// caller passes the track's per-frame `frameDurationTicks` (in MKV ticks) to space the frames.
+    public static func expandLacing(_ block: MKVBlock, frameDurationTicks: Double = 0) -> [MKVBlock]? {
         guard block.lacing != .none else { return nil }
 
         var cursor = 0
@@ -775,20 +777,12 @@ public enum MatroskaParser {
             var sizes: [Int] = []
             var size = 0
             for i in 0..<(frameCount - 1) {
-                var value = 0
-                var width = 0
-                var byte: UInt8
-                repeat {
-                    guard cursor < payload.count else { return nil }
-                    byte = payload[payload.startIndex + cursor]
-                    cursor += 1
-                    value = (value << 7) | Int(byte & 0x7F)
-                    width += 1
-                } while byte & 0x80 == 0 && width < 4
+                guard let (value, width) = EBML.readVarInt(payload, offset: cursor) else { return nil }
+                cursor += width
                 if i == 0 {
-                    size = value
+                    size = Int(value)
                 } else {
-                    size = size + (value - (1 << (7 * width - 1)) - 1)
+                    size = size + Int(value) - (1 << (7 * width - 1)) + 1
                 }
                 sizes.append(size)
             }
@@ -810,17 +804,23 @@ public enum MatroskaParser {
         }
 
         guard frames.count == frameCount else { return nil }
-        let duration = block.explicitDurationTicks ?? 0
+        let frameDuration: Double
+        if let explicit = block.explicitDurationTicks, explicit > 0 {
+            frameDuration = Double(explicit) / Double(frameCount)
+        } else if frameDurationTicks > 0 {
+            frameDuration = frameDurationTicks
+        } else {
+            frameDuration = 0
+        }
         return frames.enumerated().map { index, frame in
-            let frameDuration = duration > 0 ? duration / UInt64(frameCount) : 0
-            let offset = duration > 0 ? Int64(frameDuration) * Int64(index) : 0
+            let offset = frameDuration > 0 ? Int64((frameDuration * Double(index)).rounded()) : 0
             return MKVBlock(
                 trackNumber: block.trackNumber,
                 relativeTimestamp: block.relativeTimestamp + offset,
                 isKeyframe: block.isKeyframe && index == 0,
                 lacing: .none,
                 data: frame,
-                explicitDurationTicks: duration > 0 ? frameDuration : nil
+                explicitDurationTicks: frameDuration > 0 ? UInt64(frameDuration.rounded()) : nil
             )
         }
     }

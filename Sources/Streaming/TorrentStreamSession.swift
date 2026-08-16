@@ -56,7 +56,7 @@ public final class TorrentStreamSession: @unchecked Sendable {
     @MainActor public func makePlayerItem() async -> AVPlayerItem {
         if await prepareHLS(), let hlsAsset {
             let item = AVPlayerItem(asset: hlsAsset)
-            item.preferredForwardBufferDuration = 12
+            item.preferredForwardBufferDuration = 60
             return item
         }
         if Task.isCancelled || isStopped { return AVPlayerItem(asset: asset) }
@@ -77,7 +77,7 @@ public final class TorrentStreamSession: @unchecked Sendable {
     @MainActor public func makePlayer() async -> AVPlayer {
         if await prepareHLS(), let hlsAsset {
             let item = AVPlayerItem(asset: hlsAsset)
-            item.preferredForwardBufferDuration = 12
+            item.preferredForwardBufferDuration = 60
             return AVPlayer(playerItem: item)
         }
         if Task.isCancelled || isStopped { return AVPlayer() }

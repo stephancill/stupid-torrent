@@ -4,6 +4,34 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-16 — Fix: HEVC 10-bit MKVs with laced AAC would not play (spinner forever)
+
+Reproduced "player opens, loading spinner never plays" on a 10-bit x265 WEBRip (Minions & Monsters) in the iOS simulator and via `torrent-cli stream-play`. The HLS server served the init + segments fine and AVPlayer reached `readyToPlay`, but the playhead froze at 0. Bisected with a small HEVC Main10 fixture (played) vs the real file's video-only extraction (played) vs the full file (stalled): the video and container were fine — the **audio track** was broken.
+
+Root cause: three bugs in the EBML-laced AAC path of the transmuxer, all in `MatroskaReader.expandLacing`/`Transmuxer.TrackState`:
+
+1. **Laced frames collapsed onto one PTS.** A laced block has no per-frame timestamps; frames are spaced by the track's `DefaultDuration`. `expandLacing` only used the block's explicit `BlockDuration`, so laced AAC frames all got the block's timestamp (observed as groups of 8 frames at one PTS).
+2. **EBML lacing size VINT width was decoded wrong.** The size-table bytes' width was keyed off the *last* byte's MSB (`while byte & 0x80 == 0`) instead of the *first* byte's leading-1 marker, so any size needing a multi-byte VINT (frames ≥ 128 B) was misread and the block fell back to a single concatenated frame.
+3. **Signed-delta offset off by two.** Subsequent frame sizes are signed VINT deltas; the code used `value - 2^(7w-1) - 1` instead of `value - (2^(7w-1) - 1)`, shifting every frame boundary by 2 B (frame sizes 42,41,45,... came out 42,39,41,...). The frames still "fit" the payload so ffprobe listed packets, but the AAC data was corrupt (`Prediction is not allowed in AAC-LC`, decoder errors).
+
+Fixes:
+- `expandLacing(_:frameDurationTicks:)` spaces laced frames by the track's per-frame default duration (MKV ticks) when the block has no explicit `BlockDuration`; `TrackState.samples` passes `defaultDurationNs / timestampScaleNs`.
+- The EBML lacing size table now decodes each VINT with the correct leading-1-marker width (via `EBML.readVarInt`) and the corrected signed-delta offset `+ 1`.
+
+Verified: the real WEBRip's segment 0 now yields 490 continuous AAC packets (was 98), zero PTS gaps, audio duration 10.45 s == video 10.34 s, and `ffmpeg` decodes the transmuxed audio with no errors. On the iOS 26.3 simulator the full file plays through native AVKit (playhead advanced 0.3 → 15.7 s, `timeControlStatus = playing`). Regression test `expandsEbmlLacedAACFrames` uses real laced blocks from that file (1-byte and multi-byte VINT size tables) and asserts frame boundaries + per-frame timestamps. 78 tests green.
+
+Also fixed during investigation (kept): `MKVHLSStream.readExact` re-asserts its byte-range priority every ~1 s while waiting so a deeper HLS forward buffer can't let far-ahead lookahead permanently starve the playhead's segment; HLS `preferredForwardBufferDuration` 12 s → 60 s; de-flaked `avFoundationLoadsGlobalTimelineAndSeeks`' load-sensitive wall-clock sleeps.
+
+### 2026-08-16 — Stream tuning for slow/bursty swarms (MKV HLS buffer depth)
+
+Diagnosed laggy MKV playback on the "How To with John Wilson S03" magnet (`a88f3ab4…`): the release is six ~2.1 GB MKVs (H.264 + E-AC-3, ~1.22 MB/s content bitrate) packed at **8 MiB pieces** with **Cues at each file's very end** (last piece, ~99.98%). Streaming serves only fully-verified pieces, so at the frontier each 8 MiB piece takes ~10-20 s to verify at the observed 0.3-0.8 MB/s swarm rate while holding only ~6.7 s of video, and the play button only enables once the tail Cues piece verifies. The direct remedies:
+
+- `TorrentStreamSession`: HLS `preferredForwardBufferDuration` raised 12 s → 60 s (both `makePlayerItem`/`makePlayer`), so AVPlayer prefetches more of the 2 s cue segments during download bursts instead of draining at each piece boundary.
+- `MKVHLSStream.readExact`: re-asserts the read's byte-range priority every ~1 s while waiting. A deeper forward buffer pipelines many concurrent segment reads, and a later far-ahead segment request classifies as a jump and `replacePriorities` wipes earlier requests — without re-assertion the playhead's own segment could starve permanently.
+- `MKVHLSStreamTests.avFoundationLoadsGlobalTimelineAndSeeks`: replaced the two load-sensitive fixed 1 s sleeps with a deadline poll (`advancePlaying`) asserting playhead advance within 3 s. The old `> 20.5` after a 1 s sleep flaked on busy test hosts (decode startup eats the wall clock), independent of the buffer change.
+
+Still open (not done): the fundamental mismatch is download rate (~0.4 MB/s live) vs content bitrate (1.22 MB/s) plus 8 MiB piece quantization; also `Torrent+Streaming.streamPriority` jump-wipe racing and the Cues-at-EOF streaming-availability gate (option 2/3 from the investigation).
+
 ### 2026-08-11 — Fix: player rotates to landscape, app stays portrait
 
 The player never rotated because xtool hardcodes `UISupportedInterfaceOrientations = [portrait]` for iPhone in its generated Info.plist (PackLib/Planner.swift), and the repo's Info.plist didn't override it, so the whole app was portrait-locked. The fix advertises landscape in the plist and gates it at runtime so only the presented player rotates.

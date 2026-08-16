@@ -238,9 +238,16 @@ public final class MKVRemuxer: @unchecked Sendable {
         }
 
         func samples(from blocks: [MKVBlock], clusterTimestamp: UInt64, info: MatroskaInfo) throws -> [TransmuxSample] {
+            // Laced frames have no per-frame timestamps in the container; the track's
+            // DefaultDuration (per sample, nanoseconds) spaces them. In MKV ticks.
+            let lacingFrameTicks: Double = if let ns = mkvTrack.defaultDurationNs {
+                Double(ns) / Double(max(1, info.timestampScaleNs))
+            } else {
+                0
+            }
             var frames: [(pts: Int64, data: Data, isKeyframe: Bool)] = []
             for block in blocks {
-                let expanded = MatroskaParser.expandLacing(block) ?? [block]
+                let expanded = MatroskaParser.expandLacing(block, frameDurationTicks: lacingFrameTicks) ?? [block]
                 for frame in expanded {
                     frames.append((
                         presentationTicks(Int64(clusterTimestamp) + frame.relativeTimestamp, info: info),

@@ -117,6 +117,9 @@ struct ContentView: View {
         }
         .onAppear {
             store.restore()
+            #if DEBUG
+            autoPlayForTesting()
+            #endif
         }
         .onChange(of: scenePhase) { _, phase in
             // Re-apply on every phase change so a resume from background restores the right state.
@@ -149,6 +152,46 @@ struct ContentView: View {
                 store.togglePause(item)
             }
             .tint(item.isPaused ? .blue : .orange)
+        }
+    }
+
+    /// DEBUG: `-AutoPlayIndex <n>` opens the player for file `n` of the first restored torrent and
+    /// `-InjectPeer host:port` injects a loopback seeder, so streaming behavior can be exercised
+    /// from the command line against a hermetic local seed.
+    private func autoPlayForTesting() {
+        let args = ProcessInfo.processInfo.arguments
+        var injectedPeer: PeerAddress?
+        if let idx = args.firstIndex(of: "-InjectPeer"), idx + 1 < args.count {
+            let parts = args[idx + 1].split(separator: ":")
+            if parts.count == 2, let port = UInt16(parts[1]) {
+                injectedPeer = PeerAddress(host: String(parts[0]), port: port)
+            }
+        }
+        let fileIndex: Int?
+        if let idx = args.firstIndex(of: "-AutoPlayIndex"), idx + 1 < args.count {
+            fileIndex = Int(args[idx + 1])
+        } else {
+            fileIndex = nil
+        }
+        guard injectedPeer != nil || fileIndex != nil else { return }
+        Task {
+            for _ in 0..<40 {
+                if let item = store.items.first {
+                    if let injectedPeer {
+                        TorrentLog.log("AUTOPLAY injecting peer \(injectedPeer.host):\(injectedPeer.port)")
+                        await item.torrent.addPeer(host: injectedPeer.host, port: injectedPeer.port)
+                    }
+                    if let fileIndex, item.metainfo.files.indices.contains(fileIndex) {
+                        let kind = Torrent.playbackKind(forFileNamed: item.metainfo.files[fileIndex].name)
+                        if kind != .none {
+                            TorrentLog.log("AUTOPLAY opening file \(fileIndex) (\(item.metainfo.files[fileIndex].name))")
+                            store.pendingPlayback = PlaybackRequest(torrent: item.torrent, fileIndex: fileIndex, kind: kind)
+                        }
+                    }
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(500))
+            }
         }
     }
 }

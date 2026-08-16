@@ -1,4 +1,5 @@
 import Foundation
+import TorrentCore
 
 enum MKVHLSStreamError: Error {
     case unavailable
@@ -118,6 +119,7 @@ actor MKVHLSStream {
         }
 
         let playlist = Self.makePlaylist(segments: segments, timestampScaleNs: info.timestampScaleNs)
+        TorrentLog.log("HLS prepared: \(segments.count) segments, first=\(segments.first?.sourceRange.description ?? "-") last=\(segments.last?.sourceRange.description ?? "-")")
         prepared = Prepared(
             info: info,
             initSegment: remuxer.initSegment(),
@@ -161,6 +163,23 @@ actor MKVHLSStream {
             throw MKVHLSStreamError.unavailable
         }
         let plan = prepared.segments[id]
+        do {
+            let output = try await generateSegment(prepared, plan)
+            segmentCache[id] = output
+            cacheOrder.removeAll { $0 == id }
+            cacheOrder.append(id)
+            while cacheOrder.count > 1 {
+                let evicted = cacheOrder.removeFirst()
+                segmentCache.removeValue(forKey: evicted)
+            }
+            return output
+        } catch {
+            TorrentLog.log("HLS segment \(id) FAILED: \(error)")
+            throw error
+        }
+    }
+
+    private func generateSegment(_ prepared: Prepared, _ plan: MKVHLSSegment) async throws -> Data {
         let bytes = try await readExact(range: plan.sourceRange)
         let remuxer = try MKVRemuxer(
             info: prepared.info,
@@ -202,14 +221,6 @@ actor MKVHLSStream {
             offset = range.elementEnd
         }
         guard foundPrimaryKeyframe, !output.isEmpty else { throw MKVHLSStreamError.missingKeyframe }
-
-        segmentCache[id] = output
-        cacheOrder.removeAll { $0 == id }
-        cacheOrder.append(id)
-        while cacheOrder.count > 1 {
-            let evicted = cacheOrder.removeFirst()
-            segmentCache.removeValue(forKey: evicted)
-        }
         return output
     }
 
@@ -258,6 +269,7 @@ actor MKVHLSStream {
     private func readExact(range: Range<Int>) async throws -> Data {
         guard !range.isEmpty else { return Data() }
         await source.prioritize(fileIndex: fileIndex, range: range)
+        var polls = 0
         while true {
             try Task.checkCancellation()
             let available = await source.availability(fileIndex: fileIndex, offset: range.lowerBound)
@@ -268,6 +280,13 @@ actor MKVHLSStream {
                    length: range.count
                ) {
                 return data
+            }
+            // A later concurrent segment request can classify its range as a jump and wipe this
+            // one's priority (`replacePriorities`). Re-assert ours ~every second so a deeper
+            // forward buffer doesn't let far-ahead lookahead permanently starve the playhead.
+            polls += 1
+            if polls % 10 == 0 {
+                await source.prioritize(fileIndex: fileIndex, range: range)
             }
             try await Task.sleep(for: .milliseconds(100))
         }
