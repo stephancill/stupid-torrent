@@ -1,4 +1,5 @@
 .DS_Store
+.env.local
 /.build
 /Packages
 xcuserdata/
@@ -15,3 +16,4 @@ DerivedData/
 
 # MobileVLCKit XCFramework (see docs/mkv-streaming.md) — download + repack step
 /Vendor/
+.release/
