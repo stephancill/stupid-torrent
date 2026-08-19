@@ -2,14 +2,14 @@
 
 ## Project
 
-A torrenting client for iOS (via xtool) that downloads from magnet links and `.torrent` files and can stream media files while they are still downloading. The BitTorrent engine is written from scratch in Swift, closely modeled on webtorrent (JS) and anacrolix/torrent (Go).
+A torrenting client for iOS that downloads from magnet links and `.torrent` files and can stream media files while they are still downloading. The BitTorrent engine is written from scratch in Swift, closely modeled on webtorrent (JS) and anacrolix/torrent (Go).
 
 ## Tech stack
 
 - Swift 6 (strict concurrency, actors), SwiftUI, Network.framework (`NWConnection`), CryptoKit (`Insecure.SHA1`)
 - SwiftPM (`swift-tools-version: 6.0`), iOS 17+ / macOS 14+ targets
-- Built and deployed with xtool (`xtool dev run --network -u 00008130-001C4CA030A1401C`)
-- macOS `torrent-cli` executable product is the headless dev/test harness; xtool ignores executable products
+- Built, signed, and released with the `stupid-app` CLI (no Xcode needed at release time)
+- macOS `torrent-cli` executable product is the headless dev/test harness; `stupid-app` ignores executable products
 
 ## Agent rules (REQUIRED)
 
@@ -32,7 +32,9 @@ A torrenting client for iOS (via xtool) that downloads from magnet links and `.t
 - Run tests: `swift test`
 - Build CLI: `swift build --product torrent-cli`
 - Run CLI: `.build/debug/torrent-cli <command>`
-- Deploy to device: `xtool dev run --network -u 00008130-001C4CA030A1401C --no-attach --no-logs`
+- Build the iOS app (unsigned): `stupid-app build`
+- Release to TestFlight/App Store: `stupid-app release archive` then `stupid-app release upload --wait`
+- Deploy to a device: `stupid-app run --network --udid <udid>`
 
 ## Docs
 

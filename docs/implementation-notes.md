@@ -852,3 +852,17 @@ A fresh-install app resolve timed out at 90s on the marginal Backrooms swarm whi
 3. **DHT node warm-up at app launch** (`DHTNode.warmUp()` called in `stupid_torrent_clientApp.init`): bootstraps the shared node's routing table in the background, so the first magnet resolve doesn't pay a cold 8s bootstrap inline and queries a warm table (also starts accumulating the live peer store immediately).
 
 **Verification**: cold-cache CLI resolve x3 all succeed (21.4s first, then 3.3s/3.0s as caches warm); 53 tests green. Simulator: at launch the node is already live (`DHT: announce … to 8 nodes`, warm-up ran), and adding the Cosmos Laundromat magnet resolves and persists within ~20s (sweep-cancelled `CancellationError`s confirm a peer won; `.torrent` saved; idle timer held disabled while downloading).
+
+## 2026-08-19 — Migrate to stupid-app CLI and release build 4 to TestFlight
+
+Migrated the project from the old xtool/scripts flow to the `stupid-app` CLI:
+added `stupid-app.yml` (app product + icon, no extensions), removed `xtool.yml`,
+and added an empty `App.entitlements`. Update the dev/release command surface in
+AGENTS.md, README, `.env.example`, and `docs/planning.md` to `stupid-app build`,
+`stupid-app run --simulator` / `run --network`, and `stupid-app release archive` /
+`release upload --wait`. The `torrent-cli` executable product is still ignored.
+
+Bumped `CFBundleVersion` 3 → 4 (marketing 1.0.0) and released with the CLI:
+`signing setup --kind distribution`, `release archive`, `release upload --wait`.
+Build `d8895c7f-57a9-46c6-aec4-7c7ee8592b9c` is `VALID`, internal
+`READY_FOR_BETA_TESTING`, external `READY_FOR_BETA_SUBMISSION`.

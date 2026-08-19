@@ -2,11 +2,11 @@
 
 ## Goal
 
-An xtool iOS app (SwiftPM + SwiftUI) where you paste a **magnet link** or import a **.torrent file**, download files, and **stream media files while they are still downloading**. Foreground-only: iOS suspends apps shortly after they go to the background, so true background torrenting is out of scope.
+An iOS app (SwiftPM + SwiftUI, built with the `stupid-app` CLI) where you paste a **magnet link** or import a **.torrent file**, download files, and **stream media files while they are still downloading**. Foreground-only: iOS suspends apps shortly after they go to the background, so true background torrenting is out of scope.
 
 ## Decisions (locked in)
 
-1. **Engine: from scratch, pure Swift.** No libtorrent/C++, no vendored frameworks, no binary targets. Zero build/link risk under xtool's cross SDK, and the streaming model (priority-window piece picking) is native to our own picker. Closely modeled on two MIT references.
+1. **Engine: from scratch, pure Swift.** No libtorrent/C++, no vendored frameworks, no binary targets. Zero build/link risk under the stupid-app cross SDK, and the streaming model (priority-window piece picking) is native to our own picker. Closely modeled on two MIT references.
 2. **Scope v1: full** — magnet links + `.torrent` files, sequential/priority-window download, seeding, per-file selection and priorities, AVPlayer streaming, DHT (BEP 5) peer discovery, MSE/PE protocol encryption (BEP 10), µTP transport (BEP 29). **No web seeds (BEP 19)** — deferred.
 3. **Streaming: AVPlayer backed by verified torrent bytes.** Apple containers use `AVAssetResourceLoaderDelegate` over a custom scheme. Cue-indexed Matroska uses a static VOD HLS presentation over a loopback-only HTTP server so one stable `AVPlayerItem` owns the global timeline while independently generated fMP4 cue segments retain local decoder clocks. `UIBackgroundModes: audio` supports background audio streaming.
 4. **Validation-first: macOS `torrent-cli`** headless harness gates every engine phase against the live Big Buck Bunny torrent before any iOS UI work.
@@ -52,8 +52,8 @@ Live-swarm gates are the final check, not the only one. A test-support harness g
 
 ```
 Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
-├─ product  stupid_torrent_client      (library, the app — the only library product; xtool picks it)
-├─ product  torrent-cli                (macOS executable — xtool ignores executables)
+├─ product  stupid_torrent_client      (library, the app — the only library product; stupid-app picks it)
+├─ product  torrent-cli                (macOS executable — stupid-app ignores executables)
 ├─ target   Bencode                    (pure Swift)
 ├─ target   TorrentCore                (pure Swift; the engine, dependency-free)
 ├─ target   Streaming                  (AVFoundation/AVKit; player feeding)
@@ -93,7 +93,7 @@ Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
 - `Documents/downloads/` — data files (exposed via Files app)
 - Per-torrent verified-bitfield sidecar for fast resume (re-verify only unverified pieces on launch)
 
-## iOS config (custom `Info.plist` via `xtool.yml infoPath`)
+## iOS config (custom `Info.plist` via `stupid-app.yml infoPath`)
 
 - `UIBackgroundModes: ["audio"]`
 - `CFBundleURLTypes`: `magnet` URL scheme
@@ -103,7 +103,7 @@ Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
 
 ## Phases
 
-1. **Scaffold** — Package.swift (products/targets), xtool.yml, Info.plist, gitignore, reference clones, docs. Gate: `swift build` and `swift build --product torrent-cli` succeed.
+1. **Scaffold** — Package.swift (products/targets), stupid-app.yml, Info.plist, gitignore, reference clones, docs. Gate: `swift build` and `swift build --product torrent-cli` succeed.
 2. **Bencode + Metainfo** — with unit tests; parse the BBB `.torrent` fixture. Gate: tests pass.
 3. **PeerWire + Tracker (HTTP + UDP) + Storage (sequential)** — wire codec, announce clients, sequential picker, sparse storage. Unit tests: PeerWire message round-trip + malformed/truncated framing; HTTP announce request + bencoded response parse (compact peers/peers6, interval, failure reason); UDP connect/announce encode-decode with transaction-id matching; synthetic-torrent sequential download via the loopback seeder. Gate: `swift test` green, then live BBB `.torrent` to 100% with `torrent-cli verify` showing every piece `ok`.
 4. **Multi-file storage + resume** — piece->file offset layout (files spanning pieces) unit tests against the fixture; bitfield persistence round-trip; kill + relaunch resumes without full recheck. Gate: sizes match + fast resume (hermetic, then live).

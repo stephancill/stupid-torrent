@@ -29,7 +29,7 @@ Supported BEPs: 3 (metainfo), 9 (ut_metadata), 10 (extensions), 12 (multitracker
 
 ## Build & run
 
-Built and deployed with [xtool](https://xtool.dev).
+Built and released with [stupid-app](https://github.com/stephancill/stupid-app-cli).
 
 ```sh
 # Tests
@@ -41,13 +41,17 @@ swift build --product torrent-cli
 .build/debug/torrent-cli verify Fixtures/big-buck-bunny.torrent
 
 # Run in the iOS simulator
-xtool dev run --simulator
+stupid-app run --simulator
 
 # Deploy to a device
-xtool dev run --network -u <device-udid>
+stupid-app run --network --udid <device-udid>
+
+# Release to TestFlight / App Store
+stupid-app release archive
+stupid-app release upload --wait
 ```
 
-The `torrent-cli` executable product is ignored by xtool and is the headless dev/test harness. It validates the engine against the live Big Buck Bunny swarm before any UI work.
+The `torrent-cli` executable product is ignored by `stupid-app` and is the headless dev/test harness. It validates the engine against the live Big Buck Bunny swarm before any UI work.
 
 ## Test torrent
 
@@ -57,7 +61,7 @@ Big Buck Bunny (webtorrent.io), info hash `dd8255ecdc7ca55fb0bbf81323d87062db1f6
 
 ```
 Package.swift          SwiftPM (one app library product + torrent-cli executable)
-xtool.yml + Info.plist app config
+stupid-app.yml + Info.plist app config
 Fixtures/              test torrent
 Sources/Bencode        bencode
 Sources/TorrentCore    engine
