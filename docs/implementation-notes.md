@@ -4,6 +4,10 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-20 — Fix: disable verbose peer logging in app builds
+
+The app became unresponsive and was killed shortly after launch while restoring active torrents because `TorrentLog.verbose` was enabled unconditionally. Peer pipeline refills synchronously emitted thousands of stderr writes such as `requesting 48 blocks`, overwhelming the process during startup. Removed the app-level verbose override so normal and TestFlight builds use `TorrentLog`'s disabled default; explicit CLI diagnostics can still enable it. Reproduced on an iPhone with the persisted restore set, verified the filtered development build remained responsive with all torrent metadata restored, and uploaded build 5 to TestFlight (`READY_FOR_BETA_TESTING`). All 78 tests pass and the app launches on the iOS simulator.
+
 ### 2026-08-16 — Fix: HEVC 10-bit MKVs with laced AAC would not play (spinner forever)
 
 Reproduced "player opens, loading spinner never plays" on a 10-bit x265 WEBRip (Minions & Monsters) in the iOS simulator and via `torrent-cli stream-play`. The HLS server served the init + segments fine and AVPlayer reached `readyToPlay`, but the playhead froze at 0. Bisected with a small HEVC Main10 fixture (played) vs the real file's video-only extraction (played) vs the full file (stalled): the video and container were fine — the **audio track** was broken.
