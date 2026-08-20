@@ -2,7 +2,7 @@
 
 ## Goal
 
-An iOS app (SwiftPM + SwiftUI, built with the `stupid-app` CLI) where you paste a **magnet link** or import a **.torrent file**, download files, and **stream media files while they are still downloading**. Foreground-only: iOS suspends apps shortly after they go to the background, so true background torrenting is out of scope.
+An iOS 26 app (SwiftPM + SwiftUI, built with the `stupid-app` CLI) where you paste a **magnet link** or import a **.torrent file**, download files in the foreground or background, and **stream media files while they are still downloading**.
 
 ## Decisions (locked in)
 
@@ -11,7 +11,8 @@ An iOS app (SwiftPM + SwiftUI, built with the `stupid-app` CLI) where you paste 
 3. **Streaming: AVPlayer backed by verified torrent bytes.** Apple containers use `AVAssetResourceLoaderDelegate` over a custom scheme. Cue-indexed Matroska uses a static VOD HLS presentation over a loopback-only HTTP server so one stable `AVPlayerItem` owns the global timeline while independently generated fMP4 cue segments retain local decoder clocks. `UIBackgroundModes: audio` supports background audio streaming.
 4. **Validation-first: macOS `torrent-cli`** headless harness gates every engine phase against the live Big Buck Bunny torrent before any iOS UI work.
 5. **Concurrency: Swift 6 strict concurrency** with actors; networking over Network.framework `NWConnection`, bridged to `async`/`AsyncStream`. Engine status is fanned out through a `StatusBroadcast` (multi-subscriber, current-value); SwiftUI observes a main-actor `@Observable` `TorrentStore` snapshot.
-6. **Hermetic-first testing**: mock HTTP/UDP trackers + a local third-party seeder (webtorrent/aria2c) serving the Big Buck Bunny fixture over loopback give deterministic, offline coverage for PeerWire/Peer/PiecePicker/Storage/Tracker. The live swarm is only the final integration gate.
+6. **Background downloads: iOS 26 continued processing.** Every user-added or explicitly resumed incomplete torrent submits a `BGContinuedProcessingTaskRequest` keyed by its info hash. Verified bytes drive system progress; completion succeeds the task, while pause, deletion, user cancellation, or expiration tears down peer networking and persists resume state. Restored torrents register handlers but do not submit new background work without another explicit user action. Background seeding remains disabled because it has no finite user-requested completion point.
+7. **Hermetic-first testing**: mock HTTP/UDP trackers + a local third-party seeder (webtorrent/aria2c) serving the Big Buck Bunny fixture over loopback give deterministic, offline coverage for PeerWire/Peer/PiecePicker/Storage/Tracker. The live swarm is only the final integration gate.
 
 ## Test torrent (primary: Big Buck Bunny)
 
@@ -51,7 +52,7 @@ Live-swarm gates are the final check, not the only one. A test-support harness g
 ## Architecture
 
 ```
-Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
+Package.swift (swift-tools 6.0; platforms: iOS 26 / macOS 14)
 ├─ product  stupid_torrent_client      (library, the app — the only library product; stupid-app picks it)
 ├─ product  torrent-cli                (macOS executable — stupid-app ignores executables)
 ├─ target   Bencode                    (pure Swift)
@@ -95,7 +96,8 @@ Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
 
 ## iOS config (custom `Info.plist` via `stupid-app.yml infoPath`)
 
-- `UIBackgroundModes: ["audio"]`
+- `UIBackgroundModes: ["audio", "processing"]`
+- `BGTaskSchedulerPermittedIdentifiers: ["com.stupidtech.stupid-torrent-client.download.*"]`
 - `CFBundleURLTypes`: `magnet` URL scheme
 - `UIFileSharingEnabled` + `LSSupportsOpeningDocumentsInPlace`
 - `NSAppTransportSecurity` -> `NSAllowsArbitraryLoads: true` (ATS applies to our `URLSession` HTTP-tracker calls; raw peer sockets are unaffected)
@@ -125,11 +127,11 @@ Package.swift (swift-tools 6.0; platforms: iOS 17 / macOS 14)
 | Swift 6 concurrency friction (actors + `NWConnection` callbacks, status fan-out) | Bridge callbacks to `async` early; `StatusBroadcast` for multi-subscriber current-value; validate on macOS in Phase 3 |
 | Magnet dependency chain (magnet requires peer-wire + BEP 10/9 all working) | Phases build bottom-up, each gated by unit + hermetic tests |
 | Tracker/peer long tail | Follow anacrolix/webtorrent behavior; hermetic coverage via mock trackers + third-party seeder (webtorrent/aria2c); live swarm as final gate; fail loudly with clear logs |
-| iOS suspension in background | Foreground-only by design + `audio` background mode |
+| iOS background task expiration or cancellation | Piece verification persists resume state continuously; expiration pauses the torrent and closes peers promptly. The system can terminate tasks under resource pressure, and force-quitting the app cancels them. |
 | mkv/AV1 not playable by AVPlayer | MKV/MKA streamed via the in-house Matroska→fMP4 transmuxer (AVPlayer-native, no framework; see `docs/mkv-avplayer-transmuxer.md`); AV1-in-MKV / webm / avi remain unplayable; embedded subs + Opus/Vorbis/FLAC/DTS dropped |
 | BBB is UDP-tracker-only | UDP tracker lands in Phase 3 (before first live download); both BBB trackers probed UP on 2026-08-06 (opentrackr HTTP+UDP, explodie UDP-only), plus fallback trackers in the magnet |
 | Torrent can exceed free disk space | Storage disk-space guard (`volumeAvailableCapacityForImportantUsage`); fail loudly (pause + surface error) on ENOSPC |
 
 ## Out of scope (v1)
 
-Web seeds (BEP 19), background downloads, IPv6 peer support (decode-ignore). Note: MSE/PE and µTP (BEP 29) are now implemented; outbound connections try µTP first (reaching µTP-only peers, e.g. WebTorrent's) and fall back to TCP, and the shared UDP socket also accepts inbound µTP on the announced port. WebRTC (for WebTorrent's browser-only peers) remains out of scope.
+Web seeds (BEP 19), background seeding, IPv6 peer support (decode-ignore). Note: MSE/PE and µTP (BEP 29) are now implemented; outbound connections try µTP first (reaching µTP-only peers, e.g. WebTorrent's) and fall back to TCP, and the shared UDP socket also accepts inbound µTP on the announced port. WebRTC (for WebTorrent's browser-only peers) remains out of scope.

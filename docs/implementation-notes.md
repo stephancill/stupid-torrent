@@ -4,6 +4,22 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-20 — Fix: serialize engine startup during restore
+
+TestFlight build 5 still reproduced the launch-time `SIGKILL` after verbose logging was disabled. Isolating the persisted restore set showed that each torrent launched successfully alone, while the initial concurrent restore of three active torrents triggered the failure. Each `Torrent` previously allowed 50 peers and TCP uses dedicated connect, reader, and send threads, so restoring three torrents could create roughly 150 persistent peer threads plus transient connection and send threads at once.
+
+`Torrent.run()` now serializes only resume loading, restored-piece revalidation, and network initialization through a process-wide startup gate. Partial torrents verify restored pieces inside that gate instead of launching overlapping background hash passes. `TorrentStore` restores every row immediately with no timer, and all torrents retain the engine's existing 50-peer limit once startup completes, so the UI has no visible stagger and steady-state throughput is unaffected.
+
+Verification: the startup-gate regression proves a second caller cannot enter until the first releases; all 80 tests pass. The gate-based development build remained alive after 30 seconds on the physical iPhone with all three persisted torrents restored, and launched successfully on the iOS 26.3 simulator. Build 6 was uploaded to TestFlight and reached `READY_FOR_BETA_TESTING`.
+
+### 2026-08-20 — Feat: continue user-started downloads in the background on iOS 26
+
+Replaced the foreground-only product assumption with iOS 26 continued processing. Each newly added or explicitly resumed incomplete torrent now registers and submits a `BGContinuedProcessingTaskRequest` whose identifier is keyed by the info hash. The task observes the existing `StatusBroadcast`, reports byte-accurate verified progress and download rate through the system UI, completes when every piece verifies, and pauses the torrent so peer sockets close and resume state persists when the task expires or the user cancels it. Pausing or deleting a torrent cancels its request; restored torrents register their handler but do not submit fresh background work without another explicit user action. Background seeding remains disabled.
+
+Raised the iOS deployment target from 17 to 26 and added the `processing` background mode plus the wildcard `BGTaskSchedulerPermittedIdentifiers` entry. Added `Metainfo.verifiedByteCount(pieceCount:)` and regression coverage proving progress clamps negative counts and the short final piece to the exact torrent length.
+
+Verification: all 79 Swift tests pass; `stupid-app build` produces an iOS 26.0 binary with the expected background modes and permitted identifier in the packaged plist; the app was reinstalled and launched on the iOS 26.3 simulator. Adding Big Buck Bunny registered the wildcard handler and reached task submission. Simulator returned `BGTaskSchedulerErrorDomain error 1`, which is the documented result because Simulator does not support background processing; the error was handled without interrupting the foreground download, and the app survived a Home/foreground cycle with persisted resume state. Actual continued execution must be confirmed on a physical iOS 26 device.
+
 ### 2026-08-20 — Fix: disable verbose peer logging in app builds
 
 The app became unresponsive and was killed shortly after launch while restoring active torrents because `TorrentLog.verbose` was enabled unconditionally. Peer pipeline refills synchronously emitted thousands of stderr writes such as `requesting 48 blocks`, overwhelming the process during startup. Removed the app-level verbose override so normal and TestFlight builds use `TorrentLog`'s disabled default; explicit CLI diagnostics can still enable it. Reproduced on an iPhone with the persisted restore set, verified the filtered development build remained responsive with all torrent metadata restored, and uploaded build 5 to TestFlight (`READY_FOR_BETA_TESTING`). All 78 tests pass and the app launches on the iOS simulator.

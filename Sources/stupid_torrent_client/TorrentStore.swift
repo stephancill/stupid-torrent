@@ -83,11 +83,13 @@ final class TorrentStore {
     func restore() {
         guard items.isEmpty else { return }
         let files = (try? FileManager.default.contentsOfDirectory(atPath: torrentsURL.path)) ?? []
-        for name in files where name.hasSuffix(".torrent") {
-            let url = torrentsURL.appendingPathComponent(name)
-            guard let data = try? Data(contentsOf: url),
-                  let metainfo = try? Metainfo(data: data) else { continue }
-            Task { try? await add(metainfo: metainfo, persist: false) }
+        Task {
+            for name in files where name.hasSuffix(".torrent") {
+                let url = torrentsURL.appendingPathComponent(name)
+                guard let data = try? Data(contentsOf: url),
+                      let metainfo = try? Metainfo(data: data) else { continue }
+                try? await add(metainfo: metainfo, persist: false)
+            }
         }
     }
 
@@ -169,6 +171,7 @@ final class TorrentStore {
         )
         items.append(item)
         item.start()
+        await trackBackgroundDownload(item, submit: persist && !item.isPaused && !item.isComplete)
     }
 
     private func persistTorrent(_ metainfo: Metainfo) {
@@ -178,6 +181,7 @@ final class TorrentStore {
     }
 
     func remove(_ item: TorrentItem) {
+        Task { await cancelBackgroundDownload(item) }
         item.stop()
         items.removeAll { $0.id == item.id }
         addedDates.removeValue(forKey: item.id)
@@ -206,13 +210,34 @@ final class TorrentStore {
 
     /// Pauses/resumes a torrent and persists the paused state so it survives a relaunch.
     func togglePause(_ item: TorrentItem) {
+        guard !item.isComplete else { return }
         let wasPaused = item.isPaused
-        item.togglePause()
         if wasPaused {
             pausedIDs.remove(item.id)
         } else {
             pausedIDs.insert(item.id)
         }
         savePausedIDs()
+        Task {
+            if wasPaused {
+                await item.torrent.resume()
+                await trackBackgroundDownload(item, submit: true)
+            } else {
+                await item.torrent.pause()
+                await cancelBackgroundDownload(item)
+            }
+        }
+    }
+
+    private func trackBackgroundDownload(_ item: TorrentItem, submit: Bool) async {
+        #if os(iOS)
+        await ContinuedDownloadManager.shared.track(torrent: item.torrent, submit: submit)
+        #endif
+    }
+
+    private func cancelBackgroundDownload(_ item: TorrentItem) async {
+        #if os(iOS)
+        await ContinuedDownloadManager.shared.cancel(torrent: item.torrent)
+        #endif
     }
 }

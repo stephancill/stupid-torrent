@@ -33,6 +33,11 @@ public struct Metainfo: Sendable, Equatable {
         files.reduce(0) { $0 + $1.length }
     }
 
+    public func verifiedByteCount(pieceCount: Int) -> Int64 {
+        let verifiedPieces = min(max(pieceCount, 0), self.pieceCount)
+        return min(Int64(totalLength), Int64(verifiedPieces) * Int64(pieceLength))
+    }
+
     public var fileOffsets: [Int] {
         var offsets: [Int] = []
         var offset = 0

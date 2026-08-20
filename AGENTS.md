@@ -7,7 +7,7 @@ A torrenting client for iOS that downloads from magnet links and `.torrent` file
 ## Tech stack
 
 - Swift 6 (strict concurrency, actors), SwiftUI, Network.framework (`NWConnection`), CryptoKit (`Insecure.SHA1`)
-- SwiftPM (`swift-tools-version: 6.0`), iOS 17+ / macOS 14+ targets
+- SwiftPM (`swift-tools-version: 6.0`), iOS 26+ / macOS 14+ targets
 - Built, signed, and released with the `stupid-app` CLI (no Xcode needed at release time)
 - macOS `torrent-cli` executable product is the headless dev/test harness; `stupid-app` ignores executable products
 

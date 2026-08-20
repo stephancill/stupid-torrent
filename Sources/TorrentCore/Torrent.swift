@@ -1,6 +1,31 @@
 import Foundation
 import CryptoKit
 
+actor TorrentStartupGate {
+    static let shared = TorrentStartupGate()
+
+    private var isHeld = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !isHeld {
+            isHeld = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            isHeld = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
 public actor Torrent {
     nonisolated public let metainfo: Metainfo
     nonisolated public let statusBroadcast: StatusBroadcast<TorrentStatus>
@@ -139,6 +164,13 @@ public actor Torrent {
         guard !isRunning else { return }
         isRunning = true
 
+        await TorrentStartupGate.shared.acquire()
+        if Task.isCancelled {
+            await TorrentStartupGate.shared.release()
+            isRunning = false
+            return
+        }
+
         try? await storage.prepare()
         try? await storage.loadVerified()
         picker = PiecePicker(pieceCount: metainfo.pieceCount, verified: await storage.verifiedBitfield)
@@ -158,12 +190,11 @@ public actor Torrent {
             if picker.verified.allSet {
                 await publishStatus()
                 isRunning = false
+                await TorrentStartupGate.shared.release()
                 return
             }
         } else if !restoredVerified.isEmpty {
-            // Partial (or paused) torrent: repair stale resume bits in the background so the
-            // status stays honest and playback never hits zero-filled pieces mid-stream.
-            Task { [weak self] in await self?.reverifyRestoredPieces(restoredVerified) }
+            await reverifyRestoredPieces(restoredVerified)
         }
 
         if !isPaused {
@@ -172,6 +203,7 @@ public actor Torrent {
         // A torrent restored into the paused state (or paused between the flag read and here) must
         // publish that immediately so subscribers reflect it instead of a stale `.downloading`.
         await publishStatus()
+        await TorrentStartupGate.shared.release()
 
         while !Task.isCancelled {
             // Park while paused; `resume()` flips the flag and the loop restarts the machinery.

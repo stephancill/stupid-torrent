@@ -261,6 +261,19 @@ extension Data {
         #expect(hosts.contains("explodie.org"))
     }
 
+    @Test func verifiedByteCountClampsToTorrentLength() throws {
+        let info = try Metainfo(data: try Fixtures.bigBuckBunnyTorrentData)
+
+        #expect(info.verifiedByteCount(pieceCount: -1) == 0)
+        #expect(info.verifiedByteCount(pieceCount: 1) == Int64(info.pieceLength))
+        #expect(
+            info.verifiedByteCount(pieceCount: info.pieceCount - 1)
+                == Int64(info.pieceCount - 1) * Int64(info.pieceLength)
+        )
+        #expect(info.verifiedByteCount(pieceCount: info.pieceCount) == Int64(info.totalLength))
+        #expect(info.verifiedByteCount(pieceCount: info.pieceCount + 1) == Int64(info.totalLength))
+    }
+
     @Test func persistedMagnetMetadataRoundTrips() throws {
         let fixture = try Fixtures.bigBuckBunnyTorrentData
         let source = try Metainfo(data: fixture)
@@ -632,7 +645,34 @@ extension Data {
     }
 }
 
+private actor StartupGateProbe {
+    private(set) var entered = false
+
+    func markEntered() {
+        entered = true
+    }
+}
+
 @Suite struct TorrentPauseResumeTests {
+    @Test func startupGateSerializesCallers() async {
+        let gate = TorrentStartupGate()
+        let probe = StartupGateProbe()
+        await gate.acquire()
+
+        let waiter = Task {
+            await gate.acquire()
+            await probe.markEntered()
+            await gate.release()
+        }
+
+        try? await Task.sleep(for: .milliseconds(50))
+        #expect(!(await probe.entered))
+
+        await gate.release()
+        await waiter.value
+        #expect(await probe.entered)
+    }
+
     /// BBB metainfo without any trackers and no DHT, so `run()` only touches loopback.
     private func torrentMetainfo() throws -> Metainfo {
         let source = try Metainfo(data: try Fixtures.bigBuckBunnyTorrentData)
@@ -779,7 +819,11 @@ extension Data {
         let runTask = Task { await torrent.run() }
         defer { runTask.cancel() }
         defer { Task { await torrent.stop() } }
-        try? await Task.sleep(for: .milliseconds(300))
+        for _ in 0..<30 {
+            if await torrent.statusBroadcast.value.state == .downloading,
+               await torrent.verifiedCount == 0 { break }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
 
         #expect(await torrent.statusBroadcast.value.state == .downloading)
         #expect(await torrent.verifiedCount == 0)

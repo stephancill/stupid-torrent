@@ -99,17 +99,6 @@ final class TorrentItem: Identifiable, Hashable {
         runTask = nil
     }
 
-    /// Pauses or resumes the download. The status/run tasks stay alive across both — `pause()`
-    /// tears down the engine's network while `run()` parks, and `resume()` restarts it.
-    func togglePause() {
-        guard !isComplete else { return }
-        if isPaused {
-            Task { await torrent.resume() }
-        } else {
-            Task { await torrent.pause() }
-        }
-    }
-
     nonisolated static func == (lhs: TorrentItem, rhs: TorrentItem) -> Bool {
         lhs.id == rhs.id
     }

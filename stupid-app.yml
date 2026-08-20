@@ -1,6 +1,6 @@
 version: 1
 product: stupid_torrent_client
 bundleID: com.stupidtech.stupid-torrent-client
-deploymentTarget: "17.0"
+deploymentTarget: "26.0"
 infoPath: Info.plist
 iconPath: Resources/AppIcon.appiconset/Icon-1024.png
