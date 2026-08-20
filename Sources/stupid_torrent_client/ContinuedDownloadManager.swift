@@ -4,6 +4,43 @@ import Foundation
 import OSLog
 import TorrentCore
 
+fileprivate final class ContinuedDownloadTaskBox: @unchecked Sendable {
+    let task: BGContinuedProcessingTask
+
+    init(_ task: BGContinuedProcessingTask) {
+        self.task = task
+    }
+}
+
+private func continuedDownloadLaunchHandler(
+    manager: ContinuedDownloadManager,
+    identifier: String
+) -> @Sendable (BGTask) -> Void {
+    { task in
+        guard let continuedTask = task as? BGContinuedProcessingTask else {
+            task.setTaskCompleted(success: false)
+            return
+        }
+        continuedTask.progress.totalUnitCount = 1_000
+        continuedTask.progress.completedUnitCount = 1
+        continuedTask.expirationHandler = continuedDownloadExpirationHandler(
+            manager: manager,
+            identifier: identifier
+        )
+        let taskBox = ContinuedDownloadTaskBox(continuedTask)
+        Task { await manager.begin(taskBox: taskBox, identifier: identifier) }
+    }
+}
+
+private func continuedDownloadExpirationHandler(
+    manager: ContinuedDownloadManager,
+    identifier: String
+) -> @Sendable () -> Void {
+    {
+        Task { await manager.expire(identifier: identifier) }
+    }
+}
+
 actor ContinuedDownloadManager {
     static let shared = ContinuedDownloadManager()
 
@@ -12,21 +49,13 @@ actor ContinuedDownloadManager {
         let metainfo: Metainfo
     }
 
-    private final class TaskBox: @unchecked Sendable {
-        let task: BGContinuedProcessingTask
-
-        init(_ task: BGContinuedProcessingTask) {
-            self.task = task
-        }
-    }
-
     private let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.stupidtech.stupid-torrent-client",
         category: "BackgroundDownload"
     )
     private var downloads: [String: Download] = [:]
     private var registeredIdentifiers: Set<String> = []
-    private var activeTasks: [String: TaskBox] = [:]
+    private var activeTasks: [String: ContinuedDownloadTaskBox] = [:]
     private var monitorTasks: [String: Task<Void, Never>] = [:]
 
     func track(torrent: Torrent, submit: Bool) {
@@ -67,15 +96,9 @@ actor ContinuedDownloadManager {
 
         let didRegister = BGTaskScheduler.shared.register(
             forTaskWithIdentifier: identifier,
-            using: nil
-        ) { [self] task in
-            guard let continuedTask = task as? BGContinuedProcessingTask else {
-                task.setTaskCompleted(success: false)
-                return
-            }
-            let taskBox = TaskBox(continuedTask)
-            Task { await self.begin(taskBox: taskBox, identifier: identifier) }
-        }
+            using: nil,
+            launchHandler: continuedDownloadLaunchHandler(manager: self, identifier: identifier)
+        )
 
         if didRegister {
             registeredIdentifiers.insert(identifier)
@@ -85,7 +108,7 @@ actor ContinuedDownloadManager {
         return didRegister
     }
 
-    private func begin(taskBox: TaskBox, identifier: String) {
+    fileprivate func begin(taskBox: ContinuedDownloadTaskBox, identifier: String) {
         guard let download = downloads[identifier], activeTasks[identifier] == nil else {
             taskBox.task.setTaskCompleted(success: false)
             return
@@ -94,10 +117,6 @@ actor ContinuedDownloadManager {
         activeTasks[identifier] = taskBox
         let totalBytes = max(Int64(download.metainfo.totalLength), 1)
         taskBox.task.progress.totalUnitCount = totalBytes
-        taskBox.task.progress.completedUnitCount = 0
-        taskBox.task.expirationHandler = { [self] in
-            Task { await self.expire(identifier: identifier) }
-        }
 
         monitorTasks[identifier] = Task { [self] in
             for await status in await download.torrent.statusBroadcast.subscribe() {
@@ -139,7 +158,7 @@ actor ContinuedDownloadManager {
         }
     }
 
-    private func expire(identifier: String) async {
+    fileprivate func expire(identifier: String) async {
         guard let download = downloads[identifier] else {
             finish(identifier: identifier, success: false)
             return

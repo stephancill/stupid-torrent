@@ -124,6 +124,14 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             // Re-apply on every phase change so a resume from background restores the right state.
             IdleTimer.update(isDownloading: phase == .active && shouldKeepAwake)
+            if phase == .active {
+                store.submitRestoredBackgroundTasks()
+            }
+        }
+        .onChange(of: store.restorationComplete) { _, complete in
+            if complete && scenePhase == .active {
+                store.submitRestoredBackgroundTasks()
+            }
         }
         .onChange(of: shouldKeepAwake) { _, downloading in
             IdleTimer.update(isDownloading: downloading)

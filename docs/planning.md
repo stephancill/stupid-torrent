@@ -11,7 +11,7 @@ An iOS 26 app (SwiftPM + SwiftUI, built with the `stupid-app` CLI) where you pas
 3. **Streaming: AVPlayer backed by verified torrent bytes.** Apple containers use `AVAssetResourceLoaderDelegate` over a custom scheme. Cue-indexed Matroska uses a static VOD HLS presentation over a loopback-only HTTP server so one stable `AVPlayerItem` owns the global timeline while independently generated fMP4 cue segments retain local decoder clocks. `UIBackgroundModes: audio` supports background audio streaming.
 4. **Validation-first: macOS `torrent-cli`** headless harness gates every engine phase against the live Big Buck Bunny torrent before any iOS UI work.
 5. **Concurrency: Swift 6 strict concurrency** with actors; networking over Network.framework `NWConnection`, bridged to `async`/`AsyncStream`. Engine status is fanned out through a `StatusBroadcast` (multi-subscriber, current-value); SwiftUI observes a main-actor `@Observable` `TorrentStore` snapshot.
-6. **Background downloads: iOS 26 continued processing.** Every user-added or explicitly resumed incomplete torrent submits a `BGContinuedProcessingTaskRequest` keyed by its info hash. Verified bytes drive system progress; completion succeeds the task, while pause, deletion, user cancellation, or expiration tears down peer networking and persists resume state. Restored torrents register handlers but do not submit new background work without another explicit user action. Background seeding remains disabled because it has no finite user-requested completion point.
+6. **Background downloads: iOS 26 continued processing.** Every active incomplete torrent submits a `BGContinuedProcessingTaskRequest` keyed by its info hash when it is added, resumed, or restored during an app launch. Verified bytes drive system progress; completion succeeds the task, while pause, deletion, user cancellation, or expiration tears down peer networking and persists resume state. Background seeding remains disabled because it has no finite user-requested completion point.
 7. **Hermetic-first testing**: mock HTTP/UDP trackers + a local third-party seeder (webtorrent/aria2c) serving the Big Buck Bunny fixture over loopback give deterministic, offline coverage for PeerWire/Peer/PiecePicker/Storage/Tracker. The live swarm is only the final integration gate.
 
 ## Test torrent (primary: Big Buck Bunny)
@@ -91,8 +91,8 @@ Package.swift (swift-tools 6.0; platforms: iOS 26 / macOS 14)
 ### Persistence
 
 - `Documents/torrents/` — original `.torrent` files + a magnet link list (restore set)
-- `Documents/downloads/` — data files (exposed via Files app)
-- Per-torrent verified-bitfield sidecar for fast resume (re-verify only unverified pieces on launch)
+- `Documents/downloads/` — data files (exposed via Files app), protected as `completeUntilFirstUserAuthentication` so active downloads retain storage access while the phone is locked
+- Per-torrent verified-bitfield sidecar for fast resume (re-verify only unverified pieces on launch), using the same lock-safe protection class
 
 ## iOS config (custom `Info.plist` via `stupid-app.yml infoPath`)
 

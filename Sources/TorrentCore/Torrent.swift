@@ -106,6 +106,7 @@ public actor Torrent {
     private var uploadedBytes: Int64 = 0
     private var lastTickDownloaded: Int64 = 0
     private var lastTickUploaded: Int64 = 0
+    private var lastRateSampleTime = ContinuousClock.now
     private var downloadRate: Double = 0
     private var uploadRate: Double = 0
     private var lastSeeders = 0
@@ -294,6 +295,7 @@ public actor Torrent {
         guard isRunning, !isPaused else { return }
         isPaused = true
         await stopNetwork()
+        resetTransferRates()
         try? await storage.saveVerified()
         let _ = await announceAll(event: .stopped)
         await publishStatus()
@@ -305,6 +307,7 @@ public actor Torrent {
         guard isRunning, isPaused else { return }
         isPaused = false
         firstAnnounce = true
+        resetTransferRates()
         await publishStatus()
     }
 
@@ -421,6 +424,7 @@ public actor Torrent {
             await publishStatus()
             return
         }
+        await publishTransferStatusIfNeeded()
 
         // Completion is signalled by byte coverage, not block count: a peer may coalesce the
         // piece's final short block into the last full block, so the offset set can fall one short
@@ -980,16 +984,42 @@ public actor Torrent {
     }
 
     private func tick() async {
-        downloadRate = Double(downloadedBytes - lastTickDownloaded)
-        uploadRate = Double(uploadedBytes - lastTickUploaded)
-        lastTickDownloaded = downloadedBytes
-        lastTickUploaded = uploadedBytes
+        updateTransferRatesIfNeeded()
         requeueStalledPieces()
         if verifiedDirty {
             verifiedDirty = false
             try? await storage.saveVerified()
         }
         await publishStatus()
+    }
+
+    private func publishTransferStatusIfNeeded() async {
+        guard updateTransferRatesIfNeeded() else { return }
+        await publishStatus()
+    }
+
+    @discardableResult
+    private func updateTransferRatesIfNeeded() -> Bool {
+        let now = ContinuousClock.now
+        let elapsed = lastRateSampleTime.duration(to: now)
+        guard elapsed >= .seconds(1) else { return false }
+        let components = elapsed.components
+        let seconds = Double(components.seconds) + Double(components.attoseconds) / 1_000_000_000_000_000_000
+        guard seconds > 0 else { return false }
+        downloadRate = Double(downloadedBytes - lastTickDownloaded) / seconds
+        uploadRate = Double(uploadedBytes - lastTickUploaded) / seconds
+        lastTickDownloaded = downloadedBytes
+        lastTickUploaded = uploadedBytes
+        lastRateSampleTime = now
+        return true
+    }
+
+    private func resetTransferRates() {
+        downloadRate = 0
+        uploadRate = 0
+        lastTickDownloaded = downloadedBytes
+        lastTickUploaded = uploadedBytes
+        lastRateSampleTime = .now
     }
 
     /// Requeues active pieces that haven't received a block recently — their remaining blocks

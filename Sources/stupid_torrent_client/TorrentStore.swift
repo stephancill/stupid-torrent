@@ -33,6 +33,7 @@ final class TorrentStore {
     var resolvingItems: [ResolvingTorrentItem] = []
     var addError: String?
     var pendingPlayback: PlaybackRequest?
+    var restorationComplete = false
 
     private let documentsURL: URL
     let downloadsURL: URL
@@ -41,6 +42,9 @@ final class TorrentStore {
     private let pausedURL: URL
     private var addedDates: [String: Date] = [:]
     private var pausedIDs: Set<String> = []
+    private var restoredIDs: Set<String> = []
+    private var isRestoring = false
+    private var submittedRestoredBackgroundTasks = false
 
     init() {
         documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -81,14 +85,30 @@ final class TorrentStore {
     }
 
     func restore() {
-        guard items.isEmpty else { return }
+        guard items.isEmpty, !isRestoring else { return }
+        isRestoring = true
         let files = (try? FileManager.default.contentsOfDirectory(atPath: torrentsURL.path)) ?? []
         Task {
             for name in files where name.hasSuffix(".torrent") {
                 let url = torrentsURL.appendingPathComponent(name)
                 guard let data = try? Data(contentsOf: url),
                       let metainfo = try? Metainfo(data: data) else { continue }
-                try? await add(metainfo: metainfo, persist: false)
+                restoredIDs.insert(metainfo.infoHash.hexString)
+                try? await add(metainfo: metainfo, persist: false, submitBackgroundTask: false)
+            }
+            restorationComplete = true
+        }
+    }
+
+    func submitRestoredBackgroundTasks() {
+        guard restorationComplete, !submittedRestoredBackgroundTasks else { return }
+        submittedRestoredBackgroundTasks = true
+        let restoredItems = items.filter {
+            restoredIDs.contains($0.id) && !pausedIDs.contains($0.id) && !$0.isComplete
+        }
+        Task {
+            for item in restoredItems {
+                await trackBackgroundDownload(item, submit: true)
             }
         }
     }
@@ -140,7 +160,12 @@ final class TorrentStore {
         return downloadsURL.appendingPathComponent("\(name) \(prefix)", isDirectory: true)
     }
 
-    private func add(metainfo: Metainfo, persist: Bool, injectedPeer: PeerAddress? = nil) async throws {
+    private func add(
+        metainfo: Metainfo,
+        persist: Bool,
+        injectedPeer: PeerAddress? = nil,
+        submitBackgroundTask: Bool = true
+    ) async throws {
         guard !items.contains(where: { $0.id == metainfo.infoHash.hexString }) else {
             throw TorrentStoreError.alreadyAdded
         }
@@ -171,7 +196,10 @@ final class TorrentStore {
         )
         items.append(item)
         item.start()
-        await trackBackgroundDownload(item, submit: persist && !item.isPaused && !item.isComplete)
+        await trackBackgroundDownload(
+            item,
+            submit: submitBackgroundTask && !item.isPaused && !item.isComplete
+        )
     }
 
     private func persistTorrent(_ metainfo: Metainfo) {
@@ -223,8 +251,8 @@ final class TorrentStore {
                 await item.torrent.resume()
                 await trackBackgroundDownload(item, submit: true)
             } else {
-                await item.torrent.pause()
                 await cancelBackgroundDownload(item)
+                await item.torrent.pause()
             }
         }
     }

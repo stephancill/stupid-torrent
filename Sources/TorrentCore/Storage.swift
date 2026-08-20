@@ -21,13 +21,16 @@ public actor Storage {
 
     public func prepare() throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try allowAccessWhileLocked(at: directory)
         for index in metainfo.files.indices {
             let file = metainfo.files[index]
             let url = directory.appendingPathComponent(file.pathString)
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try allowAccessWhileLocked(at: url.deletingLastPathComponent())
             if !FileManager.default.fileExists(atPath: url.path) {
                 FileManager.default.createFile(atPath: url.path, contents: nil)
             }
+            try allowAccessWhileLocked(at: url)
         }
     }
 
@@ -139,7 +142,9 @@ public actor Storage {
         var data = Data()
         data.appendUInt32BE(UInt32(metainfo.pieceCount))
         data.append(verified.data())
-        try data.write(to: verifiedSidecarURL())
+        let url = verifiedSidecarURL()
+        try data.write(to: url)
+        try allowAccessWhileLocked(at: url)
     }
 
     private func write(file index: Int, offset: Int, data: Data) throws {
@@ -169,6 +174,15 @@ public actor Storage {
         }
         handles[index] = handle
         return handle
+    }
+
+    private func allowAccessWhileLocked(at url: URL) throws {
+        #if os(iOS)
+        try FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: url.path
+        )
+        #endif
     }
 
     private func fileSlices(in range: Range<Int>) -> [(fileIndex: Int, fileOffset: Int, length: Int)] {
