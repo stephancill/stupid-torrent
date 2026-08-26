@@ -4,6 +4,28 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-27 — Fix: deletion persists (info hash drift in persisted `.torrent` files)
+
+Deleting a torrent (Wolf of Wall Street report) didn't stick: `Metainfo.torrentData()`
+re-encoded the raw `info` dict through the canonical encoder, so any torrent whose embedded
+info dict was not already byte-canonical (unsorted keys) was persisted with a *different*
+SHA-1 info hash than the in-memory item. `TorrentStore.remove` deletes the persisted
+`.torrent` by matching that hash — no match → the file survived → `restore()` re-added the
+torrent on the next launch. The same drift also explains the earlier "Succession vanished
+after the crash": on relaunch the torrent was restored under a drifted hash/id (fresh data
+directory), so the old download looked gone.
+
+- `Metainfo.torrentData()` now emits the `info` value as the original raw `infoDict` bytes
+  (announce-list / display-name keys stay canonically encoded), so a persisted `.torrent`
+  always re-parses to the identical infohash. `Metainfo` gained a private
+  `byteString(_:)` helper.
+- New regression `persistedNonCanonicalInfoPreservesInfoHash`: an info dict with unsorted
+  keys (name, pieces, length, piece length) must round-trip through `torrentData()` with an
+  unchanged info hash. RED before the fix (hash differed), GREEN after. 81 tests pass.
+- Note: files already persisted with a drifted hash are deleted normally once the fixed
+  build has restored them (restore yields the file's own id → `remove` matches), so no
+  migration is needed.
+
 ### 2026-08-27 — Feat: dev-build engine logging via the unified log (crash diagnostic aid)
 
 After a device crash mid-stream (Succession) produced no per-app `.ips` and the newest

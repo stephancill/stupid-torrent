@@ -291,6 +291,26 @@ extension Data {
         #expect(restored.trackerTiers == source.trackerTiers)
     }
 
+    @Test func persistedNonCanonicalInfoPreservesInfoHash() throws {
+        // An info dict whose keys are NOT lexicographically sorted (name, pieces, length,
+        // piece length). Re-encoding it through a canonical encoder silently changes the
+        // bytes and therefore the SHA-1 info hash, which breaks the store's delete-by-hash
+        // (a deleted torrent's persisted .torrent survives and is re-added on relaunch).
+        var info = Data("d".utf8)
+        info.append(Data("4:name5:hello".utf8))
+        info.append(Data("6:pieces20:".utf8))
+        info.append(Data(repeating: 0xAB, count: 20))
+        info.append(Data("6:lengthi5e12:piece lengthi5ee".utf8))
+
+        let source = try Metainfo(infoDict: info)
+        let restored = try Metainfo(data: source.torrentData())
+
+        #expect(restored.infoHash == source.infoHash)
+        #expect(restored.name == "hello")
+        #expect(restored.pieceCount == 1)
+        #expect(restored.totalLength == 5)
+    }
+
     @Test func mapsPiecesToFilesAcrossBoundaries() throws {
         let info = try Metainfo(data: try Fixtures.bigBuckBunnyTorrentData)
         // srt occupies bytes 0..140, which is inside piece 0; mp4 starts at 140.

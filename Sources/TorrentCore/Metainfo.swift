@@ -53,18 +53,33 @@ public struct Metainfo: Sendable, Equatable {
     }
 
     /// Re-encodes this metainfo as a `.torrent` file (info dict + trackers), for persistence.
+    /// The `info` value is emitted as the original raw bytes, so the persisted file's SHA-1
+    /// info hash always equals `infoHash` — re-canonicalizing it would silently change the
+    /// hash for non-canonical torrents and break the store's delete-by-hash / restore
+    /// identity (a deleted torrent's `.torrent` would survive and be re-added on relaunch).
     public func torrentData() throws -> Data {
-        var dict: [String: BValue] = ["info": try Bencode.decode(infoDict)]
+        var data = Data("d".utf8)
         if !trackerTiers.isEmpty {
-            let tiers = trackerTiers.map { tier in
+            let tiersValue = trackerTiers.map { tier in
                 BValue.list(tier.map { .string(Data($0.absoluteString.utf8)) })
             }
-            dict["announce-list"] = .list(tiers)
+            data.append(Self.byteString("announce-list"))
+            data.append(Bencode.encode(.list(tiersValue)))
         }
+        data.append(Self.byteString("info"))
+        data.append(infoDict)
         if displayName != name {
-            dict["stupid-torrent-display-name"] = .string(Data(displayName.utf8))
+            data.append(Self.byteString("stupid-torrent-display-name"))
+            data.append(Bencode.encode(.string(Data(displayName.utf8))))
         }
-        return Bencode.encode(.dictionary(dict))
+        data.append(Data("e".utf8))
+        return data
+    }
+
+    /// `len:key` byte literal for a bencoded dictionary key.
+    private static func byteString(_ string: String) -> Data {
+        let bytes = Data(string.utf8)
+        return Data("\(bytes.count):".utf8) + bytes
     }
 
     public func byteRange(ofFileAt index: Int) -> Range<Int> {
