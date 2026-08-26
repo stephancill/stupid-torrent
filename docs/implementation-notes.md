@@ -4,6 +4,23 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-27 — Feat: dev-build engine logging via the unified log (crash diagnostic aid)
+
+After a device crash mid-stream (Succession) produced no per-app `.ips` and the newest
+`JetsamEvent` (2026-08-26 19:38) was classified as a resource-limit termination, verbose
+logging was reinstated for Debug builds only, routed through the unified log instead of raw
+stderr so a crash is contextualized and the flood that SIGKILL'd build 5 cannot recur.
+
+- `TorrentLog.log` now emits to `NSLog` (unified log) in addition to stderr, capped at
+  `maxPerSecond` (200/s) via an NSLock-guarded sliding window so engine hot loops
+  (per-refill "requesting N blocks", streaming serve logs) are coalesced rather than
+  overwhelming the process. `TorrentLog.verbose` stays default-off.
+- App init enables `TorrentLog.verbose = true` only under `#if DEBUG`; TestFlight/Release
+  builds remain quiet.
+- Verification: `swift build` and all 80 tests pass; `stupid-app run --network`
+  (UDID `00008130-001C4CA030A1401C`) built, signed, installed, and launched the Debug
+  build (pid 11357).
+
 ### 2026-08-20 — Fix: serialize engine startup during restore
 
 TestFlight build 5 still reproduced the launch-time `SIGKILL` after verbose logging was disabled. Isolating the persisted restore set showed that each torrent launched successfully alone, while the initial concurrent restore of three active torrents triggered the failure. Each `Torrent` previously allowed 50 peers and TCP uses dedicated connect, reader, and send threads, so restoring three torrents could create roughly 150 persistent peer threads plus transient connection and send threads at once.
