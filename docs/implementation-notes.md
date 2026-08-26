@@ -4,6 +4,31 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-27 — Fix: torrent deletion really sticks (delete ALL persisted copies + store tests)
+
+The 2026-08-27 `Metainfo` fix stopped new info-hash drift, but a device retest (Wolf of Wall
+Street "deleted, still there after reopen") showed `remove()` could still leave the torrent
+behind: it deleted only the FIRST `.torrent` file matching the info hash and `break`-ed. The
+same torrent is legitimately persisted under several display-name files (a file import names
+it by its internal `name`, a magnet by its `dn`), so any leftover copy made `restore()`
+re-add it on every relaunch.
+
+- `TorrentStore.remove` now deletes **every** persisted `.torrent` whose info hash matches
+  the item's id (the `break` is gone). This also cleans up legacy duplicate files.
+- Split the store layer out of the `@main` app target into a new library target
+  `StupidClientCore` (`TorrentStore`, `TorrentItem`, `ContinuedDownloadManager` moved;
+  cross-module surface made `public`) so `TorrentStore` can be unit-tested — the app target
+  cannot be linked into a test runner (duplicate `_main`). App target now depends on
+  `StupidClientCore`; `stupid-app build` still produces the single app product.
+- `TorrentStore` gained a documents-URL test seam (`init(documentsURL:dhtEnabled:)`), an
+  awaitable `addFileAndWait` file-import seam, and DHT-disable for hermetic tests.
+- New `TorrentStorePersistenceTests` (2 tests): a deleted torrent stays deleted across a
+  simulated relaunch (fresh store over the same documents dir), and `remove` deletes every
+  persisted copy when the same torrent lives under two display-name files.
+
+Verification: the duplicate-copies test fails against the old `break` logic and passes now;
+all 83 tests pass; `stupid-app build` green.
+
 ### 2026-08-27 — Fix: deletion persists (info hash drift in persisted `.torrent` files)
 
 Deleting a torrent (Wolf of Wall Street report) didn't stick: `Metainfo.torrentData()`

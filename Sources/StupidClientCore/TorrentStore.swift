@@ -10,48 +10,62 @@ private enum TorrentStoreError: LocalizedError {
     }
 }
 
-struct ResolvingTorrentItem: Identifiable {
-    let id: String
-    let name: String
-    let addedAt: Date
+public struct ResolvingTorrentItem: Identifiable {
+    public let id: String
+    public let name: String
+    public let addedAt: Date
 }
 
 /// A request to open a player for a torrent file. Held on `TorrentStore` (not the detail view,
 /// which is recreated on every status tick for a downloading torrent) so the full-screen player
 /// cover presented from `ContentView` reliably sees the request.
-struct PlaybackRequest: Identifiable {
-    let id = UUID()
-    let torrent: Torrent
-    let fileIndex: Int
-    let kind: Torrent.PlaybackKind
+public struct PlaybackRequest: Identifiable {
+    public let id = UUID()
+    public let torrent: Torrent
+    public let fileIndex: Int
+    public let kind: Torrent.PlaybackKind
+
+    public init(torrent: Torrent, fileIndex: Int, kind: Torrent.PlaybackKind) {
+        self.torrent = torrent
+        self.fileIndex = fileIndex
+        self.kind = kind
+    }
 }
 
 @MainActor
 @Observable
-final class TorrentStore {
-    var items: [TorrentItem] = []
-    var resolvingItems: [ResolvingTorrentItem] = []
-    var addError: String?
-    var pendingPlayback: PlaybackRequest?
-    var restorationComplete = false
+public final class TorrentStore {
+    public var items: [TorrentItem] = []
+    public var resolvingItems: [ResolvingTorrentItem] = []
+    public var addError: String?
+    public var pendingPlayback: PlaybackRequest?
+    public var restorationComplete = false
 
     private let documentsURL: URL
-    let downloadsURL: URL
+    public let downloadsURL: URL
     private let torrentsURL: URL
     private let datesURL: URL
     private let pausedURL: URL
+    private let dhtEnabled: Bool
     private var addedDates: [String: Date] = [:]
     private var pausedIDs: Set<String> = []
     private var restoredIDs: Set<String> = []
     private var isRestoring = false
     private var submittedRestoredBackgroundTasks = false
 
-    init() {
-        documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    public convenience init() {
+        self.init(documentsURL: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0])
+    }
+
+    /// Test seam: point the store at a temporary documents directory and (optionally) disable
+    /// the DHT so restore/add stays hermetic.
+    init(documentsURL: URL, dhtEnabled: Bool = true) {
+        self.documentsURL = documentsURL
         downloadsURL = documentsURL.appendingPathComponent("downloads", isDirectory: true)
         torrentsURL = documentsURL.appendingPathComponent("torrents", isDirectory: true)
         datesURL = documentsURL.appendingPathComponent("added-dates.json")
         pausedURL = documentsURL.appendingPathComponent("paused.json")
+        self.dhtEnabled = dhtEnabled
         addedDates = Self.loadDates(datesURL)
         pausedIDs = Set(Self.loadPausedIDs(pausedURL))
         try? FileManager.default.createDirectory(at: downloadsURL, withIntermediateDirectories: true)
@@ -84,7 +98,7 @@ final class TorrentStore {
         try? data.write(to: datesURL)
     }
 
-    func restore() {
+    public func restore() {
         guard items.isEmpty, !isRestoring else { return }
         isRestoring = true
         let files = (try? FileManager.default.contentsOfDirectory(atPath: torrentsURL.path)) ?? []
@@ -100,7 +114,7 @@ final class TorrentStore {
         }
     }
 
-    func submitRestoredBackgroundTasks() {
+    public func submitRestoredBackgroundTasks() {
         guard restorationComplete, !submittedRestoredBackgroundTasks else { return }
         submittedRestoredBackgroundTasks = true
         let restoredItems = items.filter {
@@ -113,7 +127,7 @@ final class TorrentStore {
         }
     }
 
-    func addMagnet(_ string: String) throws {
+    public func addMagnet(_ string: String) throws {
         let magnet = try MagnetLinkParser.parse(string.trimmingCharacters(in: .whitespacesAndNewlines))
         let id = magnet.infoHash.hexString
         if items.contains(where: { $0.id == id }) || resolvingItems.contains(where: { $0.id == id }) {
@@ -141,14 +155,25 @@ final class TorrentStore {
         }
     }
 
-    func addFile(_ url: URL) throws {
+    public func addFile(_ url: URL) throws {
+        let data = try Self.readScopedData(from: url)
+        let metainfo = try Metainfo(data: data)
+        Task { try? await add(metainfo: metainfo, persist: true) }
+    }
+
+    /// Awaitable file import (test seam; the UI path is fire-and-forget `addFile`).
+    public func addFileAndWait(_ url: URL) async throws {
+        let data = try Self.readScopedData(from: url)
+        let metainfo = try Metainfo(data: data)
+        try await add(metainfo: metainfo, persist: true)
+    }
+
+    private static func readScopedData(from url: URL) throws -> Data {
         let accessing = url.startAccessingSecurityScopedResource()
         defer {
             if accessing { url.stopAccessingSecurityScopedResource() }
         }
-        let data = try Data(contentsOf: url)
-        let metainfo = try Metainfo(data: data)
-        Task { try? await add(metainfo: metainfo, persist: true) }
+        return try Data(contentsOf: url)
     }
 
     /// The per-torrent data directory under `downloads/`. Named `<display name> <hash-prefix>` so
@@ -178,7 +203,12 @@ final class TorrentStore {
             saveDates()
         }
         let directory = torrentDirectory(for: metainfo)
-        let torrent = Torrent(directory: directory, metainfo: metainfo, startPaused: pausedIDs.contains(key))
+        let torrent = Torrent(
+            directory: directory,
+            metainfo: metainfo,
+            enableDHT: dhtEnabled,
+            startPaused: pausedIDs.contains(key)
+        )
         if let injectedPeer {
             // The metadata-serving peer is a verified-reachable seeder; feed it straight into the
             // download instead of re-discovering the (mostly-dead) swarm.
@@ -208,7 +238,7 @@ final class TorrentStore {
         try? metainfo.torrentData().write(to: url)
     }
 
-    func remove(_ item: TorrentItem) {
+    public func remove(_ item: TorrentItem) {
         Task { await cancelBackgroundDownload(item) }
         item.stop()
         items.removeAll { $0.id == item.id }
@@ -227,8 +257,11 @@ final class TorrentStore {
                 guard let data = try? Data(contentsOf: url),
                       let metainfo = try? Metainfo(data: data),
                       metainfo.infoHash.hexString == item.id else { continue }
+                // Delete EVERY persisted copy, not just the first: the same torrent can be
+                // persisted under several display-name files (a file import names it by its
+                // internal `name`, a magnet by its `dn`), and any copy left behind makes
+                // restore() re-add the torrent on the next launch.
                 try? FileManager.default.removeItem(at: url)
-                break
             }
         }
         // Also remove the per-torrent data directory (files + resume sidecar live inside it) so
@@ -237,7 +270,7 @@ final class TorrentStore {
     }
 
     /// Pauses/resumes a torrent and persists the paused state so it survives a relaunch.
-    func togglePause(_ item: TorrentItem) {
+    public func togglePause(_ item: TorrentItem) {
         guard !item.isComplete else { return }
         let wasPaused = item.isPaused
         if wasPaused {

@@ -34,10 +34,13 @@ let package = Package(
             dependencies: ["TorrentCore"]
         ),
         .target(
+            name: "StupidClientCore",
+            dependencies: ["TorrentCore", "Streaming"]
+        ),
+        .target(
             name: "stupid_torrent_client",
             dependencies: [
-                "TorrentCore",
-                "Streaming",
+                "StupidClientCore",
             ]
         ),
         .executableTarget(
@@ -60,6 +63,10 @@ let package = Package(
         .testTarget(
             name: "StreamingTests",
             dependencies: ["Streaming", "TorrentCore", "TorrentTestingSupport"]
+        ),
+        .testTarget(
+            name: "StupidTorrentClientAppTests",
+            dependencies: ["StupidClientCore", "TorrentCore", "Bencode", "TorrentTestingSupport"]
         ),
     ]
 )

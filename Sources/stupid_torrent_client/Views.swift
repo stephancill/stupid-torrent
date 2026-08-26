@@ -3,6 +3,7 @@ import AVKit
 import AVFoundation
 import TorrentCore
 import Streaming
+import StupidClientCore
 
 struct ContentView: View {
     @State private var store = TorrentStore()
