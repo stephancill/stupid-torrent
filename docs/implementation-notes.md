@@ -4,6 +4,28 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-29 — Feat: playback screen is always landscape
+
+The playback (full-screen player) screen is now always presented in landscape, rather than
+relying on a manual rotate button. A rotate button was attempted first but fought AVKit's
+own transport surface, so it was dropped in favor of unconditional landscape.
+
+- `OrientationLock` gained a `forced` orientation override (`force(_:)` / `clearForce()`).
+  When set, `mask()` returns only that orientation before the player-presented/iPad logic.
+  Rotation is driven by the modern `UIWindowScene.requestGeometryUpdate(.iOS(...))`
+  (iOS 16+), which works with Rotation Lock enabled and on the simulator — the interface
+  genuinely rotates to `landscapeRight`.
+- `PlayerView.onAppear` forces `.landscapeRight` while the player is up; `onDisappear`
+  clears the force (and `playerPresented`), so the torrent list returns to portrait. iPad is
+  unaffected (its `mask()` already allows `.all`).
+- Note: `AVPlayerViewController.customOverlayViewController` is **tvOS-only**
+  (`API_UNAVAILABLE(ios)`), which is why an earlier attempt to sync a button with AVKit's
+  native controls was not viable on iOS.
+
+Verification: macOS `swift build` and `stupid-app build` (arm64 iOS) both green; on the iOS
+26.3 simulator opening Big Buck Bunny flips the scene to `landscapeRight` (UIKit log) and
+displays AVPlayer's native landscape transport, with no custom button overlay remaining.
+
 ### 2026-08-29 — Feat: resumable playback via cached timestamps
 
 Opening a media file now resumes from where you last left off. The player caches the
@@ -20,7 +42,11 @@ playhead position (seconds) per torrent file and seeks back to it on the next op
 - `PlayerView` now takes the store, torrent, and file index. On open it seeks to the cached
   position (skipping positions inside the opening window or within 5 s of the end, both of
   which mean "play from the top"); on dismiss it persists the current time (ignoring the
-  first 5 s and the last 5 s so finished/never-started media start fresh).
+  first 5 s and the last 5 s so finished/never-started media start fresh). A ticker on the
+  player view also persists the playhead every 5 s while actively playing, so a force-quit
+  or system kill still resumes near the last watched point — not only when the player is
+  dismissed. The ticker lives on the view's lifetime (not the transient loading branch) and
+  is cancelled with the view's task when the player closes.
 - New `playbackPositionPersistsAcrossRelaunch` regression: saving a position, then a fresh
   store over the same defaults, reads it back.
 

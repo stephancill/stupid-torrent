@@ -495,26 +495,32 @@ struct PlayerView: View {
                 #endif
             } else {
                 ProgressView()
-                    .task {
-                        let preparedPlayer = await session.makePlayer()
-                        guard !Task.isCancelled else {
-                            preparedPlayer.pause()
-                            return
-                        }
-                        seekToResume(on: preparedPlayer)
-                        player = preparedPlayer
-                    }
             }
         }
         .onAppear {
             #if os(iOS)
             OrientationLock.playerPresented = true
+            // The player is always presented in landscape.
+            OrientationLock.force(.landscapeRight)
             #endif
         }
+        .task {
+            let prepared = await session.makePlayer()
+            guard !Task.isCancelled else {
+                prepared.pause()
+                return
+            }
+            seekToResume(on: prepared)
+            player = prepared
+            await persistWhilePlaying(prepared)
+        }
         .onDisappear {
-            persistPosition()
+            if let player {
+                persistPosition(from: player, onlyWhilePlaying: false)
+            }
             #if os(iOS)
             OrientationLock.playerPresented = false
+            OrientationLock.clearForce()
             #endif
             player?.pause()
             player?.replaceCurrentItem(with: nil)
@@ -540,10 +546,23 @@ struct PlayerView: View {
         stream.seek(to: CMTime(seconds: resume, preferredTimescale: 600))
     }
 
-    /// Cache the current playhead position when the player is dismissed, so a later open can
-    /// resume. Positions within the end window are ignored so finished media starts fresh.
-    private func persistPosition() {
-        guard let stream = player, let item = stream.currentItem else { return }
+    /// Periodically cache the playhead while playback runs, so a force-quit or system kill still
+    /// resumes near the last watched point — not only when the player is dismissed. The loop is
+    /// cancelled with the view's task when the player closes.
+    private func persistWhilePlaying(_ stream: AVPlayer) async {
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return }
+            persistPosition(from: stream, onlyWhilePlaying: true)
+        }
+    }
+
+    /// Cache the current playhead position so a later open can resume. Positions within the first
+    /// or last 5 s are ignored (never-started and finished media start fresh). The periodic ticker
+    /// writes only while actually playing; dismissal always saves the final position.
+    private func persistPosition(from stream: AVPlayer, onlyWhilePlaying: Bool) {
+        guard let item = stream.currentItem else { return }
+        if onlyWhilePlaying, stream.timeControlStatus != .playing { return }
         let seconds = stream.currentTime().seconds
         guard seconds.isFinite, seconds > 5 else { return }
         let duration = item.duration.seconds
@@ -555,14 +574,12 @@ struct PlayerView: View {
 #if os(iOS)
 struct AVPlayerControllerRepresentable: UIViewControllerRepresentable {
     let player: AVPlayer
-    var showsPlaybackControls = true
 
     func makeUIViewController(context: Context) -> AVPlayerViewController {
         configureAudioSession()
         let controller = AVPlayerViewController()
         controller.player = player
-        controller.showsPlaybackControls = showsPlaybackControls
-        // System PiP button appears automatically when supported and content allows it.
+        controller.showsPlaybackControls = true
         controller.allowsPictureInPicturePlayback = true
         let loadingIndicator = UIActivityIndicatorView(style: .large)
         loadingIndicator.color = .white
