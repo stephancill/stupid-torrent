@@ -44,11 +44,16 @@ public final class TorrentStore {
     private let documentsURL: URL
     public let downloadsURL: URL
     private let torrentsURL: URL
-    private let datesURL: URL
-    private let pausedURL: URL
+    private let defaults: UserDefaults
+    private static let addedDatesKey = "addedDates"
+    private static let pausedIDsKey = "pausedIDs"
+    private static let playbackPositionsKey = "playbackPositions"
     private let dhtEnabled: Bool
     private var addedDates: [String: Date] = [:]
     private var pausedIDs: Set<String> = []
+    /// Cached playback positions keyed by `"<infoHash>|<fileIndex>"`, so each torrent file's
+    /// playback can resume where the user left off.
+    private var playbackPositions: [String: Double] = [:]
     private var restoredIDs: Set<String> = []
     private var isRestoring = false
     private var submittedRestoredBackgroundTasks = false
@@ -59,43 +64,29 @@ public final class TorrentStore {
 
     /// Test seam: point the store at a temporary documents directory and (optionally) disable
     /// the DHT so restore/add stays hermetic.
-    init(documentsURL: URL, dhtEnabled: Bool = true) {
+    init(documentsURL: URL, dhtEnabled: Bool = true, defaults: UserDefaults = .standard) {
         self.documentsURL = documentsURL
         downloadsURL = documentsURL.appendingPathComponent("downloads", isDirectory: true)
         torrentsURL = documentsURL.appendingPathComponent("torrents", isDirectory: true)
-        datesURL = documentsURL.appendingPathComponent("added-dates.json")
-        pausedURL = documentsURL.appendingPathComponent("paused.json")
+        self.defaults = defaults
         self.dhtEnabled = dhtEnabled
-        addedDates = Self.loadDates(datesURL)
-        pausedIDs = Set(Self.loadPausedIDs(pausedURL))
+        addedDates = defaults.dictionary(forKey: Self.addedDatesKey) as? [String: Date] ?? [:]
+        pausedIDs = Set(defaults.array(forKey: Self.pausedIDsKey) as? [String] ?? [])
+        playbackPositions = defaults.dictionary(forKey: Self.playbackPositionsKey) as? [String: Double] ?? [:]
         try? FileManager.default.createDirectory(at: downloadsURL, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: torrentsURL, withIntermediateDirectories: true)
     }
 
-    private static func loadPausedIDs(_ url: URL) -> [String] {
-        guard let data = try? Data(contentsOf: url),
-              let raw = try? JSONSerialization.jsonObject(with: data) as? [String] else { return [] }
-        return raw
-    }
-
     private func savePausedIDs() {
-        let raw = Array(pausedIDs).sorted()
-        guard let data = try? JSONSerialization.data(withJSONObject: raw, options: [.sortedKeys]) else { return }
-        try? data.write(to: pausedURL)
+        defaults.set(Array(pausedIDs), forKey: Self.pausedIDsKey)
     }
 
-    private static func loadDates(_ url: URL) -> [String: Date] {
-        guard let data = try? Data(contentsOf: url),
-              let raw = try? JSONSerialization.jsonObject(with: data) as? [String: String] else { return [:] }
-        let iso = ISO8601DateFormatter()
-        return raw.compactMapValues { iso.date(from: $0) }
+    private func savePlaybackPositions() {
+        defaults.set(playbackPositions, forKey: Self.playbackPositionsKey)
     }
 
     private func saveDates() {
-        let iso = ISO8601DateFormatter()
-        let raw = addedDates.mapValues { iso.string(from: $0) }
-        guard let data = try? JSONSerialization.data(withJSONObject: raw, options: [.sortedKeys]) else { return }
-        try? data.write(to: datesURL)
+        defaults.set(addedDates, forKey: Self.addedDatesKey)
     }
 
     public func restore() {
@@ -246,6 +237,8 @@ public final class TorrentStore {
         saveDates()
         pausedIDs.remove(item.id)
         savePausedIDs()
+        playbackPositions = playbackPositions.filter { !$0.key.hasPrefix("\(item.id)|") }
+        savePlaybackPositions()
         // Delete the persisted .torrent by matching its info hash, not by reconstructing the
         // filename from displayName: a magnet-resolved torrent's displayName (the `dn` param, e.g.
         // "...x264[eztv.re][eztvx.to]") can differ from the filename it was saved under (e.g.
@@ -300,5 +293,21 @@ public final class TorrentStore {
         #if os(iOS)
         await ContinuedDownloadManager.shared.cancel(torrent: item.torrent)
         #endif
+    }
+
+    /// The cached playback position (seconds) for a torrent file, or `nil` if none was saved.
+    /// Used to resume playback where the user last left off.
+    public func playbackPosition(torrent: Torrent, fileIndex: Int) -> Double? {
+        playbackPositions[Self.playbackKey(torrent: torrent, fileIndex: fileIndex)]
+    }
+
+    /// Persists a file's playback position (seconds) so a later open can resume there.
+    public func savePlaybackPosition(_ seconds: Double, torrent: Torrent, fileIndex: Int) {
+        playbackPositions[Self.playbackKey(torrent: torrent, fileIndex: fileIndex)] = seconds
+        savePlaybackPositions()
+    }
+
+    private static func playbackKey(torrent: Torrent, fileIndex: Int) -> String {
+        "\(torrent.metainfo.infoHash.hexString)|\(fileIndex)"
     }
 }

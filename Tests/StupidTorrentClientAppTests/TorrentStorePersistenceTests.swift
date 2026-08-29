@@ -38,6 +38,30 @@ struct TorrentStorePersistenceTests {
         #expect(store.restorationComplete)
     }
 
+    @Test func playbackPositionPersistsAcrossRelaunch() async throws {
+        let documents = try makeDocuments()
+        defer { try? FileManager.default.removeItem(at: documents) }
+
+        let metainfo = try trackerlessMetainfo()
+        let importURL = documents.appendingPathComponent("import.torrent")
+        try metainfo.torrentData().write(to: importURL)
+
+        let suiteName = "playback-test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = TorrentStore(documentsURL: documents, dhtEnabled: false, defaults: defaults)
+        try await store.addFileAndWait(importURL)
+        let item = store.items[0]
+        #expect(store.playbackPosition(torrent: item.torrent, fileIndex: 0) == nil)
+
+        store.savePlaybackPosition(123.75, torrent: item.torrent, fileIndex: 0)
+
+        // A fresh store over the same defaults reads the position back.
+        let relaunched = TorrentStore(documentsURL: documents, dhtEnabled: false, defaults: defaults)
+        #expect(relaunched.playbackPosition(torrent: item.torrent, fileIndex: 0) == 123.75)
+    }
+
     @Test func deletedTorrentStaysDeletedAcrossRelaunch() async throws {
         let documents = try makeDocuments()
         defer { try? FileManager.default.removeItem(at: documents) }

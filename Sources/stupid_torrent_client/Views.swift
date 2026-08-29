@@ -83,7 +83,12 @@ struct ContentView: View {
             .fullScreenCover(item: $store.pendingPlayback) { request in
                 switch request.kind {
                 case .avPlayer:
-                    PlayerView(session: TorrentStreamSession(torrent: request.torrent, fileIndex: request.fileIndex))
+                    PlayerView(
+                        session: TorrentStreamSession(torrent: request.torrent, fileIndex: request.fileIndex),
+                        store: store,
+                        torrent: request.torrent,
+                        fileIndex: request.fileIndex
+                    )
                 case .none:
                     EmptyView()
                 }
@@ -339,6 +344,7 @@ struct TorrentDetailView: View {
     #if !os(iOS)
     @State private var streamSession: TorrentStreamSession?
     @State private var showPlayer = false
+    @State private var playerFileIndex: Int?
     #endif
 
     private var fileIndicesBySize: [Int] {
@@ -397,8 +403,13 @@ struct TorrentDetailView: View {
         }
         #if !os(iOS)
         .sheet(isPresented: $showPlayer) {
-            if let streamSession {
-                PlayerView(session: streamSession)
+            if let streamSession, let playerFileIndex {
+                PlayerView(
+                    session: streamSession,
+                    store: store,
+                    torrent: item.torrent,
+                    fileIndex: playerFileIndex
+                )
             }
         }
         #endif
@@ -409,6 +420,7 @@ struct TorrentDetailView: View {
         store.pendingPlayback = PlaybackRequest(torrent: item.torrent, fileIndex: fileIndex, kind: kind)
         #else
         streamSession = TorrentStreamSession(torrent: item.torrent, fileIndex: fileIndex)
+        playerFileIndex = fileIndex
         showPlayer = true
         #endif
     }
@@ -467,6 +479,9 @@ private struct TorrentDetailMenu: View {
 
 struct PlayerView: View {
     let session: TorrentStreamSession
+    let store: TorrentStore
+    let torrent: Torrent
+    let fileIndex: Int
     @State private var player: AVPlayer?
 
     var body: some View {
@@ -486,6 +501,7 @@ struct PlayerView: View {
                             preparedPlayer.pause()
                             return
                         }
+                        seekToResume(on: preparedPlayer)
                         player = preparedPlayer
                     }
             }
@@ -496,6 +512,7 @@ struct PlayerView: View {
             #endif
         }
         .onDisappear {
+            persistPosition()
             #if os(iOS)
             OrientationLock.playerPresented = false
             #endif
@@ -503,6 +520,35 @@ struct PlayerView: View {
             player?.replaceCurrentItem(with: nil)
             session.stop()
         }
+    }
+
+    /// Seek to the cached position so playback resumes where the user left off. Skipped when a
+    /// saved position is within the opening window or the end (both mean "start from the top").
+    private func seekToResume(on stream: AVPlayer) {
+        guard let resume = store.playbackPosition(torrent: torrent, fileIndex: fileIndex),
+              resume > 5 else { return }
+        if let item = stream.currentItem {
+            let duration = item.duration.seconds
+            if duration.isFinite, duration > 0 {
+                let target = min(resume, duration - 5)
+                if target > 5 {
+                    stream.seek(to: CMTime(seconds: target, preferredTimescale: 600))
+                    return
+                }
+            }
+        }
+        stream.seek(to: CMTime(seconds: resume, preferredTimescale: 600))
+    }
+
+    /// Cache the current playhead position when the player is dismissed, so a later open can
+    /// resume. Positions within the end window are ignored so finished media starts fresh.
+    private func persistPosition() {
+        guard let stream = player, let item = stream.currentItem else { return }
+        let seconds = stream.currentTime().seconds
+        guard seconds.isFinite, seconds > 5 else { return }
+        let duration = item.duration.seconds
+        if duration.isFinite, duration > 0, seconds >= duration - 5 { return }
+        store.savePlaybackPosition(seconds, torrent: torrent, fileIndex: fileIndex)
     }
 }
 

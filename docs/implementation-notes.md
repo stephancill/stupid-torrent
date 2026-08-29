@@ -4,6 +4,28 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-29 — Feat: resumable playback via cached timestamps
+
+Opening a media file now resumes from where you last left off. The player caches the
+playhead position (seconds) per torrent file and seeks back to it on the next open.
+
+- `TorrentStore` now keeps all three small per-torrent preference maps in `UserDefaults`
+  instead of JSON sidecar files in Documents: added dates, paused set, and playback
+  positions (keyed by `"<infoHash>|<fileIndex>"`). `playbackPosition(torrent:fileIndex:)` /
+  `savePlaybackPosition(...)` are the new public surface; `remove` also clears the torrent's
+  cached positions. These are all transient app preferences rather than torrent lifecycle
+  data that must ride along with the data directory, so `UserDefaults` is the right home. The
+  store seam accepts an injectable `UserDefaults` suite so tests stay hermetic. No data
+  migration is needed (preferences are non-critical and simply re-saved on next change).
+- `PlayerView` now takes the store, torrent, and file index. On open it seeks to the cached
+  position (skipping positions inside the opening window or within 5 s of the end, both of
+  which mean "play from the top"); on dismiss it persists the current time (ignoring the
+  first 5 s and the last 5 s so finished/never-started media start fresh).
+- New `playbackPositionPersistsAcrossRelaunch` regression: saving a position, then a fresh
+  store over the same defaults, reads it back.
+
+Verification: all 84 tests pass (3 in `TorrentStorePersistenceTests`); `swift build` green.
+
 ### 2026-08-27 — Fix: torrent deletion really sticks (delete ALL persisted copies + store tests)
 
 The 2026-08-27 `Metainfo` fix stopped new info-hash drift, but a device retest (Wolf of Wall
