@@ -20,10 +20,10 @@ leaving the torrent detail stuck in landscape on a real device. Two layers:
   `UIDevice`-orientation/`attemptRotationToDeviceOrientation` triggers that in-market apps
   use to force the interface to follow.
 
-Verification: macOS `swift build` and `stupid-app build` green. Note the iOS simulator
-does not reverse from landscape to portrait once programmatically rotated (a known simulator
-limitation the dismiss still fires and `playerPresented` resets), so portrait-return must be
-confirmed on a physical device.
+Verification: macOS `swift build` and `stupid-app build` green. Confirmed working on a
+physical device (TestFlight build 11): dismissing the player from the detail/open state
+returns the torrent UI to portrait. The iOS simulator itself does not reverse from landscape
+back to portrait once programmatically rotated, so this was validated on-device.
 
 ### 2026-08-29 — Fix: landscape only while the player is active (and after closing with X)
 
