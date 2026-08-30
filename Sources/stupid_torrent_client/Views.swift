@@ -80,7 +80,11 @@ struct ContentView: View {
                 TorrentDetailView(item: item, store: store)
             }
             #if os(iOS)
-            .fullScreenCover(item: $store.pendingPlayback) { request in
+            .fullScreenCover(item: $store.pendingPlayback, onDismiss: {
+                // Any dismissal of the player (swipe, or AVKit's native X) must end the
+                // player-orientation pin so the torrent UI returns to portrait.
+                OrientationLock.playerPresented = false
+            }) { request in
                 switch request.kind {
                 case .avPlayer:
                     PlayerView(
@@ -500,8 +504,6 @@ struct PlayerView: View {
         .onAppear {
             #if os(iOS)
             OrientationLock.playerPresented = true
-            // The player is always presented in landscape.
-            OrientationLock.force(.landscapeRight)
             #endif
         }
         .task {
@@ -520,7 +522,6 @@ struct PlayerView: View {
             }
             #if os(iOS)
             OrientationLock.playerPresented = false
-            OrientationLock.clearForce()
             #endif
             player?.pause()
             player?.replaceCurrentItem(with: nil)

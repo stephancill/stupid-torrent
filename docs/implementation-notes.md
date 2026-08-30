@@ -4,6 +4,45 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-08-30 — Fix: player dismiss returns the app to portrait
+
+Follow-up to the always-landscape player: dismissing the player (AVKit's native X) was
+leaving the torrent detail stuck in landscape on a real device. Two layers:
+
+- Orientation is now driven purely by `OrientationLock.playerPresented` (removed the global
+  `forced` override): `mask()` is `.landscape` during the player and `.portrait` after it.
+  `playerPresented` is a `didSet` that calls a `rotate(to:)` helper; the mask is portrait-only
+  once the player dismisses, which forces a real device back to portrait.
+- Dismissal is ensured from both `PlayerView.onDisappear` and the cover's `onDismiss`, so
+  closing via AVKit's X (not just a swipe) always clears the pin. `rotate(to:)` combines the
+  sanctioned `UIWindowScene.requestGeometryUpdate` (with one retry, since the initial request
+  is often rejected while the player view controller still claims portrait) with the legacy
+  `UIDevice`-orientation/`attemptRotationToDeviceOrientation` triggers that in-market apps
+  use to force the interface to follow.
+
+Verification: macOS `swift build` and `stupid-app build` green. Note the iOS simulator
+does not reverse from landscape to portrait once programmatically rotated (a known simulator
+limitation the dismiss still fires and `playerPresented` resets), so portrait-return must be
+confirmed on a physical device.
+
+### 2026-08-29 — Fix: landscape only while the player is active (and after closing with X)
+
+Follow-up to the always-landscape player: the landscape pin leaked to the torrent detail.
+Root cause was a global `forced` override active whether or not the player is actually up.
+The orientation is now driven purely by `OrientationLock.playerPresented`:
+
+- Removed the `forced`/`force()`/`clearForce()`. `OrientationLock.playerPresented` is a
+  `didSet` that requests the scene geometry; `mask()` returns `.landscape` while the player
+  is presented and `.portrait` otherwise (iPad unchanged, still `.all`).
+- `PlayerView.onAppear`/`.onDisappear` just toggle `playerPresented`. `ContentView` also
+  added `.fullScreenCover(... onDismiss:)` that clears it, so dismissing via AVKit's native
+  X (not just a swipe) always returns the detail to portrait.
+- `requestGeometryUpdate` retries once on failure: the portrait request can be rejected while
+  AVPlayer is tearing down, which previously left the detail stuck in landscape.
+
+Verification: macOS `swift build` and `stupid-app build` green; on iOS 26.3 simulator the
+detail/list stay portrait and the player flips to `landscapeRight`.
+
 ### 2026-08-29 — Feat: playback screen is always landscape
 
 The playback (full-screen player) screen is now always presented in landscape, rather than
