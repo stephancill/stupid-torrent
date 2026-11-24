@@ -1,4 +1,5 @@
 import Foundation
+import TorrentCore
 
 public enum MediaKind: String, Codable, Sendable, Hashable, CaseIterable {
     case movie
@@ -198,28 +199,12 @@ public struct TorrentioStream: Identifiable, Hashable, Sendable {
         value.firstMatch(of: /(?i)s\d{1,2}\s?e\d{1,3}|\b\d{1,2}x\d{2,3}\b/) != nil
     }
 
-    /// A magnet link that resolves this exact torrent and includes the scrape's trackers. Torrents
-    /// without scraped trackers fall back to a small set of public trackers so resolution does not
-    /// depend on DHT alone.
     public func magnetLink() -> String {
-        var parts = ["xt=urn:btih:\(infoHash)"]
-        parts.append("dn=\(Self.percentEncode(magnetName))")
-        let usableTrackers = trackers.isEmpty ? TorrentioClient.defaultTrackers : trackers
-        var seen = Set<String>()
-        for tracker in usableTrackers {
-            let value = tracker.absoluteString
-            guard seen.insert(value).inserted else { continue }
-            parts.append("tr=\(Self.percentEncode(value))")
-        }
-        return "magnet:?" + parts.joined(separator: "&")
-    }
-
-    private static let magnetAllowed = CharacterSet(
-        charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
-    )
-
-    private static func percentEncode(_ value: String) -> String {
-        value.addingPercentEncoding(withAllowedCharacters: magnetAllowed) ?? value
+        MagnetLink.build(
+            infoHash: infoHash,
+            displayName: magnetName,
+            trackers: trackers.isEmpty ? TorrentioClient.defaultTrackers : trackers
+        )
     }
 }
 

@@ -19,6 +19,28 @@ public struct MagnetLink: Sendable, Equatable {
     }
 }
 
+extension MagnetLink {
+    public static func build(infoHash: String, displayName: String?, trackers: [URL]) -> String {
+        var parts = ["xt=urn:btih:\(infoHash)"]
+        if let displayName {
+            parts.append("dn=\(percentEncode(displayName))")
+        }
+        var seen = Set<String>()
+        for tracker in trackers where seen.insert(tracker.absoluteString).inserted {
+            parts.append("tr=\(percentEncode(tracker.absoluteString))")
+        }
+        return "magnet:?" + parts.joined(separator: "&")
+    }
+
+    private static let unreserved = CharacterSet(
+        charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+    )
+
+    private static func percentEncode(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? value
+    }
+}
+
 public enum MagnetLinkParser {
     public static func parse(_ string: String) throws -> MagnetLink {
         guard let components = URLComponents(string: string), components.scheme?.lowercased() == "magnet" else {
@@ -30,7 +52,7 @@ public enum MagnetLinkParser {
         var trackers: [URL] = []
         var exactSources: [URL] = []
 
-        for item in components.queryItems ?? [] {
+        for item in components.percentEncodedQueryItems ?? [] {
             let value = decoded(item.value)
             switch item.name.lowercased() {
             case "xt":
@@ -61,8 +83,7 @@ public enum MagnetLinkParser {
     }
 
     private static func decoded(_ raw: String?) -> String? {
-        // Mirrors Go's url.ParseQuery semantics (golden: anacrolix/torrent): '+' decodes to space.
-        raw?.replacingOccurrences(of: "+", with: " ")
+        raw?.replacingOccurrences(of: "+", with: " ").removingPercentEncoding
     }
 
     static func decodeV1InfoHash(_ encoded: String) -> Data? {

@@ -499,7 +499,11 @@ private struct TorrentDetailMenu: View {
     }
 
     private func copyMagnet() {
-        let magnet = magnetLink(item.metainfo)
+        let magnet = MagnetLink.build(
+            infoHash: item.id,
+            displayName: item.name,
+            trackers: item.metainfo.flattenedTrackers
+        )
         #if os(iOS)
         UIPasteboard.general.string = magnet
         #else

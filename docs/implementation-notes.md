@@ -4,6 +4,19 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-11-24 — Fix: escape magnet links built for Copy Magnet
+
+- The detail menu's magnet escaped `dn`/`tr` with `.urlQueryAllowed`, which leaves `&`, `=` and
+  `?` unescaped, so names with `&` and tracker URLs with query strings split into bogus
+  parameters. `MagnetLink.build(infoHash:displayName:trackers:)` (TorrentCore, next to the
+  parser) escapes everything outside RFC 3986 unreserved characters and drops duplicate
+  trackers; Copy Magnet and `TorrentioStream.magnetLink()` both use it.
+- The parser now applies `+`-as-space before percent-decoding (it reads
+  `percentEncodedQueryItems`), so a literal `%2B` survives a round trip instead of becoming a
+  space.
+- Test: build→parse round trip with a name containing `&`, `+`, `=`, `?`, a tracker with a query
+  string, and a duplicate tracker.
+
 ### 2026-11-24 — Feat: Apple TV app (`TV/`)
 
 A tvOS app on the same engine, so torrents stream on an Apple TV.
@@ -644,6 +657,19 @@ Track the offset locally (follow `currentOffset` only if the player jumps ahead)
 - **Added `skills/stupid-torrent-debug/`** — a repo-local opencode skill capturing this session's debugging knowledge: simulator workflow (preferred UDID, install/launch/log/screenshot), checking app state (data container, `.verified` sidecar bit counts via `scripts/check_app_state.sh`), `torrent-cli` commands, hermetic seeding with aria2 (tracker-less torrents, seeding flags), live-swarm tips (BBB hash, flaky opentrackr, poison-peers), and the gotchas to not "fix" (BSD sockets, Data-slice traps, `#if os(iOS)` AVKit).
 
 ## Unreleased
+
+### 2026-11-24 — Fix: escape magnet links built for Copy Magnet
+
+- The detail menu's magnet escaped `dn`/`tr` with `.urlQueryAllowed`, which leaves `&`, `=` and
+  `?` unescaped, so names with `&` and tracker URLs with query strings split into bogus
+  parameters. `MagnetLink.build(infoHash:displayName:trackers:)` (TorrentCore, next to the
+  parser) escapes everything outside RFC 3986 unreserved characters and drops duplicate
+  trackers; Copy Magnet and `TorrentioStream.magnetLink()` both use it.
+- The parser now applies `+`-as-space before percent-decoding (it reads
+  `percentEncodedQueryItems`), so a literal `%2B` survives a round trip instead of becoming a
+  space.
+- Test: build→parse round trip with a name containing `&`, `+`, `=`, `?`, a tracker with a query
+  string, and a duplicate tracker.
 
 ### 2026-08-08 — Fix: MKV streaming via loopback HTTP server (VLC MediaKit)
 

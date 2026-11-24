@@ -1,19 +1,6 @@
 import Foundation
 import TorrentCore
 
-public func magnetLink(_ metainfo: Metainfo) -> String {
-    var parts = ["xt=urn:btih:\(metainfo.infoHash.hexString)"]
-    if let dn = metainfo.displayName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-        parts.append("dn=\(dn)")
-    }
-    for tracker in metainfo.flattenedTrackers {
-        if let tr = tracker.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            parts.append("tr=\(tr)")
-        }
-    }
-    return "magnet:?" + parts.joined(separator: "&")
-}
-
 public func byteString(_ bytes: Double) -> String {
     if bytes >= 1_000_000_000 { return String(format: "%.1f GB", bytes / 1_000_000_000) }
     if bytes >= 1_000_000 { return String(format: "%.1f MB", bytes / 1_000_000) }
