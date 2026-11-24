@@ -2,11 +2,9 @@ import Foundation
 
 public struct TorrentStatus: Sendable, Equatable {
     public enum State: Sendable, Equatable {
-        case metadata
         case downloading
         case seeding
         case paused
-        case error(String)
     }
 
     public let name: String

@@ -1,8 +1,5 @@
 import SwiftUI
-import AVKit
-import AVFoundation
 import TorrentCore
-import Streaming
 import StupidClientCore
 import StupidClientUI
 
@@ -10,41 +7,23 @@ struct ContentView: View {
     @State private var store = TorrentStore()
     @Environment(\.scenePhase) private var scenePhase
 
-    /// True while anything needs the network: resolving a magnet, or a torrent in the `.downloading`
-    /// state (paused/complete/error do not keep the screen awake).
-    private var shouldKeepAwake: Bool {
-        !store.resolvingItems.isEmpty || store.items.contains { $0.status?.state == .downloading }
-    }
-
     var body: some View {
         tabs
         #if os(iOS)
         .fullScreenCover(item: $store.pendingPlayback, onDismiss: {
-            // Any dismissal of the player (swipe, or AVKit's native X) must end the
-            // player-orientation pin so the torrent UI returns to portrait.
             OrientationLock.playerPresented = false
         }) { request in
-            switch request.kind {
-            case .avPlayer:
-                PlayerView(
-                    session: TorrentStreamSession(torrent: request.torrent, fileIndex: request.fileIndex),
-                    store: store,
-                    torrent: request.torrent,
-                    fileIndex: request.fileIndex
-                )
-            case .none:
-                EmptyView()
-            }
+            TorrentPlayerView(request: request, store: store)
+                .onAppear { OrientationLock.playerPresented = true }
+                .onDisappear { OrientationLock.playerPresented = false }
+        }
+        #else
+        .sheet(item: $store.pendingPlayback) { request in
+            TorrentPlayerView(request: request, store: store)
         }
         #endif
-        .alert("Could Not Add Torrent", isPresented: Binding(
-            get: { store.addError != nil },
-            set: { if !$0 { store.addError = nil } }
-        )) {
-            Button("OK", role: .cancel) { store.addError = nil }
-        } message: {
-            Text(store.addError ?? "")
-        }
+        .errorAlert("Could Not Add Torrent", message: $store.addError)
+        .keepsScreenAwake(while: store.needsNetwork)
         .onAppear {
             store.restore()
             #if DEBUG
@@ -52,8 +31,6 @@ struct ContentView: View {
             #endif
         }
         .onChange(of: scenePhase) { _, phase in
-            // Re-apply on every phase change so a resume from background restores the right state.
-            IdleTimer.update(isDownloading: phase == .active && shouldKeepAwake)
             if phase == .active {
                 store.submitRestoredBackgroundTasks()
             }
@@ -62,9 +39,6 @@ struct ContentView: View {
             if complete && scenePhase == .active {
                 store.submitRestoredBackgroundTasks()
             }
-        }
-        .onChange(of: shouldKeepAwake) { _, downloading in
-            IdleTimer.update(isDownloading: downloading)
         }
         .onOpenURL { url in
             guard url.scheme?.lowercased() == "magnet" else { return }
@@ -105,9 +79,7 @@ struct ContentView: View {
         }
     }
 
-    /// DEBUG: `-AutoPlayIndex <n>` opens the player for file `n` of the first restored torrent and
-    /// `-InjectPeer host:port` injects a loopback seeder, so streaming behavior can be exercised
-    /// from the command line against a hermetic local seed.
+    #if DEBUG
     private func autoPlayForTesting() {
         let args = ProcessInfo.processInfo.arguments
         var injectedPeer: PeerAddress?
@@ -117,33 +89,24 @@ struct ContentView: View {
                 injectedPeer = PeerAddress(host: String(parts[0]), port: port)
             }
         }
-        let fileIndex: Int?
-        if let idx = args.firstIndex(of: "-AutoPlayIndex"), idx + 1 < args.count {
-            fileIndex = Int(args[idx + 1])
-        } else {
-            fileIndex = nil
+        let fileIndex = args.firstIndex(of: "-AutoPlayIndex").flatMap { idx in
+            idx + 1 < args.count ? Int(args[idx + 1]) : nil
         }
         guard injectedPeer != nil || fileIndex != nil else { return }
         Task {
-            for _ in 0..<40 {
-                if let item = store.items.first {
-                    if let injectedPeer {
-                        TorrentLog.log("AUTOPLAY injecting peer \(injectedPeer.host):\(injectedPeer.port)")
-                        await item.torrent.addPeer(host: injectedPeer.host, port: injectedPeer.port)
-                    }
-                    if let fileIndex, item.metainfo.files.indices.contains(fileIndex) {
-                        let kind = Torrent.playbackKind(forFileNamed: item.metainfo.files[fileIndex].name)
-                        if kind != .none {
-                            TorrentLog.log("AUTOPLAY opening file \(fileIndex) (\(item.metainfo.files[fileIndex].name))")
-                            store.pendingPlayback = PlaybackRequest(torrent: item.torrent, fileIndex: fileIndex, kind: kind)
-                        }
-                    }
-                    return
-                }
-                try? await Task.sleep(for: .milliseconds(500))
+            guard let item = await store.firstItem() else { return }
+            if let injectedPeer {
+                TorrentLog.log("AUTOPLAY injecting peer \(injectedPeer.host):\(injectedPeer.port)")
+                await item.torrent.addPeer(host: injectedPeer.host, port: injectedPeer.port)
+            }
+            if let fileIndex, item.metainfo.files.indices.contains(fileIndex),
+               Torrent.isPlayable(fileNamed: item.metainfo.files[fileIndex].name) {
+                TorrentLog.log("AUTOPLAY opening file \(fileIndex) (\(item.metainfo.files[fileIndex].name))")
+                store.play(item: item, fileIndex: fileIndex)
             }
         }
     }
+    #endif
 }
 
 struct TorrentLibraryView: View {
@@ -258,21 +221,15 @@ struct TorrentRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            if let status = item.status {
-                if status.isComplete {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                } else if item.isPaused {
-                    Image(systemName: "pause.circle")
-                        .foregroundStyle(.secondary)
-                } else {
-                    PieProgressView(progress: status.progress)
-                        .frame(width: 20, height: 20)
-                }
+            if item.isComplete {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            } else if item.isPaused {
+                Image(systemName: "pause.circle")
+                    .foregroundStyle(.secondary)
             } else {
-                ProgressView()
-                    .controlSize(.small)
-                    .frame(width: 16, height: 16)
+                PieProgressView(progress: item.status.progress)
+                    .frame(width: 20, height: 20)
             }
             Text(item.name)
                 .font(.body)
@@ -286,9 +243,7 @@ struct TorrentRow: View {
     }
 
     private var eta: String? {
-        guard let status = item.status,
-              let seconds = remainingSeconds(status, metainfo: item.metainfo) else { return nil }
-        return "ETA \(durationString(seconds))"
+        remainingSeconds(item.status, metainfo: item.metainfo).map { "ETA \(durationString($0))" }
     }
 }
 
@@ -347,14 +302,7 @@ struct AddTorrentView: View {
                     add(.file(url))
                 }
             }
-            .alert("Could Not Add Torrent", isPresented: Binding(
-                get: { addError != nil },
-                set: { if !$0 { addError = nil } }
-            )) {
-                Button("OK", role: .cancel) { addError = nil }
-            } message: {
-                Text(addError ?? "")
-            }
+            .errorAlert("Could Not Add Torrent", message: $addError)
         }
     }
 
@@ -372,26 +320,12 @@ struct TorrentDetailView: View {
     let item: TorrentItem
     let store: TorrentStore
 
-    // macOS keeps the player presentation local; iOS presents from ContentView via
-    // `store.pendingPlayback` because this view is recreated on every status tick for a
-    // downloading torrent, which would reset local `@State` and break the cover.
-    #if !os(iOS)
-    @State private var streamSession: TorrentStreamSession?
-    @State private var showPlayer = false
-    @State private var playerFileIndex: Int?
-    #endif
-
-    private var fileIndicesBySize: [Int] {
-        item.metainfo.files.indices.sorted {
-            item.metainfo.files[$0].length > item.metainfo.files[$1].length
-        }
-    }
-
     var body: some View {
         List {
-            if let status = item.status, !status.isComplete {
+            if !item.isComplete {
+                let status = item.status
                 Section("Status") {
-                    LabeledContent("Progress", value: item.isPaused ? "\(Int(status.progress * 100))% (Paused)" : "\(Int(status.progress * 100))%")
+                    LabeledContent("Progress", value: item.isPaused ? "\(percentString(status.progress)) (Paused)" : percentString(status.progress))
                     LabeledContent("Pieces", value: "\(status.verifiedCount)/\(status.pieceCount)")
                     if !item.isPaused {
                         LabeledContent("Download", value: byteRateString(status.downloadRate))
@@ -401,18 +335,14 @@ struct TorrentDetailView: View {
                 }
             }
             Section("Files") {
-                ForEach(fileIndicesBySize, id: \.self) { index in
+                ForEach(item.fileIndicesBySize, id: \.self) { index in
                     let file = item.metainfo.files[index]
-                    let playbackKind = Torrent.playbackKind(forFileNamed: file.name)
-                    let isStreamable = playbackKind != .none
                     let isPlaybackAvailable = item.isPlaybackAvailable(fileIndex: index)
                     Button {
-                        if isPlaybackAvailable {
-                            openPlayer(fileIndex: index, kind: playbackKind)
-                        }
+                        store.play(item: item, fileIndex: index)
                     } label: {
                         HStack {
-                            if isStreamable {
+                            if Torrent.isPlayable(fileNamed: file.name) {
                                 Image(systemName: "play.circle")
                             }
                             Text(file.name)
@@ -435,33 +365,9 @@ struct TorrentDetailView: View {
         .toolbar {
             TorrentDetailMenu(item: item, store: store)
         }
-        #if !os(iOS)
-        .sheet(isPresented: $showPlayer) {
-            if let streamSession, let playerFileIndex {
-                PlayerView(
-                    session: streamSession,
-                    store: store,
-                    torrent: item.torrent,
-                    fileIndex: playerFileIndex
-                )
-            }
-        }
-        #endif
-    }
-
-    private func openPlayer(fileIndex: Int, kind: Torrent.PlaybackKind) {
-        #if os(iOS)
-        store.pendingPlayback = PlaybackRequest(torrent: item.torrent, fileIndex: fileIndex, kind: kind)
-        #else
-        streamSession = TorrentStreamSession(torrent: item.torrent, fileIndex: fileIndex)
-        playerFileIndex = fileIndex
-        showPlayer = true
-        #endif
     }
 }
 
-/// The detail view's kebab menu. Reads only `TorrentItem`'s change-guarded pause flags (not the
-/// 1s-churning `status`), so it doesn't rebuild every tick and cause the toolbar brightness pulse.
 private struct TorrentDetailMenu: View {
     let item: TorrentItem
     let store: TorrentStore
@@ -471,7 +377,7 @@ private struct TorrentDetailMenu: View {
 
     var body: some View {
         Menu {
-            if item.canPause {
+            if !item.isComplete {
                 Button {
                     store.togglePause(item)
                 } label: {
@@ -499,162 +405,13 @@ private struct TorrentDetailMenu: View {
     }
 
     private func copyMagnet() {
-        let magnet = magnetLink(item.metainfo)
-        #if os(iOS)
-        UIPasteboard.general.string = magnet
-        #else
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(magnet, forType: .string)
-        #endif
+        copyToClipboard(MagnetLink.build(
+            infoHash: item.id,
+            displayName: item.name,
+            trackers: item.metainfo.flattenedTrackers
+        ))
     }
 }
-
-struct PlayerView: View {
-    let session: TorrentStreamSession
-    let store: TorrentStore
-    let torrent: Torrent
-    let fileIndex: Int
-    @State private var player: AVPlayer?
-
-    var body: some View {
-        Group {
-            if let player {
-                #if os(iOS)
-                AVPlayerControllerRepresentable(player: player)
-                    .ignoresSafeArea()
-                #else
-                VideoPlayerView(player: player)
-                #endif
-            } else {
-                ProgressView()
-            }
-        }
-        .onAppear {
-            #if os(iOS)
-            OrientationLock.playerPresented = true
-            #endif
-        }
-        .task {
-            let prepared = await session.makePlayer()
-            guard !Task.isCancelled else {
-                prepared.pause()
-                return
-            }
-            seekToResume(on: prepared)
-            player = prepared
-            await persistWhilePlaying(prepared)
-        }
-        .onDisappear {
-            if let player {
-                persistPosition(from: player, onlyWhilePlaying: false)
-            }
-            #if os(iOS)
-            OrientationLock.playerPresented = false
-            #endif
-            player?.pause()
-            player?.replaceCurrentItem(with: nil)
-            session.stop()
-        }
-    }
-
-    /// Seek to the cached position so playback resumes where the user left off. Skipped when a
-    /// saved position is within the opening window or the end (both mean "start from the top").
-    private func seekToResume(on stream: AVPlayer) {
-        guard let resume = store.playbackPosition(torrent: torrent, fileIndex: fileIndex),
-              resume > 5 else { return }
-        if let item = stream.currentItem {
-            let duration = item.duration.seconds
-            if duration.isFinite, duration > 0 {
-                let target = min(resume, duration - 5)
-                if target > 5 {
-                    stream.seek(to: CMTime(seconds: target, preferredTimescale: 600))
-                    return
-                }
-            }
-        }
-        stream.seek(to: CMTime(seconds: resume, preferredTimescale: 600))
-    }
-
-    /// Periodically cache the playhead while playback runs, so a force-quit or system kill still
-    /// resumes near the last watched point — not only when the player is dismissed. The loop is
-    /// cancelled with the view's task when the player closes.
-    private func persistWhilePlaying(_ stream: AVPlayer) async {
-        while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(5))
-            guard !Task.isCancelled else { return }
-            persistPosition(from: stream, onlyWhilePlaying: true)
-        }
-    }
-
-    /// Cache the current playhead position so a later open can resume. Positions within the first
-    /// or last 5 s are ignored (never-started and finished media start fresh). The periodic ticker
-    /// writes only while actually playing; dismissal always saves the final position.
-    private func persistPosition(from stream: AVPlayer, onlyWhilePlaying: Bool) {
-        guard let item = stream.currentItem else { return }
-        if onlyWhilePlaying, stream.timeControlStatus != .playing { return }
-        let seconds = stream.currentTime().seconds
-        guard seconds.isFinite, seconds > 5 else { return }
-        let duration = item.duration.seconds
-        if duration.isFinite, duration > 0, seconds >= duration - 5 { return }
-        store.savePlaybackPosition(seconds, torrent: torrent, fileIndex: fileIndex)
-    }
-}
-
-#if os(iOS)
-struct AVPlayerControllerRepresentable: UIViewControllerRepresentable {
-    let player: AVPlayer
-
-    func makeUIViewController(context: Context) -> AVPlayerViewController {
-        configureAudioSession()
-        let controller = AVPlayerViewController()
-        controller.player = player
-        controller.showsPlaybackControls = true
-        controller.allowsPictureInPicturePlayback = true
-        let loadingIndicator = UIActivityIndicatorView(style: .large)
-        loadingIndicator.color = .white
-        loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
-        loadingIndicator.startAnimating()
-        let overlayView = controller.contentOverlayView ?? controller.view!
-        overlayView.addSubview(loadingIndicator)
-        NSLayoutConstraint.activate([
-            loadingIndicator.centerXAnchor.constraint(equalTo: overlayView.centerXAnchor),
-            loadingIndicator.centerYAnchor.constraint(equalTo: overlayView.centerYAnchor),
-        ])
-        player.play()
-        Task { @MainActor [weak loadingIndicator, weak player] in
-            while let player,
-                  player.timeControlStatus != .playing,
-                  player.currentItem?.status != .failed {
-                try? await Task.sleep(for: .milliseconds(100))
-            }
-            loadingIndicator?.stopAnimating()
-        }
-        return controller
-    }
-
-    func updateUIViewController(_ uiViewController: AVPlayerViewController, context: Context) {}
-
-    private func configureAudioSession() {
-        let audioSession = AVAudioSession.sharedInstance()
-        try? audioSession.setCategory(.playback, mode: .moviePlayback)
-        try? audioSession.setActive(true)
-    }
-}
-
-#else
-struct VideoPlayerView: View {
-    let player: AVPlayer
-
-    var body: some View {
-        VideoPlayer(player: player)
-            .ignoresSafeArea()
-            .onAppear {
-                player.play()
-            }
-    }
-}
-#endif
-
 
 struct PieProgressView: View {
     let progress: Double

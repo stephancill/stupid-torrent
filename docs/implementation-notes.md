@@ -58,6 +58,79 @@ session, partial cue-less failure, segment-request dedupe, Dolby decoding, raw r
 playback, and corrupt-size parsing). The tvOS app compiles against the new API
 (`swift build --triple arm64-apple-tvos26.0` in `TV/`).
 
+### 2026-11-24 — Refactor: app layer
+
+Audit-driven cleanup of the iOS/tvOS app layer, with one deliberate breaking change to
+persisted app state.
+
+- **Breaking: persisted state.** `.torrent` files are stored as `torrents/<infoHashHex>.torrent`.
+  `restore()` renames any legacy display-name file to that name (or deletes it when the canonical
+  file already exists), so `remove()` is a single `removeItem` and deletion keeps working for
+  existing installs. The three UserDefaults dictionaries (`addedDates`, `pausedIDs`,
+  `playbackPositions`) are replaced by one JSON `torrentRecords` entry: a `TorrentRecord`
+  (added date, paused flag, playback position per file) per info hash. The old keys are not
+  migrated, so added dates, paused state and resume positions reset once after updating; the old
+  keys are left in defaults untouched (a few bytes, never read).
+- **Shared player.** `TorrentPlayerView` (StupidClientUI) replaces the iOS `PlayerView`, the TV
+  `TVPlayerView` and the macOS sheet. Resume/save policy lives in the store:
+  `resumePosition(torrent:fileIndex:duration:)` clamps to `duration - 5` and ignores the first and
+  last 5 s; `recordPlayhead(seconds:duration:torrent:fileIndex:)` applies the same margins. The
+  view saves every 5 s while playing and once on dismiss. The TV previously did not clamp and
+  awaited the resume seek; the shared view issues the seek without awaiting (iOS behaviour) so the
+  player and its spinner appear immediately. The stream session is created in the view's task
+  (it used to be rebuilt on every parent render). On iOS/tvOS one `AVPlayerViewController`
+  wrapper shows a loading indicator until `timeControlStatus` becomes `.playing` or the item fails,
+  observed with KVO instead of a 100 ms polling task. macOS uses `VideoPlayer` and now presents
+  from `store.pendingPlayback` like the other platforms.
+- **Other iOS/tvOS sharing.** `store.play(item:fileIndex:)` builds every `PlaybackRequest`;
+  `store.needsNetwork` + `.keepsScreenAwake(while:)` (StupidClientUI, also tvOS) replace two
+  hand-written idle-timer paths and `IdleTimer.swift`; `.errorAlert(_:message:)` replaces five
+  hand-written alert bindings; `copyToClipboard` is shared; `startTorrentEngine()` (verbose log
+  in DEBUG, log file on tvOS, DHT warm-up) replaces both App initializers; DEBUG launch helpers
+  wait with `store.firstItem()`.
+- **Model simplification.** `PlaybackKind` is gone: `Torrent.isPlayable(fileNamed:)`.
+  `TorrentStatus.State` drops `.metadata` and `.error` (the engine never produced them).
+  `TorrentItem.status` is non-optional (Torrent seeds its own status the same way regardless of
+  piece count); `canPause` is replaced by a change-guarded `isComplete` flag, which keeps the
+  detail menu from re-rendering on every status tick; `metainfo` forwards to `torrent.metainfo`;
+  `fileIndicesBySize` is computed once. `isPaused` starts from the persisted record.
+- `TorrentStore`: `items`/`resolvingItems`/`restorationComplete` are `private(set)`;
+  `item(infoHash:)`/`isResolving(infoHash:)`/`contains(infoHash:)` back both the duplicate check
+  and the search rows; `addFile` rejects duplicates synchronously and reports add failures;
+  writing the `.torrent` file throws instead of being ignored; `addFileAndWait` is gone (tests call
+  the internal `add(metainfo:persist:)`).
+- Search: one `Loadable` state + `LoadableContent` view replace three hand-rolled
+  loading/error/retry state machines. Removed unused `MediaKind` Codable/CaseIterable and
+  `TorrentioStream.subtitle`.
+- `ContinuedDownloadManager`: one end-of-task branch, the torrent is stored directly, the rate
+  uses `byteRateString`, the bundle-ID fallback is one constant. Formatting: one
+  `compactDuration`, `remainingSeconds` uses `metainfo.totalLength`, shared `percentString`.
+- CLI: `add`/`verify` share `CommonOptions` (unknown options and bad values now fail loudly),
+  the duplicate `Data.hexString` is gone, and the usage lists `dht-node` and `stream-play`.
+- Tooling: `OrientationManager.swift` → `OrientationLock.swift`; test target
+  `StupidTorrentClientAppTests` → `StupidClientCoreTests` (no Bencode dependency); stale xtool
+  comments and `.gitignore` entries removed; `scripts/release.sh` deleted (an xcodebuild-based
+  release script superseded by `stupid-app release`); the debug skill uses
+  `stupid-app run --simulator` and the `Default` simulator.
+- Kept: the iOS player still clears the orientation pin from both the cover's `onDismiss` and the
+  player's `onDisappear` (device-verified fix for AVKit's X button; not re-verified here).
+
+Verification: `swift build`, `swift build --product torrent-cli`, `swift test` (108 tests), iOS
+`stupid-app build` and tvOS `stupid-app build` green. New tests: info-hash file naming, record persistence across relaunch (added date, paused, resume clamping), legacy rename.
+
+### 2026-11-24 — Fix: escape magnet links built for Copy Magnet
+
+- The detail menu's magnet escaped `dn`/`tr` with `.urlQueryAllowed`, which leaves `&`, `=` and
+  `?` unescaped, so names with `&` and tracker URLs with query strings split into bogus
+  parameters. `MagnetLink.build(infoHash:displayName:trackers:)` (TorrentCore, next to the
+  parser) escapes everything outside RFC 3986 unreserved characters and drops duplicate
+  trackers; Copy Magnet and `TorrentioStream.magnetLink()` both use it.
+- The parser now applies `+`-as-space before percent-decoding (it reads
+  `percentEncodedQueryItems`), so a literal `%2B` survives a round trip instead of becoming a
+  space.
+- Test: build→parse round trip with a name containing `&`, `+`, `=`, `?`, a tracker with a query
+  string, and a duplicate tracker.
+
 ### 2026-11-24 — Feat: Apple TV app (`TV/`)
 
 A tvOS app on the same engine, so torrents stream on an Apple TV.
@@ -698,6 +771,19 @@ Track the offset locally (follow `currentOffset` only if the player jumps ahead)
 - **Added `skills/stupid-torrent-debug/`** — a repo-local opencode skill capturing this session's debugging knowledge: simulator workflow (preferred UDID, install/launch/log/screenshot), checking app state (data container, `.verified` sidecar bit counts via `scripts/check_app_state.sh`), `torrent-cli` commands, hermetic seeding with aria2 (tracker-less torrents, seeding flags), live-swarm tips (BBB hash, flaky opentrackr, poison-peers), and the gotchas to not "fix" (BSD sockets, Data-slice traps, `#if os(iOS)` AVKit).
 
 ## Unreleased
+
+### 2026-11-24 — Fix: escape magnet links built for Copy Magnet
+
+- The detail menu's magnet escaped `dn`/`tr` with `.urlQueryAllowed`, which leaves `&`, `=` and
+  `?` unescaped, so names with `&` and tracker URLs with query strings split into bogus
+  parameters. `MagnetLink.build(infoHash:displayName:trackers:)` (TorrentCore, next to the
+  parser) escapes everything outside RFC 3986 unreserved characters and drops duplicate
+  trackers; Copy Magnet and `TorrentioStream.magnetLink()` both use it.
+- The parser now applies `+`-as-space before percent-decoding (it reads
+  `percentEncodedQueryItems`), so a literal `%2B` survives a round trip instead of becoming a
+  space.
+- Test: build→parse round trip with a name containing `&`, `+`, `=`, `?`, a tracker with a query
+  string, and a duplicate tracker.
 
 ### 2026-08-08 — Fix: MKV streaming via loopback HTTP server (VLC MediaKit)
 

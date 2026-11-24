@@ -75,7 +75,7 @@ enum TorrentStreamSessionError: Error {
 
     public nonisolated static func isPlaybackAvailable(torrent: Torrent, fileIndex: Int) async -> Bool {
         let name = torrent.fileName(fileIndex)
-        guard Torrent.playbackKind(forFileNamed: name) != .none else { return false }
+        guard Torrent.isPlayable(fileNamed: name) else { return false }
         guard isMatroska(fileName: name) else { return true }
         let source = TorrentStreamSourceAdapter(torrent: torrent)
         if await source.isComplete(fileIndex: fileIndex) { return true }
