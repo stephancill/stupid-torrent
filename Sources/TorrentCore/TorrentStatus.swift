@@ -3,7 +3,7 @@ import Foundation
 public struct TorrentStatus: Sendable, Equatable {
     public enum State: Sendable, Equatable {
         case downloading
-        case seeding
+        case complete
         case paused
     }
 

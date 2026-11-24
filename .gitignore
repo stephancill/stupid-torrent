@@ -19,3 +19,6 @@ DerivedData/
 # tvOS app package build output
 /TV/.build
 /TV/Package.resolved
+
+/xtool
+.release/

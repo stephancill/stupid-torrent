@@ -823,14 +823,14 @@ private actor StartupGateProbe {
         let torrent = Torrent(directory: dir, metainfo: metainfo, enableDHT: false)
         defer { Task { await torrent.stop() } }
         await torrent.run()
-        #expect(await torrent.statusBroadcast.value.state == .seeding)
+        #expect(await torrent.statusBroadcast.value.state == .complete)
         #expect(!(await torrent.running))
 
         // A complete torrent has no network to pause; the state stays seeding.
         await torrent.pause()
-        #expect(await torrent.statusBroadcast.value.state == .seeding)
+        #expect(await torrent.statusBroadcast.value.state == .complete)
         await torrent.resume()
-        #expect(await torrent.statusBroadcast.value.state == .seeding)
+        #expect(await torrent.statusBroadcast.value.state == .complete)
     }
 
     @Test func completeTorrentWithStaleSidecarRepairsAtStartup() async throws {

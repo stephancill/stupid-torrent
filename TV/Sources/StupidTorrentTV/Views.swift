@@ -179,7 +179,7 @@ struct TVTorrentRow: View {
 private func stateDescription(_ state: TorrentStatus.State) -> String {
     switch state {
     case .downloading: "Downloading"
-    case .seeding: "Seeding"
+    case .complete: "Complete"
     case .paused: "Paused"
     }
 }

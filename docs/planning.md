@@ -10,7 +10,7 @@ An iOS 26 app (SwiftPM + SwiftUI, built with the `stupid-app` CLI) where you pas
 2. **Scope v1: full** — magnet links + `.torrent` files, sequential/priority-window download, seeding, per-file selection and priorities, AVPlayer streaming, DHT (BEP 5) peer discovery, MSE/PE protocol encryption (BEP 10), µTP transport (BEP 29). **No web seeds (BEP 19)** — deferred.
 3. **Streaming: AVPlayer backed by verified torrent bytes.** Apple containers use `AVAssetResourceLoaderDelegate` over a custom scheme. Cue-indexed Matroska uses a static VOD HLS presentation over a loopback-only HTTP server so one stable `AVPlayerItem` owns the global timeline while independently generated fMP4 cue segments retain local decoder clocks. `UIBackgroundModes: audio` supports background audio streaming.
 4. **Validation-first: macOS `torrent-cli`** headless harness gates every engine phase against the live Big Buck Bunny torrent before any iOS UI work.
-5. **Concurrency: Swift 6 strict concurrency** with actors; networking over Network.framework `NWConnection`, bridged to `async`/`AsyncStream`. Engine status is fanned out through a `StatusBroadcast` (multi-subscriber, current-value); SwiftUI observes a main-actor `@Observable` `TorrentStore` snapshot.
+5. **Concurrency: Swift 6 strict concurrency** with actors; networking over raw BSD sockets (`BSD.swift`; `NWConnection` cannot reach `.ready` in the dev shell, see implementation notes Phase 3) with blocking I/O on dedicated threads via `BlockingIO`, bridged to `async`/`AsyncStream`. Engine status is fanned out through a `StatusBroadcast` (multi-subscriber, current-value); SwiftUI observes a main-actor `@Observable` `TorrentStore` snapshot.
 6. **Background downloads: iOS 26 continued processing.** Every active incomplete torrent submits a `BGContinuedProcessingTaskRequest` keyed by its info hash when it is added, resumed, or restored during an app launch. Verified bytes drive system progress; completion succeeds the task, while pause, deletion, user cancellation, or expiration tears down peer networking and persists resume state. Background seeding remains disabled because it has no finite user-requested completion point.
 7. **Hermetic-first testing**: mock HTTP/UDP trackers + a local third-party seeder (webtorrent/aria2c) serving the Big Buck Bunny fixture over loopback give deterministic, offline coverage for PeerWire/Peer/PiecePicker/Storage/Tracker. The live swarm is only the final integration gate.
 8. **Discovery: Torrentio + Cinemeta.** The Search tab resolves free-text queries through Stremio's Cinemeta (IMDb metadata; Torrentio is ID-keyed and has no text search), then lists Torrentio streams for the movie or the selected series episode. Tapping a stream adds its magnet (info hash + scraped trackers, public-tracker fallback). Discovery does not touch the engine or library model.
@@ -41,11 +41,7 @@ Secondary alternatives: Sintel (`08ada5a7a6183aae1e09d831df6748d566095a10`), Cos
 
 Live-swarm gates are the final check, not the only one. A test-support harness gives deterministic coverage of PeerWire, Peer, PiecePicker, Storage, and trackers.
 
-- `TorrentTestingSupport` (test-only target) provides:
-  - **Mock HTTP tracker** — bencoded announce responses (configurable compact `peers`/`peers6` lists, `interval`, `failure reason`); asserts the started/completed/stopped lifecycle and `numwant`.
-  - **Mock UDP tracker** — connect/announce protocol over a loopback UDP socket; asserts transaction-id matching, action codes, and retry behavior.
-  - **Peer injector** — `Client.addPeer(ip:port:)` connects our engine directly to a specific seeder address without any tracker (fully deterministic path).
-  - **Synthetic torrent generator** — small, fully deterministic multi-file torrents (controlled piece length, files spanning piece boundaries) for fast codec/picker/storage tests with no network.
+- `TorrentTestingSupport` (test-only target) provides fixture loading (`Fixtures`). Hermetic engine tests build small synthetic torrents in-test and run engines against each other over loopback: `Torrent.addPeer(host:port:)` connects directly to a known address without any tracker, and a seeding test has one engine serve verified pieces to another. Tracker response parsing, compact peers, DHT and µTP are covered by loopback/unit tests in `TorrentCoreTests`.
 - **Seeder = an existing, battle-tested package, not ours.** The hermetic seeder serves the real BBB fixture over loopback using `webtorrent` (npm, run from the `third-party/webtorrent` reference clone) or, as fallback, `aria2c` (installed at `/opt/homebrew/bin/aria2c`). Using a correct third-party implementation as the peer derisks our wire protocol against real-world behavior without swarm flakiness.
 - **Hermetic download gate**: create a Torrent from `Fixtures/big-buck-bunny.torrent`, inject the loopback seeder peer, download to 100% offline, and SHA-1-verify every piece.
 - Unit-test gates are explicit per phase (see Phases); hermetic gates run with `swift test` (network only needed for one-time seed-cache population).
@@ -53,15 +49,18 @@ Live-swarm gates are the final check, not the only one. A test-support harness g
 ## Architecture
 
 ```
-Package.swift (swift-tools 6.0; platforms: iOS 26 / macOS 14)
-├─ product  stupid_torrent_client      (library, the app — the only library product; stupid-app picks it)
+Package.swift (swift-tools 6.0; platforms: iOS 26 / tvOS 26 / macOS 14)
+├─ product  stupid_torrent_client      (library, the iOS app; stupid-app.yml selects it)
+├─ product  StupidClientCore / StupidClientUI (libraries consumed by the tvOS app in TV/)
 ├─ product  torrent-cli                (macOS executable — stupid-app ignores executables)
 ├─ target   Bencode                    (pure Swift)
 ├─ target   TorrentCore                (pure Swift; the engine, dependency-free)
 ├─ target   Streaming                  (AVFoundation/AVKit; player feeding)
 ├─ target   StupidClientCore           (store, search clients, formatting; shared with TV/)
 ├─ target   StupidClientUI             (SwiftUI screens shared by iOS and tvOS: search, delete alert)
-├─ target   StupidTorrentClientApp     (SwiftUI @main)
+├─ target   stupid_torrent_client      (iOS SwiftUI @main)
+├─ test     TorrentTestingSupport      (fixtures for test targets)
+TV/          separate stupid-app project (tvOS app) depending on this package by path
 └─ target   torrent-cli                (Swift, macOS harness)
 ```
 
@@ -72,21 +71,25 @@ Package.swift (swift-tools 6.0; platforms: iOS 26 / macOS 14)
 | `Metainfo` | `.torrent` + magnet parsing; info dict -> piece hashes, piece length, file list; piece->file mapping (pieces span file boundaries) |
 | `PeerID` | 20-byte peer id, `-ST0001-` + random |
 | `PeerWire` | length-prefixed message codec; IDs 0-9 + extended (20); keepalive; block encode/decode; BEP 10 extended handshake; BEP 9 ut_metadata (16 KiB chunk assembly, SHA-1 against info hash) |
-| `Peer` | `NWConnection` state machine: TCP connect, handshake (extension bit), choke/unchoke/interested, request pipeline (16 KiB blocks, ~16-32 outstanding), keepalive timer, stall detection |
+| `PeerStream`/`PeerSession` | BSD TCP stream (one reader + one writer thread, optional RC4) and a stateless per-peer I/O loop that forwards messages to the `Torrent` actor |
+| `PeerConnector` | connect ladder shared by downloads and metadata fetch: µTP raced against MSE-encrypted TCP, plaintext TCP retry, BitTorrent handshake |
+| `BlockScheduler`/`PeerPool` | synchronous, unit-tested block bookkeeping (active pieces, requesters, stall requeue, redundancy, failure attribution) and peer queue/backoff/bans |
+| `MSEHandshake`/`DH`/`RC4` | MSE/PE protocol encryption (BEP 10 era); fixed-width Montgomery DH |
+| `DHTClient`/`DHTNode`/`KRPC`/`RoutingTable` | BEP 5 DHT peer discovery |
 | `UTP`/`UTPConnection`/`UTPTransport` | µTP (BEP 29): wire codec (20-byte header, extensions), per-connection seq/ack + retransmit + reorder buffering, shared UDP demux socket + retransmit ticker. Modeled on libutp; peers connect over µTP first with TCP fallback |
-| `Tracker` | HTTP(S) announce via `URLSession` (bencoded response, `compact=1`, `peers`/`peers6`, interval/numwant, started/completed/stopped); UDP announce via `NWConnection` (.udp, connect -> announce, spec retries). Aggregates peer lists |
+| `Tracker` | HTTP(S) announce via `URLSession` (bencoded response, `compact=1`, `peers`/`peers6`, interval/numwant, started/completed/stopped); UDP announce over a BSD UDP socket (connect -> announce, spec retries). Aggregates peer lists |
 | `PiecePicker` | sequential mode + priority window (primary); jump-to-requested-range for streaming; optional endgame; per-file priority honoring piece-spanning |
 | `Storage` | sparse multi-file writes via `pwrite`; verified-piece bitfield; SHA-1 via `CryptoKit.Insecure.SHA1`; resume sidecars; disk-space guard (check `volumeAvailableCapacityForImportantUsage` before allocating; on ENOSPC fail loudly — pause the torrent and surface an error) |
-| `Torrent` (actor) | orchestrates magnet -> metadata -> download -> seed; publishes status snapshots via `StatusBroadcast` |
+| `Torrent` (actor) | orchestrates download, seeding to connected peers while running, lifecycle and announce/DHT; completed torrents go idle; publishes status snapshots via `StatusBroadcast` |
+| `MetadataExchange` | BEP 9/10 magnet metadata bootstrap (trackers + DHT + peer sweep) |
 | `StatusBroadcast` | concurrency-safe, multi-subscriber current-value stream (actor; replays current value on subscribe; supports N subscribers) |
-| `Client` | session: peer connection pool, reconnects, tracker cycling, rate/peer limits |
 
 ### Streaming design
 
 `Streaming` is the only target besides the app that uses Apple frameworks (AVFoundation/AVKit: `AVAssetResourceLoaderDelegate`, `AVPlayer`); `TorrentCore`/`Bencode` stay dependency-free.
 
-1. User taps play on a media file -> `StreamController` selects that file, sets its pieces high priority, others paused.
-2. Apple containers use `AVURLAsset(stream://...)` + `TorrentResourceLoader`. The loader answers `contentInformationRequest` (type from `ftyp`/extension, total length, `isByteRangeAccessSupported = true`) and holds `dataRequest`s until their bytes are verified, feeding from `Storage`.
+1. User taps play on a media file -> `TorrentStreamSession` prioritizes that file's requested ranges (`Torrent+Streaming`).
+2. Apple containers use `AVURLAsset(stream://...)` + `TorrentResourceLoaderDelegate`. The loader answers `contentInformationRequest` (type from `ftyp`/extension, total length, `isByteRangeAccessSupported = true`) and holds `dataRequest`s until their bytes are verified, feeding from `Storage`.
 3. Picker drives playback: sequential window around current position + moov-tail jump (when the loader sees a non-zero offset request — AVPlayer probing a tail `moov` atom on non-faststart MP4 — temporarily prioritize that region, then resume sequential).
 4. Playback begins after the loader supplies `moov` + leading frames.
 5. Cue-indexed MKV/MKA stream through **AVPlayer** via an in-house Matroska → fragmented-MP4 transmuxer (`Streaming`: EBML parse → static full-duration VOD HLS playlist + independently generated local-timeline fMP4 segments). `EXT-X-DISCONTINUITY` maps each local decoder timeline into one stable HLS movie timeline, preserving native AVKit controls and PiP without replacing the player item. A loopback-only HTTP server exposes the playlist/init/segments because `AVAssetResourceLoaderDelegate` is not a supported HLS media transport. The file row validates and prioritizes the Cues index asynchronously; a partial MKV's play button stays disabled until a usable index is available. Missing/invalid Cues disable streaming until the file completes, after which the same HLS pipeline indexes the verified file by walking its cluster headers. HLS is the only MKV pipeline; the resource loader serves raw bytes for Apple containers only. There is no app-owned MKV player UI. Covers H.264/HEVC video and AAC/E-AC-3/AC-3/ALAC audio; embedded subtitles and Opus/Vorbis/FLAC/DTS are dropped (see `docs/mkv-avplayer-transmuxer.md`). Other formats (webm/avi/AV1-in-MKV) remain unplayable.
@@ -116,19 +119,23 @@ Package.swift (swift-tools 6.0; platforms: iOS 26 / macOS 14)
 5. **ut_metadata + magnet flow** — BEP 10/9. Unit tests: extended-handshake + ut_metadata message build/parse; 16 KiB chunking/assembly + SHA-1 against the fixture info dict. Gate: `swift test` green, then `torrent-cli add <BBB magnet>` (hermetic seeder, then live) downloads fully.
 6. **Streaming** — resource loader, priority window, moov-tail; deterministic streaming test from the partial seed cache, then macOS-sim and live. Gate: video plays before 100% download.
 7. **SwiftUI app** — list/detail/add (magnet paste + `fileImporter` .torrent)/player, file selection, persistence. Gate: full flow on device.
-8. **Polish** — seeding, pause/resume, app icon (xtool-app-icon skill), implementation notes, README. Optional later: DHT.
+8. **Polish** — seeding, pause/resume, app icon, implementation notes, README. Optional later: DHT.
 
 ## `torrent-cli` commands
 
-- `torrent-cli add <magnet|path>` — add and download (flags: `--stop-at <bytes>`, `--dir <savePath>`)
-- `torrent-cli status [<hash>]` — live status (progress, rates, seeds/peers, state)
-- `torrent-cli verify <hash>` — recompute SHA-1 per piece from `Storage`, compare to the torrent's `pieces`; print per-piece `ok`/`bad`/`missing`. **The direct piece-correctness gate.**
+Run `torrent-cli` with no arguments for the full usage. The main gates:
+
+- `torrent-cli add <file.torrent|magnet> [--dir <dir>] [--stop-at <bytes>] [--peer host:port]` — add and download; verifies every piece when it stops
+- `torrent-cli verify <file.torrent> [--dir <dir>]` — recompute SHA-1 per piece and print `ok`/`bad`/`missing`. **The direct piece-correctness gate.**
+- `torrent-cli resolve <magnet>`, `tracker`, `dht-node` — metadata, tracker and DHT diagnostics
+- `torrent-cli stream-test` / `stream-play` — drive `TorrentStreamSession.preparePlayer()` against a partial download (what the apps ship)
+- `torrent-cli utp-echo` / `utp-listen` — µTP transport diagnostics
 
 ## Risks & mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Swift 6 concurrency friction (actors + `NWConnection` callbacks, status fan-out) | Bridge callbacks to `async` early; `StatusBroadcast` for multi-subscriber current-value; validate on macOS in Phase 3 |
+| Swift 6 concurrency friction (actors + blocking socket threads, status fan-out) | Blocking I/O only on dedicated threads (`BlockingIO`), bridged to `async`; `StatusBroadcast` for multi-subscriber current-value; validate on macOS in Phase 3 |
 | Magnet dependency chain (magnet requires peer-wire + BEP 10/9 all working) | Phases build bottom-up, each gated by unit + hermetic tests |
 | Tracker/peer long tail | Follow anacrolix/webtorrent behavior; hermetic coverage via mock trackers + third-party seeder (webtorrent/aria2c); live swarm as final gate; fail loudly with clear logs |
 | iOS background task expiration or cancellation | Piece verification persists resume state continuously; expiration pauses the torrent and closes peers promptly. The system can terminate tasks under resource pressure, and force-quitting the app cancels them. |

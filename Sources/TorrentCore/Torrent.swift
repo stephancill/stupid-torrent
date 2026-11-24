@@ -100,7 +100,7 @@ public actor Torrent {
         let status = TorrentStatus(
             name: metainfo.displayName,
             infoHash: metainfo.infoHash,
-            state: restored.allSet ? .seeding : .downloading,
+            state: restored.allSet ? .complete : .downloading,
             verifiedCount: restored.setCount,
             pieceCount: metainfo.pieceCount,
             peers: 0,
@@ -689,7 +689,7 @@ public actor Torrent {
         let state: TorrentStatus.State = if isPaused {
             .paused
         } else if scheduler.picker.verified.allSet {
-            .seeding
+            .complete
         } else {
             .downloading
         }
