@@ -274,7 +274,7 @@ struct TorrentCLI {
         }
     }
 
-    static func streamTest(_ args: [String]) async {
+    @MainActor static func streamTest(_ args: [String]) async {
         guard let path = args.first else {
             print("usage: torrent-cli stream-test <file.torrent> [--dir <dir>] [--file <index>] [--seed-until <bytes>] [--peer host:port]")
             return
@@ -332,14 +332,14 @@ struct TorrentCLI {
             }
             let streamTask = Task { await stream.run() }
 
-            print("  -> loading asset...")
+            print("  -> preparing player...")
             let session = TorrentStreamSession(torrent: stream, fileIndex: index)
             do {
-                let duration = try await withThrowingTaskGroup(of: CMTime.self) { group in
-                    group.addTask { try await session.asset.load(.duration) }
+                let player = try await withThrowingTaskGroup(of: AVPlayer.self) { group in
+                    group.addTask { try await session.preparePlayer() }
                     group.addTask {
                         try await Task.sleep(for: .seconds(30))
-                        throw NSError(domain: "stream-test", code: -1, userInfo: [NSLocalizedDescriptionKey: "asset load timed out"])
+                        throw NSError(domain: "stream-test", code: -1, userInfo: [NSLocalizedDescriptionKey: "player preparation timed out"])
                     }
                     guard let result = try await group.next() else {
                         throw NSError(domain: "stream-test", code: -1, userInfo: [NSLocalizedDescriptionKey: "no result"])
@@ -347,22 +347,22 @@ struct TorrentCLI {
                     group.cancelAll()
                     return result
                 }
+                guard let asset = player.currentItem?.asset else {
+                    throw NSError(domain: "stream-test", code: -1, userInfo: [NSLocalizedDescriptionKey: "player has no item"])
+                }
+                let (duration, playable) = try await asset.load(.duration, .isPlayable)
+                let audioTracks = try await asset.loadTracks(withMediaType: .audio)
                 let seconds = CMTimeGetSeconds(duration)
-                let playable = (try? await session.asset.load(.isPlayable)) ?? false
-                let audioTracks = (try? await session.asset.loadTracks(withMediaType: .audio)) ?? []
-                let playerItem = await session.makePlayerItem()
-                let playerSeconds = CMTimeGetSeconds(playerItem.duration)
                 print("ASSET: duration=\(seconds)s playable=\(playable) audioTracks=\(audioTracks.count)")
-                print("PLAYER ITEM: duration=\(playerSeconds)s")
-                if playerSeconds > 0 {
+                if seconds > 0, playable {
                     print("STREAM OK: media loads and is playable before 100% download")
                 } else {
-                    print("STREAM FAIL: duration is 0")
+                    print("STREAM FAIL: duration=\(seconds)s playable=\(playable)")
                 }
             } catch {
-                print("asset load error: \(error)")
+                print("STREAM FAIL: \(error)")
             }
-            await session.stop()
+            session.stop()
             streamTask.cancel()
             await stream.stop()
         } catch {
@@ -370,7 +370,7 @@ struct TorrentCLI {
         }
     }
 
-    static func streamPlay(_ args: [String]) async {
+    @MainActor static func streamPlay(_ args: [String]) async {
         guard let path = args.first else {
             print("usage: torrent-cli stream-play <file.torrent> [--dir <dir>] [--file <index>] [--seed-until <bytes>] [--peer host:port] [--seconds <n>] [--seek-to <seconds>]")
             return
@@ -431,7 +431,7 @@ struct TorrentCLI {
             let streamTask = Task { await stream.run() }
 
             let session = TorrentStreamSession(torrent: stream, fileIndex: index)
-            let player = await session.makePlayer()
+            let player = try await session.preparePlayer()
             player.play()
 
             var maxTime: Double = 0
@@ -466,7 +466,7 @@ struct TorrentCLI {
                 print(maxTime > 5 ? "STREAM-PLAY OK: played past 5s" : "STREAM-PLAY FAIL: stalled early")
             }
             player.pause()
-            await session.stop()
+            session.stop()
             streamTask.cancel()
             await stream.stop()
         } catch {

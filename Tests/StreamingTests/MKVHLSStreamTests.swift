@@ -94,9 +94,6 @@ import TorrentTestingSupport
         player.pause()
     }
 
-    /// Waits (up to `within` wall-clock seconds) for playback to advance past `beyond`. A fixed
-    /// sleep is load-sensitive: AVPlayer's segment-fetch + decoder startup eats into it under a
-    /// busy test host, so assert on reaching the target rather than on a wall-clock threshold.
     private func advancePlaying(_ player: AVPlayer, beyond: Double, within: Double) async -> Bool {
         let deadline = ContinuousClock.now + .seconds(within)
         while ContinuousClock.now < deadline {
@@ -160,7 +157,7 @@ import TorrentTestingSupport
         var data = try Fixtures.data(named: "mkv/long30.mkv")
         let info = try MatroskaParser.parseHead(bytes: data)
         let cueID = Data([0x1C, 0x53, 0xBB, 0x6B])
-        let headEnd = try #require(info.firstClusterOffset)
+        let headEnd = try #require(info.clustersStart)
         let seekIDRange = try #require(data[..<headEnd].range(of: cueID))
         data[seekIDRange.lowerBound] = 0x1D
         let source = FakeMKVSource(data)
@@ -175,12 +172,110 @@ import TorrentTestingSupport
         }
     }
 
+    @Test @MainActor func completeCuelessFilePlaysThroughSession() async throws {
+        let data = try cuelessWithoutDuration(try Fixtures.data(named: "mkv/long30.mkv"))
+        let source = FakeMKVSource(data)
+        await source.verify(0..<data.count)
+
+        let stream = MKVHLSStream(source: source, fileIndex: 0)
+        let segments = try await stream.segments()
+        #expect(segments.count > 1)
+        #expect(segments.first?.startTimeTicks == 0)
+        let totalSeconds = segments.reduce(0) { $0 + $1.durationTicks } / 1000
+        #expect(abs(totalSeconds - 30.0) < 0.1)
+
+        let session = TorrentStreamSession(source: source, fileIndex: 0, fileName: "long30.mkv", cacheKey: nil)
+        defer { session.stop() }
+        let player = try await session.preparePlayer()
+        player.isMuted = true
+        let item = try #require(player.currentItem)
+        let duration = try await item.asset.load(.duration)
+        #expect(abs(CMTimeGetSeconds(duration) - 30.0) < 0.1)
+
+        await player.seek(
+            to: CMTime(seconds: 20, preferredTimescale: 600),
+            toleranceBefore: .zero,
+            toleranceAfter: .zero
+        )
+        #expect(abs(CMTimeGetSeconds(player.currentTime()) - 20) < 0.2)
+        player.play()
+        #expect(await advancePlaying(player, beyond: 20.5, within: 3))
+        player.pause()
+    }
+
+    @Test @MainActor func partialCuelessFileFailsToPreparePlayer() async throws {
+        let data = try cuelessWithoutDuration(try Fixtures.data(named: "mkv/long30.mkv"))
+        let source = FakeMKVSource(data)
+        await source.verify(0..<300 * 1024)
+        let session = TorrentStreamSession(source: source, fileIndex: 0, fileName: "long30.mkv", cacheKey: nil)
+        defer { session.stop() }
+
+        await #expect(throws: MKVHLSStreamError.invalidCues) {
+            _ = try await session.preparePlayer()
+        }
+    }
+
+    @Test func concurrentSegmentRequestsShareOneGeneration() async throws {
+        let data = try Fixtures.data(named: "mkv/long30.mkv")
+        let source = FakeMKVSource(data)
+        await source.verify(0..<data.count)
+        let stream = MKVHLSStream(source: source, fileIndex: 0)
+        let target = try await stream.segments()[1]
+        let readsBefore = await source.readRanges.filter { $0 == target.sourceRange }.count
+
+        async let first = stream.mediaSegment(id: target.id)
+        async let second = stream.mediaSegment(id: target.id)
+        let (a, b) = try await (first, second)
+        let cached = try await stream.mediaSegment(id: target.id)
+        let readsAfter = await source.readRanges.filter { $0 == target.sourceRange }.count
+
+        #expect(a == b)
+        #expect(a == cached)
+        #expect(readsAfter - readsBefore == 1)
+    }
+
+    private func cuelessWithoutDuration(_ original: Data) throws -> Data {
+        var data = original
+        let info = try MatroskaParser.parseHead(bytes: data)
+        let headEnd = try #require(info.clustersStart)
+        let cuesOffset = try #require(info.cuesOffset)
+        let seekID = try #require(data[..<headEnd].range(of: Data([0x1C, 0x53, 0xBB, 0x6B])))
+        data[seekID.lowerBound] = 0x1D
+        #expect(data[cuesOffset] == 0x1C)
+        data[cuesOffset] = 0x1D
+        let durationID = try #require(childOffset(data: data, id: 0x4489, inChildWithID: 0x1549A966))
+        data[durationID + 1] = 0x88
+        let mutated = try MatroskaParser.parseHead(bytes: data)
+        #expect(mutated.cuesOffset == nil)
+        #expect(mutated.durationTicks == nil)
+        return data
+    }
+
+    private func childOffset(data: Data, id: UInt64, inChildWithID parentID: UInt64) -> Int? {
+        guard let info = try? MatroskaParser.parseHead(bytes: data), let start = info.segmentDataStart,
+              let end = info.clustersStart else { return nil }
+        var offset = start
+        while offset < end, let header = EBML.readHeader(in: data, offset: offset), let size = header.size {
+            if header.id == parentID {
+                var child = offset + header.length
+                while child < offset + header.length + Int(size),
+                      let childHeader = EBML.readHeader(in: data, offset: child), let childSize = childHeader.size {
+                    if childHeader.id == id { return child }
+                    child += childHeader.length + Int(childSize)
+                }
+                return nil
+            }
+            offset += header.length + Int(size)
+        }
+        return nil
+    }
+
     private func cueRange(data: Data) throws -> Range<Int> {
         let info = try MatroskaParser.parseHead(bytes: data)
         let offset = try #require(info.cuesOffset)
-        let header = try #require(EBML.readHeader(data, offset: offset))
+        let header = try #require(EBML.readHeader(in: data, offset: offset))
         let size = try #require(header.size)
-        return offset..<offset + EBML.headerLength(header) + Int(size)
+        return offset..<offset + header.length + Int(size)
     }
 
     private func tfdtValues(data: Data) -> [UInt64] {
