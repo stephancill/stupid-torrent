@@ -4,6 +4,25 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-11-24 — Fix: search field crash when the iPhone app runs on a Mac
+
+- Activating `.searchable` inside the root `TabView` crashed the iPhone app running on an Apple
+  Silicon Mac: UIKit's search presentation hides the tab bar (`setSuppressTabBar:`), and the
+  resulting layout asks `+[UINavigationBar defaultSizeForOrientation:]` for main-screen bounds,
+  which asserts on the Mac (`_screenBasedFocusUnsupported`). Dropping the tab's `.search` role,
+  `.tabViewStyle(.tabBarOnly)` and `.toolbar` search placement all still crashed.
+- When `ProcessInfo.isiOSAppOnMac`, `TorrentSearchView` uses a plain `TextField` pinned above the
+  results instead of `.searchable` (`SearchQueryField`). iPhone and iPad keep the native search
+  tab; tvOS keeps `.searchable(text:prompt:)` because it has no `isPresented` variant.
+- DEBUG launch arguments `-SearchTab` (open the Search tab) and `-SearchActivate` (activate the
+  search field after 1 s, and `fatalError` if it is not presented 2 s later) make the crash
+  reproducible without clicking: launch, wait, then check for a crash report.
+
+Verification: with both arguments the Mac app crashed on the old code and every rejected
+variant, and stayed up with the field focused (twice) with the text field. iOS, tvOS and macOS
+builds green; `swift test` green; on an iPhone simulator the native search tab still activates
+with the keyboard up.
+
 ### 2026-11-24 — Gapless MKV audio across HLS segments (phase 5)
 
 A real 7.1 E-AC-3 stream (FFmpeg's `7_pt_1.eac3` sample, one 256-sample independent frame plus

@@ -3,8 +3,21 @@ import TorrentCore
 import StupidClientCore
 import StupidClientUI
 
+private enum RootTab: Hashable {
+    case torrents
+    case search
+
+    static var initial: RootTab {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-SearchTab") { return .search }
+        #endif
+        return .torrents
+    }
+}
+
 struct ContentView: View {
     @State private var store = TorrentStore()
+    @State private var selectedTab = RootTab.initial
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -53,11 +66,11 @@ struct ContentView: View {
     @ViewBuilder
     private var tabs: some View {
         if #available(macOS 15, *) {
-            TabView {
-                Tab("Torrents", systemImage: "arrow.down.circle") {
+            TabView(selection: $selectedTab) {
+                Tab("Torrents", systemImage: "arrow.down.circle", value: RootTab.torrents) {
                     TorrentLibraryView(store: store)
                 }
-                Tab("Search", systemImage: "magnifyingglass", role: .search) {
+                Tab("Search", systemImage: "magnifyingglass", value: RootTab.search, role: .search) {
                     TorrentSearchView(store: store) { item in
                         TorrentDetailView(item: item, store: store)
                     }

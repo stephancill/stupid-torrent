@@ -19,8 +19,43 @@ private enum SearchDebug {
     static var opensFirst: Bool { opensEpisode || ProcessInfo.processInfo.arguments.contains("-SearchOpenFirst") }
 
     static var opensEpisode: Bool { ProcessInfo.processInfo.arguments.contains("-SearchOpenEpisode") }
+
+    static var activatesField: Bool { ProcessInfo.processInfo.arguments.contains("-SearchActivate") }
 }
 #endif
+
+private struct SearchQueryField: ViewModifier {
+    @Binding var query: String
+    @Binding var isActive: Bool
+    @FocusState private var isFocused: Bool
+
+    private let prompt = "Movies and TV shows"
+
+    func body(content: Content) -> some View {
+        #if os(iOS)
+        if ProcessInfo.processInfo.isiOSAppOnMac {
+            content
+                .safeAreaInset(edge: .top) {
+                    TextField(prompt, text: $query)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .submitLabel(.search)
+                        .focused($isFocused)
+                        .padding(.horizontal)
+                        .padding(.bottom, 8)
+                }
+                .onChange(of: isActive) { _, active in isFocused = active }
+                .onChange(of: isFocused) { _, focused in isActive = focused }
+        } else {
+            content.searchable(text: $query, isPresented: $isActive, prompt: prompt)
+        }
+        #elseif os(tvOS)
+        content.searchable(text: $query, prompt: prompt)
+        #else
+        content.searchable(text: $query, isPresented: $isActive, prompt: prompt)
+        #endif
+    }
+}
 
 #if os(tvOS)
 private let resultPosterWidth: CGFloat = 240
@@ -35,6 +70,7 @@ public struct TorrentSearchView<Detail: View>: View {
     let detail: (TorrentItem) -> Detail
 
     @State private var query = ""
+    @State private var isSearchPresented = false
     @State private var path = NavigationPath()
     @State private var search = Loadable<MediaSearchResults>()
 
@@ -76,7 +112,7 @@ public struct TorrentSearchView<Detail: View>: View {
                 .navigationDestination(for: TorrentItem.self) { item in
                     detail(item)
                 }
-                .searchable(text: $query, prompt: "Movies and TV shows")
+                .modifier(SearchQueryField(query: $query, isActive: $isSearchPresented))
                 #if !os(tvOS)
                 .toolbar {
                     if search.isLoading, search.value?.isEmpty == false {
@@ -92,6 +128,13 @@ public struct TorrentSearchView<Detail: View>: View {
                 #if DEBUG
                 .onAppear {
                     if query.isEmpty { query = SearchDebug.query }
+                }
+                .task {
+                    guard SearchDebug.activatesField else { return }
+                    try? await Task.sleep(for: .seconds(1))
+                    isSearchPresented = true
+                    try? await Task.sleep(for: .seconds(2))
+                    if !isSearchPresented { fatalError("SearchDebug: not presented") }
                 }
                 .onChange(of: search.value) { _, results in
                     if SearchDebug.opensFirst, path.isEmpty,
