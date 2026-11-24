@@ -7,6 +7,7 @@ The BitTorrent engine is written from scratch in Swift, closely modeled on [webt
 ## Features
 
 - Magnet links and `.torrent` files
+- Torrentio search: find movies and shows by name, then pick a torrent
 - HTTP(S) and UDP tracker announces
 - Sequential + priority-window downloading (streaming-friendly)
 - SHA-1 piece verification and fast-resume (verified-bitfield sidecar)
@@ -50,6 +51,22 @@ stupid-app run --network --udid <device-udid>
 stupid-app release archive
 stupid-app release upload --wait
 ```
+
+### Apple TV
+
+`TV/` is a separate stupid-app project (`platform: tvos`) with a remote-friendly SwiftUI UI
+on the same engine and store (`StupidClientCore`). Needs a stupid-app build with tvOS support.
+
+```sh
+cd TV
+stupid-app device pair --network            # Apple TV: Settings > Remotes and Devices > Remote App and Devices
+stupid-app signing setup --kind development --udid <apple-tv-udid>
+stupid-app run --network --udid <apple-tv-udid>   # installs; open it from the home screen
+stupid-app run --simulator                  # tvOS simulator
+```
+
+tvOS gives apps no Documents directory, so the TV app keeps torrents and downloads in
+Caches, which tvOS can purge when storage runs low.
 
 The `torrent-cli` executable product is ignored by `stupid-app` and is the headless dev/test harness. It validates the engine against the live Big Buck Bunny swarm before any UI work.
 

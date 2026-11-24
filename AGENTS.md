@@ -35,6 +35,7 @@ A torrenting client for iOS that downloads from magnet links and `.torrent` file
 - Build the iOS app (unsigned): `stupid-app build`
 - Release to TestFlight/App Store: `stupid-app release archive` then `stupid-app release upload --wait`
 - Deploy to a device: `stupid-app run --network --udid <udid>`
+- tvOS app (Apple TV): run stupid-app from `TV/` (its own project: `TV/stupid-app.yml`, `platform: tvos`): `cd TV && stupid-app build`, `stupid-app run --simulator` (tvOS simulator runtime), `stupid-app run --network --udid <apple-tv-udid>` after `stupid-app device pair --network`
 
 ## Docs
 

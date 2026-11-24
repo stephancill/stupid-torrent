@@ -6,6 +6,7 @@ let package = Package(
     name: "stupid-torrent-client",
     platforms: [
         .iOS("26.0"),
+        .tvOS("26.0"),
         .macOS(.v14),
     ],
     products: [
@@ -16,6 +17,11 @@ let package = Package(
             targets: ["stupid_torrent_client"]
         ),
         // Headless macOS dev/test harness. xtool ignores executable products.
+        // Shared engine + store for the tvOS app in TV/ (its own stupid-app project).
+        .library(
+            name: "StupidClientCore",
+            targets: ["StupidClientCore"]
+        ),
         .executable(
             name: "torrent-cli",
             targets: ["torrent-cli"]

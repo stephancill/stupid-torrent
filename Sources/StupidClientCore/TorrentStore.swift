@@ -59,7 +59,14 @@ public final class TorrentStore {
     private var submittedRestoredBackgroundTasks = false
 
     public convenience init() {
-        self.init(documentsURL: FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0])
+        #if os(tvOS)
+        // tvOS apps have no Documents directory; Caches is the only writable storage, and the
+        // system may purge it when the Apple TV runs low on space.
+        let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        #else
+        let directory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        #endif
+        self.init(documentsURL: directory)
     }
 
     /// Test seam: point the store at a temporary documents directory and (optionally) disable

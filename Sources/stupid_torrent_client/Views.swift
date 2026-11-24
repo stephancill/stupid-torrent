@@ -7,12 +7,7 @@ import StupidClientCore
 
 struct ContentView: View {
     @State private var store = TorrentStore()
-    @State private var showAdd = false
-    @State private var showCompleted = true
     @Environment(\.scenePhase) private var scenePhase
-
-    private var downloadingItems: [TorrentItem] { store.items.filter { !$0.isComplete } }
-    private var completedItems: [TorrentItem] { store.items.filter { $0.isComplete } }
 
     /// True while anything needs the network: resolving a magnet, or a torrent in the `.downloading`
     /// state (paused/complete/error do not keep the screen awake).
@@ -21,109 +16,33 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            Group {
-                if store.items.isEmpty && store.resolvingItems.isEmpty {
-                    ContentUnavailableView(
-                        "No Torrents",
-                        systemImage: "arrow.down.circle",
-                        description: Text("Add a magnet link or a .torrent file to start downloading.")
-                    )
-                } else {
-                    List {
-                        if !store.resolvingItems.isEmpty || !downloadingItems.isEmpty {
-                            Section {
-                                ForEach(store.resolvingItems) { item in
-                                    ResolvingTorrentRow(item: item)
-                                }
-                                ForEach(downloadingItems) { item in
-                                    row(item)
-                                }
-                            } header: {
-                                Text("In Progress")
-                                    .font(.headline)
-                                    .foregroundStyle(.primary)
-                                    .textCase(nil)
-                            }
-                        }
-                        if !completedItems.isEmpty {
-                            Section {
-                                if showCompleted {
-                                    ForEach(completedItems) { item in
-                                        row(item)
-                                    }
-                                }
-                            } header: {
-                                Button {
-                                    showCompleted.toggle()
-                                } label: {
-                                    HStack {
-                                        Text("Completed")
-                                            .font(.headline)
-                                            .foregroundStyle(.primary)
-                                        Spacer()
-                                        Image(systemName: "chevron.right")
-                                            .foregroundStyle(.tint)
-                                            .rotationEffect(.degrees(showCompleted ? 90 : 0))
-                                            .animation(.easeInOut(duration: 0.2), value: showCompleted)
-                                    }
-                                    .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .textCase(nil)
-                            }
-                        }
-                    }
-                }
+        tabs
+        #if os(iOS)
+        .fullScreenCover(item: $store.pendingPlayback, onDismiss: {
+            // Any dismissal of the player (swipe, or AVKit's native X) must end the
+            // player-orientation pin so the torrent UI returns to portrait.
+            OrientationLock.playerPresented = false
+        }) { request in
+            switch request.kind {
+            case .avPlayer:
+                PlayerView(
+                    session: TorrentStreamSession(torrent: request.torrent, fileIndex: request.fileIndex),
+                    store: store,
+                    torrent: request.torrent,
+                    fileIndex: request.fileIndex
+                )
+            case .none:
+                EmptyView()
             }
-            .navigationDestination(for: TorrentItem.self) { item in
-                TorrentDetailView(item: item, store: store)
-            }
-            #if os(iOS)
-            .fullScreenCover(item: $store.pendingPlayback, onDismiss: {
-                // Any dismissal of the player (swipe, or AVKit's native X) must end the
-                // player-orientation pin so the torrent UI returns to portrait.
-                OrientationLock.playerPresented = false
-            }) { request in
-                switch request.kind {
-                case .avPlayer:
-                    PlayerView(
-                        session: TorrentStreamSession(torrent: request.torrent, fileIndex: request.fileIndex),
-                        store: store,
-                        torrent: request.torrent,
-                        fileIndex: request.fileIndex
-                    )
-                case .none:
-                    EmptyView()
-                }
-            }
-            #endif
-            .navigationTitle("Torrents")
-            .toolbar {
-                Button {
-                    showAdd = true
-                } label: {
-                    Image(systemName: "plus")
-                }
-            }
-            .sheet(isPresented: $showAdd) {
-                AddTorrentView { source in
-                    switch source {
-                    case .magnet(let string):
-                        try store.addMagnet(string)
-                    case .file(let url):
-                        try store.addFile(url)
-                    }
-                }
-            }
-            .alert("Could Not Add Torrent", isPresented: Binding(
-                get: { store.addError != nil },
-                set: { if !$0 { store.addError = nil } }
-            )) {
-                Button("OK", role: .cancel) { store.addError = nil }
-            } message: {
-                Text(store.addError ?? "")
-            }
+        }
+        #endif
+        .alert("Could Not Add Torrent", isPresented: Binding(
+            get: { store.addError != nil },
+            set: { if !$0 { store.addError = nil } }
+        )) {
+            Button("OK", role: .cancel) { store.addError = nil }
+        } message: {
+            Text(store.addError ?? "")
         }
         .onAppear {
             store.restore()
@@ -156,20 +75,28 @@ struct ContentView: View {
         }
     }
 
-    private func row(_ item: TorrentItem) -> some View {
-        NavigationLink(value: item) {
-            TorrentRow(item: item)
-        }
-        .swipeActions {
-            Button("Delete", role: .destructive) {
-                store.remove(item)
+    @ViewBuilder
+    private var tabs: some View {
+        if #available(macOS 15, *) {
+            TabView {
+                Tab("Torrents", systemImage: "arrow.down.circle") {
+                    TorrentLibraryView(store: store)
+                }
+                Tab("Search", systemImage: "magnifyingglass", role: .search) {
+                    TorrentSearchView(store: store)
+                }
             }
-        }
-        .swipeActions(edge: .leading) {
-            Button(item.isPaused ? "Resume" : "Pause") {
-                store.togglePause(item)
+        } else {
+            TabView {
+                TorrentLibraryView(store: store)
+                    .tabItem {
+                        Label("Torrents", systemImage: "arrow.down.circle")
+                    }
+                TorrentSearchView(store: store)
+                    .tabItem {
+                        Label("Search", systemImage: "magnifyingglass")
+                    }
             }
-            .tint(item.isPaused ? .blue : .orange)
         }
     }
 
@@ -210,6 +137,93 @@ struct ContentView: View {
                 }
                 try? await Task.sleep(for: .milliseconds(500))
             }
+        }
+    }
+}
+
+struct TorrentLibraryView: View {
+    let store: TorrentStore
+
+    @State private var showAdd = false
+    @State private var showCompleted = true
+    @State private var pendingDelete: TorrentItem?
+
+    private var downloadingItems: [TorrentItem] { store.items.filter { !$0.isComplete } }
+    private var completedItems: [TorrentItem] { store.items.filter { $0.isComplete } }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if store.items.isEmpty && store.resolvingItems.isEmpty {
+                    ContentUnavailableView(
+                        "No Torrents",
+                        systemImage: "arrow.down.circle",
+                        description: Text("Add a magnet link, import a .torrent file, or search for a movie or show in the Search tab.")
+                    )
+                } else {
+                    List {
+                        if !store.resolvingItems.isEmpty || !downloadingItems.isEmpty {
+                            Section("In Progress") {
+                                ForEach(store.resolvingItems) { item in
+                                    ResolvingTorrentRow(item: item)
+                                }
+                                ForEach(downloadingItems) { item in
+                                    row(item)
+                                }
+                            }
+                        }
+                        if !completedItems.isEmpty {
+                            Section("Completed", isExpanded: $showCompleted) {
+                                ForEach(completedItems) { item in
+                                    row(item)
+                                }
+                            }
+                        }
+                    }
+                    .listStyle(.sidebar)
+                }
+            }
+            .navigationDestination(for: TorrentItem.self) { item in
+                TorrentDetailView(item: item, store: store)
+            }
+            .navigationTitle("Torrents")
+            .toolbar {
+                Button {
+                    showAdd = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+            }
+            .sheet(isPresented: $showAdd) {
+                AddTorrentView { source in
+                    switch source {
+                    case .magnet(let string):
+                        try store.addMagnet(string)
+                    case .file(let url):
+                        try store.addFile(url)
+                    }
+                }
+            }
+            .deleteTorrentAlert(item: $pendingDelete) { item in
+                store.remove(item)
+            }
+        }
+    }
+
+    private func row(_ item: TorrentItem) -> some View {
+        NavigationLink(value: item) {
+            TorrentRow(item: item)
+        }
+        .swipeActions {
+            Button("Delete", role: .destructive) {
+                pendingDelete = item
+            }
+        }
+        .swipeActions(edge: .leading) {
+            Button(item.isPaused ? "Resume" : "Pause") {
+                store.togglePause(item)
+            }
+            .tint(item.isPaused ? .blue : .orange)
         }
     }
 }
@@ -306,7 +320,14 @@ struct AddTorrentView: View {
                     }
                 }
             }
-            .navigationTitle("Add torrent")
+            .navigationTitle("Add Torrent")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", role: .cancel) {
+                        dismiss()
+                    }
+                }
+            }
             .onAppear {
                 if magnet.isEmpty, let clipboard = clipboardString(), (try? MagnetLinkParser.parse(clipboard)) != nil {
                     magnet = String(clipboard.drop(while: \.isWhitespace))
@@ -437,7 +458,7 @@ private struct TorrentDetailMenu: View {
     let store: TorrentStore
 
     @Environment(\.dismiss) private var dismiss
-    @State private var confirmDelete = false
+    @State private var pendingDelete: TorrentItem?
 
     var body: some View {
         Menu {
@@ -455,18 +476,16 @@ private struct TorrentDetailMenu: View {
             }
             Divider()
             Button(role: .destructive) {
-                confirmDelete = true
+                pendingDelete = item
             } label: {
                 Label("Delete", systemImage: "trash")
             }
         } label: {
             Image(systemName: "ellipsis")
         }
-        .confirmationDialog("Delete \"\(item.name)\"?", isPresented: $confirmDelete, titleVisibility: .visible) {
-            Button("Delete", role: .destructive) {
-                store.remove(item)
-                dismiss()
-            }
+        .deleteTorrentAlert(item: $pendingDelete) { item in
+            store.remove(item)
+            dismiss()
         }
     }
 
@@ -478,6 +497,26 @@ private struct TorrentDetailMenu: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(magnet, forType: .string)
         #endif
+    }
+}
+
+extension View {
+    func deleteTorrentAlert(item: Binding<TorrentItem?>, onDelete: @escaping (TorrentItem) -> Void) -> some View {
+        alert(
+            "Delete \u{201C}\(item.wrappedValue?.name ?? "")\u{201D}?",
+            isPresented: Binding(
+                get: { item.wrappedValue != nil },
+                set: { if !$0 { item.wrappedValue = nil } }
+            ),
+            presenting: item.wrappedValue
+        ) { pending in
+            Button("Cancel", role: .cancel) {}
+            Button("Delete Torrent", role: .destructive) {
+                onDelete(pending)
+            }
+        } message: { _ in
+            Text("This stops the torrent and deletes its downloaded files from this device.")
+        }
     }
 }
 
@@ -635,30 +674,6 @@ func clipboardString() -> String? {
     #endif
 }
 
-func magnetLink(_ metainfo: Metainfo) -> String {
-    var parts = ["xt=urn:btih:\(metainfo.infoHash.hexString)"]
-    if let dn = metainfo.displayName.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-        parts.append("dn=\(dn)")
-    }
-    for tracker in metainfo.flattenedTrackers {
-        if let tr = tracker.absoluteString.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
-            parts.append("tr=\(tr)")
-        }
-    }
-    return "magnet:?" + parts.joined(separator: "&")
-}
-
-func byteString(_ bytes: Double) -> String {
-    if bytes >= 1_000_000_000 { return String(format: "%.1f GB", bytes / 1_000_000_000) }
-    if bytes >= 1_000_000 { return String(format: "%.1f MB", bytes / 1_000_000) }
-    if bytes >= 1_000 { return String(format: "%.1f KB", bytes / 1_000) }
-    return "\(Int(bytes)) B"
-}
-
-func byteRateString(_ bytesPerSecond: Double) -> String {
-    "\(byteString(bytesPerSecond))/s"
-}
-
 struct PieProgressView: View {
     let progress: Double
 
@@ -681,43 +696,7 @@ struct PieProgressView: View {
                 )
                 path.closeSubpath()
             }
-            context.fill(pie, with: .color(.blue))
+            context.fill(pie, with: .style(.tint))
         }
     }
-}
-
-func relativeTime(_ date: Date) -> String {
-    let seconds = max(0, Int(Date().timeIntervalSince(date)))
-    if seconds < 60 { return "now" }
-    let minutes = seconds / 60
-    if minutes < 60 { return "\(minutes)m" }
-    let hours = minutes / 60
-    if hours < 24 { return "\(hours)h" }
-    let days = hours / 24
-    if days < 30 { return "\(days)d" }
-    let months = days / 30
-    if months < 12 { return "\(months)mo" }
-    return "\(months / 12)y"
-}
-
-func remainingSeconds(_ status: TorrentStatus, metainfo: Metainfo) -> Double? {
-    guard !status.isComplete, status.downloadRate > 0 else { return nil }
-    let total = metainfo.files.reduce(Int64(0)) { $0 + Int64($1.length) }
-    let remaining = Double(total) * (1 - status.progress)
-    guard remaining > 0 else { return nil }
-    return remaining / status.downloadRate
-}
-
-func durationString(_ seconds: Double) -> String {
-    let s = max(0, Int(seconds))
-    if s < 60 { return "<1m" }
-    let minutes = s / 60
-    if minutes < 60 { return "\(minutes)m" }
-    let hours = minutes / 60
-    if hours < 24 { return "\(hours)h" }
-    let days = hours / 24
-    if days < 30 { return "\(days)d" }
-    let months = days / 30
-    if months < 12 { return "\(months)mo" }
-    return "\(months / 12)y"
 }

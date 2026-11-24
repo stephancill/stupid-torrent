@@ -4,6 +4,45 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-11-24 — Feat: Apple TV app (`TV/`)
+
+A tvOS app on the same engine, so torrents stream on an Apple TV.
+
+- `TV/` is its own stupid-app project (`TV/stupid-app.yml`, `platform: tvos`, bundle
+  `net.stupidtech.stupid-torrent-tv`) whose package depends on the root package by path.
+  The root package declares `.tvOS("26.0")` and exports `StupidClientCore` as a library so
+  the TV target can use the engine, streaming and store unchanged (all compile for tvOS
+  as-is).
+- TV UI (`TV/Sources/StupidTorrentTV`): list with an Add row, add sheet (magnet text field
+  for the iPhone keyboard, plus a Big Buck Bunny sample), detail with status, files
+  (play when streamable), pause/resume and delete, and a full-screen
+  `AVPlayerViewController` that resumes and periodically saves the playhead. Idle timer is
+  held while downloading.
+- `TorrentStore()` uses Caches on tvOS: tvOS has no writable Documents directory. Caches can
+  be purged by the system.
+- Shared formatting helpers (`magnetLink`, `byteString`, `relativeTime`, ...) moved from the
+  iOS views to `StupidClientCore/Formatting.swift`.
+
+Verification: iOS `stupid-app build`, macOS `swift build`, and tvOS `stupid-app build` green;
+installed on an Apple TV HD with `stupid-app run --network` (launched from the home
+screen; stupid-app cannot launch on tvOS until it mounts the developer disk image).
+
+### 2026-11-24 — Portable engine I/O and urgent streaming for tvOS
+
+Running on an Apple TV HD (2 cores) exposed engine work that only held on phones.
+
+- **Blocking socket work never uses the cooperative pool.** `BlockingIO.run` executes a blocking
+  operation on a dedicated `Thread`; `UDPTrackerClient.announce` now goes through it. The µTP
+  receive loop previously occupied a pool thread permanently via `Task.detached` (one of only two
+  on the TV), starving actors and freezing the engine; `UTPTransport` now reads datagrams on a
+  named "utp-receive" thread and hands them, in order, to a task that dispatches into the actor.
+- **The stream-blocking piece is urgent.** `Torrent.streamPriority` records the first unverified
+  piece of the player's window in `urgentPieces`; it is requested with endgame-style redundancy
+  (`maxUrgentRedundancy` 4 instead of 2) and has a 3 s stall timeout instead of 20 s, so a
+  trickling peer cannot hold playback hostage.
+- `TorrentLog.logToFile(at:)` mirrors the engine log into a 20 MB-capped file so the Apple TV app
+  can pull diagnostics from its container, where the unified log is hard to reach.
+
 ### 2026-08-30 — Fix: player dismiss returns the app to portrait
 
 Follow-up to the always-landscape player: dismissing the player (AVKit's native X) was
@@ -1037,3 +1076,33 @@ Bumped `CFBundleVersion` 3 → 4 (marketing 1.0.0) and released with the CLI:
 `signing setup --kind distribution`, `release archive`, `release upload --wait`.
 Build `d8895c7f-57a9-46c6-aec4-7c7ee8592b9c` is `VALID`, internal
 `READY_FOR_BETA_TESTING`, external `READY_FOR_BETA_SUBMISSION`.
+
+## 2026-11-24 — Torrentio search (Search tab)
+
+Added torrent discovery. Torrentio has no free-text endpoint (it is ID-keyed), so search runs
+through Stremio's Cinemeta (`v3-cinemeta.strem.io`) for IMDb metadata, then Torrentio
+(`torrentio.strem.fun`) for streams.
+
+- `Sources/StupidClientCore/TorrentSearch.swift` — `CinemetaClient` (search + series detail),
+  `TorrentioClient` (streams), models, and pure parsers. Torrentio's `title` is parsed for seeders
+  (`👤`), size (`💾`) and provider (`⚙` — parsed by Unicode scalar because the gear carries VS16 and
+  Swift's grapheme-based regex rejects a bare U+2699). Stream magnets use
+  `behaviorHints.filename` (or a file-name-looking title line) as `dn`, keep the scrape's
+  `tracker:` sources, and fall back to four public trackers when the scrape has none. Invalid info
+  hashes are dropped.
+- `Sources/stupid_torrent_client/SearchView.swift` — Search tab with a debounced `.searchable`
+  list (posters, title, year, kind), a series season picker (specials/season 0 filtered) and
+  episode list, then Torrentio streams showing quality · size · provider · seeders. Tapping a
+  stream adds the magnet and flips the row to an "Added" checkmark; long-press copies the magnet.
+  Errors render inline with a retry.
+- `ContentView` is now a two-tab `TabView` (Torrents / Search) and the library moved to
+  `TorrentLibraryView`. The player cover, scene-phase/idle-timer handling, magnet URL handling and
+  the shared add-error alert stay on `ContentView` so they work from either tab.
+
+Tests: 8 hermetic `TorrentSearchTests` cover stream/search/series parsing, magnet encoding and
+tracker fallback, and dropping malformed info hashes. Verified live in the simulator: search
+"severance" → season 1 → E01 streams, adding the Rutracker 4K stream resolved in ~25 s and showed
+up in the library; "the matrix" lists movie streams with seeders/size/provider.
+
+Known limitation: a season-pack stream adds the whole torrent (the engine has no per-file
+selection yet); the row names the file Torrentio would play.

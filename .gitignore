@@ -17,3 +17,7 @@ DerivedData/
 # MobileVLCKit XCFramework (see docs/mkv-streaming.md) — download + repack step
 /Vendor/
 .release/
+
+# tvOS app package build output
+/TV/.build
+/TV/Package.resolved

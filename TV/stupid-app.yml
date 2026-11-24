@@ -1,0 +1,7 @@
+version: 1
+product: StupidTorrentTV
+bundleID: net.stupidtech.stupid-torrent-tv
+deploymentTarget: "26.0"
+platform: tvos
+infoPath: Info.plist
+iconPath: Resources/AppIcon.png
