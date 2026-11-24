@@ -90,7 +90,7 @@ public final class TorrentStreamSession: @unchecked Sendable {
 
     public static func isPlaybackAvailable(torrent: Torrent, fileIndex: Int) async -> Bool {
         let name = torrent.fileName(fileIndex)
-        guard Torrent.playbackKind(forFileNamed: name) != .none else { return false }
+        guard Torrent.isPlayable(fileNamed: name) else { return false }
         let ext = (name as NSString).pathExtension.lowercased()
         guard ext == "mkv" || ext == "mka" else { return true }
 

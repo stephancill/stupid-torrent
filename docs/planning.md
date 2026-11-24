@@ -93,7 +93,8 @@ Package.swift (swift-tools 6.0; platforms: iOS 26 / macOS 14)
 
 ### Persistence
 
-- `Documents/torrents/` — original `.torrent` files + a magnet link list (restore set)
+- `Documents/torrents/<infoHashHex>.torrent` — the restore set (magnets are persisted as `.torrent` once their metadata resolves)
+- `UserDefaults` `torrentRecords` — one Codable record per info hash: added date, paused state, playback position per file
 - `Documents/downloads/` — data files (exposed via Files app), protected as `completeUntilFirstUserAuthentication` so active downloads retain storage access while the phone is locked
 - Per-torrent verified-bitfield sidecar for fast resume (re-verify only unverified pieces on launch), using the same lock-safe protection class
 

@@ -42,17 +42,17 @@ struct TorrentCLI {
         torrent-cli v\(TorrentCore.version)
         usage:
           torrent-cli add <file.torrent|magnet:...> [--dir <dir>] [--stop-at <bytes>] [--peer host:port] [--verbose]
-          torrent-cli resolve <magnet:...> [--verbose]   (metadata resolution benchmark only)
+          torrent-cli resolve <magnet:...> [--verbose]
+          torrent-cli dht-node <info-hash-hex40> [--announce-port <port>] [--idle <seconds>]
           torrent-cli verify <file.torrent> [--dir <dir>]
           torrent-cli tracker <announce-url> --info-hash <hex40> [--verbose]
-          torrent-cli stream-test <file.torrent> [--dir <dir>] [--file <index>] [--seed-until <bytes>] [--peer host:port]
+          torrent-cli stream-test <file.torrent> [--dir <dir>] [--file <index>] [--seed-until <bytes>] [--peer host:port] [--verbose]
+          torrent-cli stream-play <file.torrent> [--dir <dir>] [--file <index>] [--seed-until <bytes>] [--peer host:port] [--seconds <n>] [--seek-to <seconds>] [--verbose]
           torrent-cli utp-echo <host> <port> [payload]
           torrent-cli utp-listen <port>
         """)
     }
 
-    /// µTP echo server: accepts µTP connections and echoes a 5-byte payload back. Used to validate
-    /// the responder path against a libutp (`utp-native`) initiator.
     static func utpListen(_ args: [String]) async {
         guard let port = args.first.flatMap({ UInt16($0) }) else {
             print("usage: torrent-cli utp-listen <port>")
@@ -78,8 +78,6 @@ struct TorrentCLI {
         }
     }
 
-    /// Interop check against a libutp (`utp-native`) echo server: connects over µTP, sends a
-    /// payload, reads the echoed bytes back.
     static func utpEcho(_ args: [String]) async {
         guard args.count >= 2, let port = UInt16(args[1]) else {
             print("usage: torrent-cli utp-echo <host> <port> [payload]")
@@ -161,33 +159,17 @@ struct TorrentCLI {
 
     static func add(_ args: [String]) async {
         guard let path = args.first else {
-            print("usage: torrent-cli add <file.torrent> [--dir <dir>] [--stop-at <bytes>]")
+            print("usage: torrent-cli add <file.torrent|magnet:...> [--dir <dir>] [--stop-at <bytes>] [--peer host:port] [--verbose]")
             return
         }
-        var dir = FileManager.default.currentDirectoryPath + "/downloads"
-        var stopAt: Int64?
-        var index = 1
-        while index < args.count {
-            switch args[index] {
-            case "--dir":
-                if index + 1 < args.count { dir = args[index + 1]; index += 2 } else { index += 1 }
-            case "--stop-at":
-                if index + 1 < args.count { stopAt = Int64(args[index + 1]); index += 2 } else { index += 1 }
-            case "--verbose":
-                TorrentLog.verbose = true
-                index += 1
-            default:
-                index += 1
-            }
-        }
-        var injectedPeer: PeerAddress?
-        if let peerIdx = args.firstIndex(of: "--peer"), peerIdx + 1 < args.count {
-            let parts = args[peerIdx + 1].split(separator: ":")
-            if parts.count == 2, let port = UInt16(parts[1]) {
-                injectedPeer = PeerAddress(host: String(parts[0]), port: port)
-            }
-        }
         do {
+            let options = try CommonOptions(
+                parsing: args.dropFirst(),
+                allowed: ["--dir", "--stop-at", "--peer", "--verbose"]
+            )
+            let dir = options.dir
+            let stopAt = options.stopAt
+            let injectedPeer = options.peer
             let metainfo: Metainfo
             var metadataPeer: PeerAddress? = nil
             if path.lowercased().hasPrefix("magnet:") {
@@ -205,7 +187,6 @@ struct TorrentCLI {
             print("  size:  \(metainfo.totalLength) bytes, \(metainfo.pieceCount) pieces")
             if let stopAt { print("  stopping after \(stopAt) bytes") }
 
-            // Persist the resolved magnet as a .torrent so later runs skip bootstrapping.
             if path.lowercased().hasPrefix("magnet:") {
                 let torrentDir = URL(fileURLWithPath: dir)
                 try FileManager.default.createDirectory(at: torrentDir, withIntermediateDirectories: true)
@@ -252,17 +233,8 @@ struct TorrentCLI {
             print("usage: torrent-cli verify <file.torrent> [--dir <dir>]")
             return
         }
-        var dir = FileManager.default.currentDirectoryPath + "/downloads"
-        var index = 1
-        while index < args.count {
-            if args[index] == "--dir", index + 1 < args.count {
-                dir = args[index + 1]
-                index += 2
-            } else {
-                index += 1
-            }
-        }
         do {
+            let dir = try CommonOptions(parsing: args.dropFirst(), allowed: ["--dir"]).dir
             let data = try Data(contentsOf: URL(fileURLWithPath: path))
             let metainfo = try Metainfo(data: data)
             let result = try await PieceVerifier.verify(metainfo: metainfo, directory: URL(fileURLWithPath: dir))
@@ -312,7 +284,7 @@ struct TorrentCLI {
             let metainfo = try Metainfo(data: data)
             let dirURL = URL(fileURLWithPath: dir)
             let index = fileIndex ?? metainfo.files.indices.first {
-                Torrent.playbackKind(forFileNamed: metainfo.files[$0].name) != .none
+                Torrent.isPlayable(fileNamed: metainfo.files[$0].name)
             } ?? 0
             let mediaName = metainfo.files[index].name
             print("Streaming file \(index): \(mediaName) (\(metainfo.files[index].length) bytes)")
@@ -414,7 +386,7 @@ struct TorrentCLI {
             let metainfo = try Metainfo(data: data)
             let dirURL = URL(fileURLWithPath: dir)
             let index = fileIndex ?? metainfo.files.indices.first {
-                Torrent.playbackKind(forFileNamed: metainfo.files[$0].name) != .none
+                Torrent.isPlayable(fileNamed: metainfo.files[$0].name)
             } ?? 0
 
             let partial = Torrent(directory: dirURL, metainfo: metainfo, stopAfterBytes: seedUntil)
@@ -541,8 +513,3 @@ struct TorrentCLI {
     }
 }
 
-extension Data {
-    var hexString: String {
-        map { String(format: "%02x", $0) }.joined()
-    }
-}

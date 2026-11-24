@@ -8,7 +8,6 @@ DerivedData/
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
 
-/xtool
 
 # reference clones + hermetic seeder cache (see docs/planning.md)
 /third-party/
@@ -16,7 +15,6 @@ DerivedData/
 
 # MobileVLCKit XCFramework (see docs/mkv-streaming.md) — download + repack step
 /Vendor/
-.release/
 
 # tvOS app package build output
 /TV/.build

@@ -1,7 +1,7 @@
 import Foundation
 import TorrentCore
 
-public enum MediaKind: String, Codable, Sendable, Hashable, CaseIterable {
+public enum MediaKind: String, Sendable, Hashable {
     case movie
     case series
 }
@@ -52,9 +52,6 @@ public struct MediaSearchResults: Hashable, Sendable {
 
     public var isEmpty: Bool { movies.isEmpty && series.isEmpty }
 
-    /// Cinemeta ranks movies and series in separate catalogs, so they are shown as separate
-    /// sections. The section whose top result best matches the query comes first; ties keep TV
-    /// shows first.
     public func sections(query: String) -> [MediaSearchSection] {
         let candidates = [
             MediaSearchSection(kind: .series, results: series),
@@ -145,10 +142,8 @@ public struct TorrentioStream: Identifiable, Hashable, Sendable {
     public let infoHash: String
     public let fileIdx: Int?
     public let filename: String?
-    /// The last non-metadata line of Torrentio's title, e.g. the file name or a release name.
     public let titleLine: String?
     public let quality: String?
-    /// The first content line of Torrentio's title: the torrent's own name.
     public let releaseName: String?
     public let seeders: Int?
     public let sizeBytes: Int64?
@@ -157,12 +152,6 @@ public struct TorrentioStream: Identifiable, Hashable, Sendable {
 
     public var displayName: String {
         filename ?? titleLine ?? infoHash
-    }
-
-    public var subtitle: String {
-        [quality, sizeBytes.map { byteString(Double($0)) }, provider]
-            .compactMap { $0 }
-            .joined(separator: " · ")
     }
 
     public var resolution: StreamResolution {
@@ -174,22 +163,17 @@ public struct TorrentioStream: Identifiable, Hashable, Sendable {
         return .other
     }
 
-    /// True when the torrent bundles several episodes (its name has no episode marker but the
-    /// listed file does), so adding it downloads the whole pack, not one episode.
     public var isEpisodePack: Bool {
         guard let releaseName, releaseName != displayName else { return false }
         return !Self.hasEpisodeMarker(releaseName) && Self.hasEpisodeMarker(displayName)
     }
 
-    /// The name the library shows for this torrent: the pack's release name for multi-episode
-    /// packs (adding one downloads every episode), otherwise the file name.
     public var magnetName: String {
         guard isEpisodePack, let releaseName else { return displayName }
         let trimmed = releaseName.trimmingCharacters(in: CharacterSet(charactersIn: "…").union(.whitespaces))
         return trimmed.isEmpty ? displayName : trimmed
     }
 
-    /// True for packs spanning several seasons, e.g. "S01-S09" or "Season 1-9".
     public var isMultiSeasonPack: Bool {
         guard isEpisodePack, let releaseName else { return false }
         return releaseName.firstMatch(of: /(?i)\bs\d{1,2}\s?-\s?s?\d{1,2}\b|\bseasons?\s?\d{1,2}\s?-\s?\d{1,2}\b|complete series/) != nil
@@ -309,7 +293,6 @@ public struct CinemetaClient: Sendable {
 public struct TorrentioClient: Sendable {
     public static let defaultBaseURL = URL(string: "https://torrentio.strem.fun")!
 
-    /// Used only for scrapes that came without tracker sources, so the magnet is not DHT-only.
     public static let defaultTrackers: [URL] = [
         URL(string: "udp://tracker.opentrackr.org:1337/announce")!,
         URL(string: "udp://open.stealth.si:80/announce")!,
@@ -329,7 +312,6 @@ public struct TorrentioClient: Sendable {
         self.session = session
     }
 
-    /// `id` is an IMDb id for movies (`tt…`) and an episode id for series (`tt…:S:E`).
     public func streams(kind: MediaKind, id: String) async throws -> [TorrentioStream] {
         guard let url = URL(string: "\(baseURL.absoluteString)/stream/\(kind.rawValue)/\(id).json") else {
             throw TorrentSearchError.invalidURL
@@ -390,8 +372,6 @@ public struct TorrentioClient: Sendable {
         "mkv", "mp4", "m4v", "avi", "mov", "webm", "ts", "mpg", "mpeg", "wmv", "flv", "srt", "iso",
     ]
 
-    /// Prefer a line that names a media file (multi-file torrents put it below the release name), so
-    /// a trailing audio/flag line does not become the row title; otherwise use the first content line.
     private static func preferredTitleLine(from lines: [String]) -> String? {
         lines.last(where: { line in
             let lowered = line.lowercased()
@@ -414,7 +394,6 @@ public struct TorrentioClient: Sendable {
         return Int(match.1)
     }
 
-    /// Torrentio formats sizes with 1024-based units ("263.34 MB" is 276,134,947 bytes).
     private static func sizeBytes(from title: String) -> Int64? {
         guard let match = title.firstMatch(of: /💾\s*([0-9.]+)\s*([kKMGT]?B)/),
               let value = Double(match.1) else { return nil }

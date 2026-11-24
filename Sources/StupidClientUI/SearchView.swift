@@ -9,8 +9,6 @@ struct TorrentStreamsRequest: Hashable {
 }
 
 #if DEBUG
-/// Launch arguments for screenshotting without input: `-SearchQuery <text>` prefills the query and
-/// `-SearchOpenFirst` opens the first result; `-SearchOpenEpisode` also opens a show's first episode.
 private enum SearchDebug {
     static var query: String {
         let arguments = ProcessInfo.processInfo.arguments
@@ -32,17 +30,13 @@ private let resultPosterWidth: CGFloat = 44
 private let headerPosterWidth: CGFloat = 72
 #endif
 
-/// Searches Cinemeta for movies and shows, then lists Torrentio streams to add. `detail` builds the
-/// screen pushed when an already-added stream is selected.
 public struct TorrentSearchView<Detail: View>: View {
     let store: TorrentStore
     let detail: (TorrentItem) -> Detail
 
     @State private var query = ""
     @State private var path = NavigationPath()
-    @State private var results = MediaSearchResults.empty
-    @State private var isSearching = false
-    @State private var searchError: String?
+    @State private var search = Loadable<MediaSearchResults>()
 
     private let cinemeta = CinemetaClient()
 
@@ -85,7 +79,7 @@ public struct TorrentSearchView<Detail: View>: View {
                 .searchable(text: $query, prompt: "Movies and TV shows")
                 #if !os(tvOS)
                 .toolbar {
-                    if isSearching && !results.isEmpty {
+                    if search.isLoading, search.value?.isEmpty == false {
                         ToolbarItem {
                             ProgressView()
                         }
@@ -93,15 +87,15 @@ public struct TorrentSearchView<Detail: View>: View {
                 }
                 #endif
                 .task(id: trimmedQuery) {
-                    await search()
+                    await runSearch()
                 }
                 #if DEBUG
                 .onAppear {
                     if query.isEmpty { query = SearchDebug.query }
                 }
-                .onChange(of: results) { _, results in
+                .onChange(of: search.value) { _, results in
                     if SearchDebug.opensFirst, path.isEmpty,
-                       let first = results.sections(query: trimmedQuery).first?.results.first {
+                       let first = results?.sections(query: trimmedQuery).first?.results.first {
                         path.append(first)
                     }
                 }
@@ -117,27 +111,19 @@ public struct TorrentSearchView<Detail: View>: View {
                 systemImage: "magnifyingglass",
                 description: Text("Search for a title, then pick a torrent to download.")
             )
-        } else if let searchError {
-            ContentUnavailableView {
-                Label("Search Failed", systemImage: "exclamationmark.triangle")
-            } description: {
-                Text(searchError)
-            } actions: {
-                Button("Try Again") {
-                    Task { await search(debounce: false) }
+        } else {
+            LoadableContent(state: search, failureTitle: "Search Failed", retry: { await runSearch(debounce: false) }) { results in
+                if results.isEmpty {
+                    ContentUnavailableView.search(text: trimmedQuery)
+                } else {
+                    resultsView(results)
                 }
             }
-        } else if isSearching && results.isEmpty {
-            LoadingView()
-        } else if results.isEmpty {
-            ContentUnavailableView.search(text: trimmedQuery)
-        } else {
-            resultsView
         }
     }
 
     #if os(tvOS)
-    private var resultsView: some View {
+    private func resultsView(_ results: MediaSearchResults) -> some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 48) {
                 ForEach(results.sections(query: trimmedQuery)) { section in
@@ -164,7 +150,7 @@ public struct TorrentSearchView<Detail: View>: View {
         }
     }
     #else
-    private var resultsView: some View {
+    private func resultsView(_ results: MediaSearchResults) -> some View {
         List {
             ForEach(results.sections(query: trimmedQuery)) { section in
                 Section(section.title) {
@@ -179,42 +165,17 @@ public struct TorrentSearchView<Detail: View>: View {
     }
     #endif
 
-    private func search(debounce: Bool = true) async {
+    private func runSearch(debounce: Bool = true) async {
         let query = trimmedQuery
         guard !query.isEmpty else {
-            results = .empty
-            searchError = nil
-            isSearching = false
+            search = Loadable()
             return
         }
         if debounce {
             try? await Task.sleep(for: .milliseconds(300))
             guard !Task.isCancelled else { return }
         }
-        isSearching = true
-        searchError = nil
-        do {
-            let found = try await cinemeta.search(query)
-            guard !Task.isCancelled else { return }
-            results = found
-        } catch is CancellationError {
-            return
-        } catch {
-            guard !Task.isCancelled else { return }
-            results = .empty
-            searchError = error.localizedDescription
-        }
-        isSearching = false
-    }
-}
-
-private struct LoadingView: View {
-    var body: some View {
-        ProgressView()
-            #if !os(tvOS)
-            .controlSize(.large)
-            #endif
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        await load($search) { try await cinemeta.search(query) }
     }
 }
 
@@ -279,31 +240,15 @@ private struct SeriesEpisodesView: View {
     let result: MediaSearchResult
     let store: TorrentStore
 
-    @State private var info: SeriesInfo?
+    @State private var series = Loadable<SeriesInfo>()
     @State private var seasonNumber = 1
     @State private var debugEpisode: TorrentStreamsRequest?
-    @State private var isLoading = true
-    @State private var error: String?
 
     private let cinemeta = CinemetaClient()
 
     var body: some View {
-        Group {
-            if let info {
-                episodesList(info)
-            } else if isLoading {
-                LoadingView()
-            } else {
-                ContentUnavailableView {
-                    Label("Could Not Load Episodes", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(error ?? "No episodes are available for this show.")
-                } actions: {
-                    Button("Try Again") {
-                        Task { await load() }
-                    }
-                }
-            }
+        LoadableContent(state: series, failureTitle: "Could Not Load Episodes", retry: loadSeries) { info in
+            episodesList(info)
         }
         .navigationTitle(result.name)
         #if os(iOS)
@@ -311,7 +256,7 @@ private struct SeriesEpisodesView: View {
         #endif
         #if !os(tvOS)
         .toolbar {
-            if let info, info.seasons.count > 1 {
+            if let info = series.value, info.seasons.count > 1 {
                 ToolbarItem {
                     seasonPicker(info)
                         .pickerStyle(.menu)
@@ -320,7 +265,7 @@ private struct SeriesEpisodesView: View {
         }
         #endif
         .task {
-            await load()
+            await loadSeries()
         }
         #if DEBUG
         .navigationDestination(item: $debugEpisode) { request in
@@ -377,32 +322,25 @@ private struct SeriesEpisodesView: View {
         )
     }
 
-    private func load() async {
-        guard info == nil else { return }
-        isLoading = true
-        error = nil
-        defer { isLoading = false }
-        do {
-            let fetched = try await cinemeta.series(id: result.id)
-            guard !Task.isCancelled else { return }
-            if fetched.seasons.isEmpty {
-                error = "No episodes are available for this show."
-            } else {
-                info = fetched
-                seasonNumber = fetched.seasons.first?.number ?? 1
-                #if DEBUG
-                if SearchDebug.opensEpisode, let season = fetched.seasons.first, let episode = season.episodes.first {
-                    debugEpisode = streamsRequest(show: fetched, season: season, episode: episode)
-                }
-                #endif
-            }
-        } catch is CancellationError {
-            return
-        } catch {
-            guard !Task.isCancelled else { return }
-            self.error = error.localizedDescription
+    private func loadSeries() async {
+        guard series.value == nil else { return }
+        await load($series) {
+            let info = try await cinemeta.series(id: result.id)
+            guard !info.seasons.isEmpty else { throw NoEpisodesError() }
+            return info
         }
+        guard let info = series.value else { return }
+        seasonNumber = info.seasons.first?.number ?? 1
+        #if DEBUG
+        if SearchDebug.opensEpisode, let season = info.seasons.first, let episode = season.episodes.first {
+            debugEpisode = streamsRequest(show: info, season: season, episode: episode)
+        }
+        #endif
     }
+}
+
+private struct NoEpisodesError: LocalizedError {
+    var errorDescription: String? { "No episodes are available for this show." }
 }
 
 private struct SeriesHeader: View {
@@ -432,36 +370,21 @@ private struct TorrentStreamsView: View {
     let request: TorrentStreamsRequest
     let store: TorrentStore
 
-    @State private var streams: [TorrentioStream] = []
-    @State private var isLoading = true
-    @State private var hasLoaded = false
-    @State private var error: String?
+    @State private var streams = Loadable<[TorrentioStream]>()
     @State private var addError: String?
     @State private var addedCount = 0
 
     private let torrentio = TorrentioClient()
 
-    private var groups: [(resolution: StreamResolution, streams: [TorrentioStream])] {
+    private func groups(_ streams: [TorrentioStream]) -> [(resolution: StreamResolution, streams: [TorrentioStream])] {
         Dictionary(grouping: streams, by: \.resolution)
             .sorted { $0.key < $1.key }
             .map { (resolution: $0.key, streams: $0.value) }
     }
 
     var body: some View {
-        Group {
-            if isLoading {
-                LoadingView()
-            } else if let error {
-                ContentUnavailableView {
-                    Label("Could Not Load Torrents", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(error)
-                } actions: {
-                    Button("Try Again") {
-                        Task { await load() }
-                    }
-                }
-            } else if streams.isEmpty {
+        LoadableContent(state: streams, failureTitle: "Could Not Load Torrents", retry: loadStreams) { streams in
+            if streams.isEmpty {
                 ContentUnavailableView(
                     "No Torrents Found",
                     systemImage: "tray",
@@ -475,7 +398,7 @@ private struct TorrentStreamsView: View {
                             .foregroundStyle(.secondary)
                     }
                     #endif
-                    let groups = groups
+                    let groups = groups(streams)
                     if groups.count > 1 {
                         ForEach(groups, id: \.resolution) { group in
                             Section(group.resolution.title) {
@@ -499,27 +422,19 @@ private struct TorrentStreamsView: View {
         .sensoryFeedback(.success, trigger: addedCount)
         #endif
         .task {
-            guard !hasLoaded else { return }
-            await load()
+            await loadStreams()
         }
-        .alert("Could Not Add Torrent", isPresented: Binding(
-            get: { addError != nil },
-            set: { if !$0 { addError = nil } }
-        )) {
-            Button("OK", role: .cancel) { addError = nil }
-        } message: {
-            Text(addError ?? "")
-        }
+        .errorAlert("Could Not Add Torrent", message: $addError)
     }
 
     @ViewBuilder
     private func row(_ stream: TorrentioStream) -> some View {
         Group {
-            if let item = store.items.first(where: { $0.id == stream.infoHash }) {
+            if let item = store.item(infoHash: stream.infoHash) {
                 NavigationLink(value: item) {
                     TorrentioStreamRow(stream: stream, request: request, state: .added)
                 }
-            } else if store.resolvingItems.contains(where: { $0.id == stream.infoHash }) {
+            } else if store.isResolving(infoHash: stream.infoHash) {
                 TorrentioStreamRow(stream: stream, request: request, state: .adding)
             } else {
                 Button {
@@ -552,21 +467,9 @@ private struct TorrentStreamsView: View {
         }
     }
 
-    private func load() async {
-        isLoading = true
-        error = nil
-        defer { isLoading = false }
-        do {
-            let found = try await torrentio.streams(kind: request.kind, id: request.mediaID)
-            guard !Task.isCancelled else { return }
-            streams = found
-            hasLoaded = true
-        } catch is CancellationError {
-            return
-        } catch {
-            guard !Task.isCancelled else { return }
-            self.error = error.localizedDescription
-        }
+    private func loadStreams() async {
+        guard streams.value == nil else { return }
+        await load($streams) { try await torrentio.streams(kind: request.kind, id: request.mediaID) }
     }
 }
 
@@ -645,14 +548,3 @@ private struct TorrentioStreamRow: View {
         }
     }
 }
-
-#if !os(tvOS)
-private func copyToClipboard(_ string: String) {
-    #if os(iOS)
-    UIPasteboard.general.string = string
-    #else
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(string, forType: .string)
-    #endif
-}
-#endif

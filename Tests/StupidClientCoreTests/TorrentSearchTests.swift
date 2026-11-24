@@ -46,7 +46,6 @@ struct TorrentSearchTests {
         #expect(first.sizeBytes == 12_036_645_847)
         #expect(first.provider == "Rutracker")
         #expect(first.trackers.count == 2)
-        #expect(first.subtitle == "4k DV | HDR10+ · 12.0 GB · Rutracker")
         #expect(first.releaseName == "Severance.S01.2160p.WEB-DL")
         #expect(first.resolution == .uhd)
         #expect(first.isEpisodePack)

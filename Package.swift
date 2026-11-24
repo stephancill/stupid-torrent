@@ -10,19 +10,14 @@ let package = Package(
         .macOS(.v14),
     ],
     products: [
-        // An xtool project should contain exactly one library product,
-        // representing the main app.
         .library(
             name: "stupid_torrent_client",
             targets: ["stupid_torrent_client"]
         ),
-        // Headless macOS dev/test harness. xtool ignores executable products.
-        // Shared engine + store for the tvOS app in TV/ (its own stupid-app project).
         .library(
             name: "StupidClientCore",
             targets: ["StupidClientCore"]
         ),
-        // SwiftUI screens shared by the iOS and tvOS apps (search, delete confirmation).
         .library(
             name: "StupidClientUI",
             targets: ["StupidClientUI"]
@@ -50,7 +45,7 @@ let package = Package(
         ),
         .target(
             name: "StupidClientUI",
-            dependencies: ["StupidClientCore"]
+            dependencies: ["StupidClientCore", "TorrentCore", "Streaming"]
         ),
         .target(
             name: "stupid_torrent_client",
@@ -81,8 +76,8 @@ let package = Package(
             dependencies: ["Streaming", "TorrentCore", "TorrentTestingSupport"]
         ),
         .testTarget(
-            name: "StupidTorrentClientAppTests",
-            dependencies: ["StupidClientCore", "TorrentCore", "Bencode", "TorrentTestingSupport"]
+            name: "StupidClientCoreTests",
+            dependencies: ["StupidClientCore", "TorrentCore", "TorrentTestingSupport"]
         ),
     ]
 )
