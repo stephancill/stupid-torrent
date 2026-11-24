@@ -304,9 +304,18 @@ struct AddTorrentView: View {
         NavigationStack {
             Form {
                 Section("Magnet link") {
-                    TextField("magnet:?xt=urn:btih:…", text: $magnet)
-                        .lineLimit(1)
-                        .autocorrectionDisabled()
+                    HStack {
+                        TextField("magnet:?xt=urn:btih:…", text: $magnet)
+                            .lineLimit(1)
+                            .autocorrectionDisabled()
+                        PasteButton(payloadType: String.self) { strings in
+                            if let pasted = strings.first {
+                                magnet = pasted.trimmingCharacters(in: .whitespacesAndNewlines)
+                            }
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonBorderShape(.capsule)
+                    }
                     Button {
                         add(.magnet(magnet))
                     } label: {
@@ -326,11 +335,6 @@ struct AddTorrentView: View {
                     Button("Cancel", role: .cancel) {
                         dismiss()
                     }
-                }
-            }
-            .onAppear {
-                if magnet.isEmpty, let clipboard = clipboardString(), (try? MagnetLinkParser.parse(clipboard)) != nil {
-                    magnet = String(clipboard.drop(while: \.isWhitespace))
                 }
             }
             .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.data]) { result in
@@ -666,13 +670,6 @@ struct VideoPlayerView: View {
 }
 #endif
 
-func clipboardString() -> String? {
-    #if os(iOS)
-    return UIPasteboard.general.string
-    #else
-    return NSPasteboard.general.string(forType: .string)
-    #endif
-}
 
 struct PieProgressView: View {
     let progress: Double

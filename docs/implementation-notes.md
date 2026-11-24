@@ -1136,3 +1136,12 @@ Most of these edits were already swept into `f91f47a`; this entry documents them
   the unconfirmed swipe and the action-sheet `confirmationDialog`. "Completed" uses the native
   `Section(isExpanded:)` with `.listStyle(.sidebar)`. The Add sheet is titled "Add Torrent" and has a
   Cancel button. `PieProgressView` fills with the tint instead of hard-coded blue.
+
+## 2026-11-24 — Paste button and pack names
+
+- The Add sheet no longer reads the clipboard when it appears. That read triggered the system
+  "would like to paste" prompt every time the sheet opened. A native `PasteButton` next to the
+  magnet field fills it instead, and it never prompts. The `clipboardString()` helper is removed.
+- `TorrentioStream.magnetName` is the magnet `dn`. Multi-episode packs use the release name (with a
+  trailing "…" stripped). Other streams keep the file name. Because `dn` becomes
+  `Metainfo.displayName`, a pack used to appear in the library under a single episode's file name.

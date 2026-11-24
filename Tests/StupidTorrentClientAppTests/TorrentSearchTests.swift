@@ -68,14 +68,14 @@ struct TorrentSearchTests {
         let magnet = try #require(streams.first).magnetLink()
 
         #expect(magnet.hasPrefix("magnet:?xt=urn:btih:2a6b66671753c2454dd34115b72b0899514f0ca6&"))
-        #expect(magnet.contains("dn=Severance.S01E01.mkv"))
+        #expect(magnet.contains("dn=Severance.S01.2160p.WEB-DL"))
         #expect(magnet.contains("tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"))
         #expect(magnet.contains("tr=http%3A%2F%2Fbt.example.org%2Fann%3Fpasskey%3Dabc"))
         #expect(!magnet.contains("opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.stealth.si"))
 
         let parsed = try MagnetLinkParser.parse(magnet)
         #expect(parsed.infoHash.hexString == "2a6b66671753c2454dd34115b72b0899514f0ca6")
-        #expect(parsed.displayName == "Severance.S01E01.mkv")
+        #expect(parsed.displayName == "Severance.S01.2160p.WEB-DL")
         #expect(parsed.trackers.count == 2)
     }
 

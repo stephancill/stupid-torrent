@@ -180,6 +180,14 @@ public struct TorrentioStream: Identifiable, Hashable, Sendable {
         return !Self.hasEpisodeMarker(releaseName) && Self.hasEpisodeMarker(displayName)
     }
 
+    /// The name the library shows for this torrent: the pack's release name for multi-episode
+    /// packs (adding one downloads every episode), otherwise the file name.
+    public var magnetName: String {
+        guard isEpisodePack, let releaseName else { return displayName }
+        let trimmed = releaseName.trimmingCharacters(in: CharacterSet(charactersIn: "…").union(.whitespaces))
+        return trimmed.isEmpty ? displayName : trimmed
+    }
+
     /// True for packs spanning several seasons, e.g. "S01-S09" or "Season 1-9".
     public var isMultiSeasonPack: Bool {
         guard isEpisodePack, let releaseName else { return false }
@@ -195,7 +203,7 @@ public struct TorrentioStream: Identifiable, Hashable, Sendable {
     /// depend on DHT alone.
     public func magnetLink() -> String {
         var parts = ["xt=urn:btih:\(infoHash)"]
-        parts.append("dn=\(Self.percentEncode(displayName))")
+        parts.append("dn=\(Self.percentEncode(magnetName))")
         let usableTrackers = trackers.isEmpty ? TorrentioClient.defaultTrackers : trackers
         var seen = Set<String>()
         for tracker in usableTrackers {
