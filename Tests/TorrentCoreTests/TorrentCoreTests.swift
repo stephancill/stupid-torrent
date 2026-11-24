@@ -15,7 +15,7 @@ extension Data {
 
 @Suite struct MetadataExchangeTests {
     @Test func extendedHandshakeAdvertisesUtMetadata() {
-        let message = ExtendedHandshake.message(client: "stupid-torrent-client/0.1", port: 6881)
+        let message = ExtendedHandshake.message(client: "stupid-torrent-client/0.1")
         guard case .extended(let extID, let payload) = message else {
             Issue.record("expected extended message")
             return
@@ -100,7 +100,7 @@ extension Data {
     @Test func handshakeStructure() throws {
         let hash = Data(repeating: 0xAB, count: 20)
         let id = Data(repeating: 0xCD, count: 20)
-        let hs = Handshake.make(extensionEnabled: true, infoHash: hash, peerID: id)
+        let hs = Handshake.make(infoHash: hash, peerID: id)
         let encoded = hs.encode()
         #expect(encoded.count == 68)
         #expect(encoded[0] == 19)
@@ -145,21 +145,21 @@ extension Data {
 }
 
 @Suite struct StorageTests {
-    @Test func loadVerifiedCountReadsSidecar() throws {
+    @Test func loadVerifiedReadsSidecar() throws {
         let metainfo = try Metainfo(data: try Fixtures.bigBuckBunnyTorrentData)
         let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
         // No sidecar yet -> 0.
-        #expect(Storage.loadVerifiedCount(directory: dir, infoHash: metainfo.infoHash, pieceCount: metainfo.pieceCount) == 0)
+        #expect(Storage.loadVerified(directory: dir, metainfo: metainfo).setCount == 0)
 
         // Full sidecar -> complete.
         var full = Data()
         full.appendUInt32BE(UInt32(metainfo.pieceCount))
         full.append(Bitfield(bits: [Bool](repeating: true, count: metainfo.pieceCount)).data())
         try full.write(to: dir.appendingPathComponent(".\(metainfo.infoHash.hexString).verified"))
-        #expect(Storage.loadVerifiedCount(directory: dir, infoHash: metainfo.infoHash, pieceCount: metainfo.pieceCount) == metainfo.pieceCount)
+        #expect(Storage.loadVerified(directory: dir, metainfo: metainfo).setCount == metainfo.pieceCount)
 
         // Half sidecar -> half.
         var half = Data()
@@ -167,13 +167,13 @@ extension Data {
         half.appendUInt32BE(UInt32(metainfo.pieceCount))
         half.append(Bitfield(bits: (0..<metainfo.pieceCount).map { $0 < halfCount }).data())
         try half.write(to: dir.appendingPathComponent(".\(metainfo.infoHash.hexString).verified"))
-        #expect(Storage.loadVerifiedCount(directory: dir, infoHash: metainfo.infoHash, pieceCount: metainfo.pieceCount) == halfCount)
+        #expect(Storage.loadVerified(directory: dir, metainfo: metainfo).setCount == halfCount)
     }
 }
 
 @Suite struct PiecePickerTests {
     @Test func walksPiecesInOrder() {
-        var picker = PiecePicker(pieceCount: 5, verified: [false, false, false, false, false])
+        var picker = PiecePicker(verified: Bitfield(bits: [false, false, false, false, false]))
         #expect(picker.nextPiece() == 0)
         #expect(picker.nextPiece() == 1)
         picker.markVerified(1)
@@ -181,7 +181,7 @@ extension Data {
     }
 
     @Test func higherPriorityLevelJumpsAheadOfLowerIndexPieces() {
-        var picker = PiecePicker(pieceCount: 13, verified: [false, false, false, false, false, false, false, false, false, false, false, false, false])
+        var picker = PiecePicker(verified: Bitfield(bits: [false, false, false, false, false, false, false, false, false, false, false, false, false]))
         picker.setPriority(12, level: 10) // moov tail piece
         picker.setPriority(0, level: 0)   // current window
         picker.setPriority(1, level: 0)
@@ -195,7 +195,7 @@ extension Data {
     }
 
     @Test func verifiedPieceLeavesPriority() {
-        var picker = PiecePicker(pieceCount: 3, verified: [false, false, false])
+        var picker = PiecePicker(verified: Bitfield(bits: [false, false, false]))
         picker.setPriority(2, level: 10)
         picker.markRequested(2)
         picker.markVerified(2)
@@ -204,7 +204,7 @@ extension Data {
     }
 
     @Test func lowerLevelUsedWhenHigherLevelExhausted() {
-        var picker = PiecePicker(pieceCount: 5, verified: [false, false, false, false, false])
+        var picker = PiecePicker(verified: Bitfield(bits: [false, false, false, false, false]))
         picker.setPriority(0, level: 10)
         picker.setPriority(3, level: 5)
         picker.markRequested(0)
@@ -212,7 +212,7 @@ extension Data {
     }
 
     @Test func setPriorityKeepsHighestLevel() {
-        var picker = PiecePicker(pieceCount: 5, verified: [false, false, false, false, false])
+        var picker = PiecePicker(verified: Bitfield(bits: [false, false, false, false, false]))
         picker.setPriority(2, level: 0)
         picker.setPriority(2, level: 10) // seek/jump re-prioritizes
         #expect(picker.priority[2] == 10)
@@ -222,14 +222,14 @@ extension Data {
     }
 
     @Test func setPrioritySkipsVerifiedPieces() {
-        var picker = PiecePicker(pieceCount: 5, verified: [false, true, false, false, false])
+        var picker = PiecePicker(verified: Bitfield(bits: [false, true, false, false, false]))
         picker.setPriority(1, level: 10)
         #expect(picker.priority[1] == nil)
         #expect(picker.nextPiece() == 0)
     }
 
     @Test func replacingPrioritiesDropsEarlierSeekWindow() {
-        var picker = PiecePicker(pieceCount: 10, verified: Array(repeating: false, count: 10))
+        var picker = PiecePicker(verified: Bitfield(bits: Array(repeating: false, count: 10)))
         picker.setPriority(2, level: 0)
         picker.setPriority(3, level: 10)
 
@@ -808,21 +808,6 @@ private actor StartupGateProbe {
         return metainfo
     }
 
-    private func syntheticTorrent(pieceLength: Int = 16, pieceCount: Int = 4) throws -> (Metainfo, Data) {
-        let pieces = (0..<pieceCount).map { i in
-            Data((0..<pieceLength).map { UInt8((i * pieceLength + $0) % 251) })
-        }
-        let fileData = pieces.reduce(Data(), +)
-        let info: [String: BValue] = [
-            "name": .string(Data("synth.mkv".utf8)),
-            "piece length": .int(pieceLength),
-            "length": .int(fileData.count),
-            "pieces": .string(pieces.reduce(Data()) { $0 + Data(Insecure.SHA1.hash(data: $1)) }),
-        ]
-        let metainfo = try Metainfo(infoDict: Bencode.encode(.dictionary(info)), trackers: [])
-        return (metainfo, fileData)
-    }
-
     private func writeAllVerifiedSidecar(_ metainfo: Metainfo, in dir: URL) throws {
         var full = Data()
         full.appendUInt32BE(UInt32(metainfo.pieceCount))
@@ -891,11 +876,7 @@ private actor StartupGateProbe {
         let result = await torrent.streamingRead(fileIndex: 0, offset: 0, length: 1)
         #expect(result == nil)
         #expect(await torrent.verifiedCount == 0)
-        #expect(Storage.loadVerifiedCount(
-            directory: dir,
-            infoHash: metainfo.infoHash,
-            pieceCount: metainfo.pieceCount
-        ) == 0)
+        #expect(Storage.loadVerified(directory: dir, metainfo: metainfo).setCount == 0)
         #expect(await waitUntilRunning(torrent))
         await torrent.stop()
     }

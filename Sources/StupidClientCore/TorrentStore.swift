@@ -231,16 +231,7 @@ public final class TorrentStore {
         if let injectedPeer {
             await torrent.addPeer(host: injectedPeer.host, port: injectedPeer.port)
         }
-        let item = TorrentItem(
-            torrent: torrent,
-            initialVerifiedCount: Storage.loadVerifiedCount(
-                directory: directory,
-                infoHash: metainfo.infoHash,
-                pieceCount: metainfo.pieceCount
-            ),
-            isPaused: record.isPaused,
-            addedAt: record.addedAt
-        )
+        let item = TorrentItem(torrent: torrent, isPaused: record.isPaused, addedAt: record.addedAt)
         items.append(item)
         item.start()
         await trackBackgroundDownload(

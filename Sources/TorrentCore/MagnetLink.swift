@@ -9,13 +9,11 @@ public struct MagnetLink: Sendable, Equatable {
     public let infoHash: Data
     public let displayName: String?
     public let trackers: [URL]
-    public let exactSources: [URL]
 
-    public init(infoHash: Data, displayName: String? = nil, trackers: [URL] = [], exactSources: [URL] = []) {
+    public init(infoHash: Data, displayName: String? = nil, trackers: [URL] = []) {
         self.infoHash = infoHash
         self.displayName = displayName
         self.trackers = trackers
-        self.exactSources = exactSources
     }
 }
 
@@ -50,7 +48,6 @@ public enum MagnetLinkParser {
         var infoHash: Data?
         var displayName: String?
         var trackers: [URL] = []
-        var exactSources: [URL] = []
 
         for item in components.percentEncodedQueryItems ?? [] {
             let value = decoded(item.value)
@@ -69,17 +66,13 @@ public enum MagnetLinkParser {
                 if let value, let url = URL(string: value) {
                     trackers.append(url)
                 }
-            case "xs":
-                if let value, let url = URL(string: value) {
-                    exactSources.append(url)
-                }
             default:
                 break
             }
         }
 
         guard let infoHash else { throw MagnetError.missingInfoHash }
-        return MagnetLink(infoHash: infoHash, displayName: displayName, trackers: trackers, exactSources: exactSources)
+        return MagnetLink(infoHash: infoHash, displayName: displayName, trackers: trackers)
     }
 
     private static func decoded(_ raw: String?) -> String? {

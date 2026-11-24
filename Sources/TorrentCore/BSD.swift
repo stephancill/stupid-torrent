@@ -310,13 +310,17 @@ public final class TCPListener: Sendable {
     }
 
     public func accept() throws -> Int32 {
+        try acceptPeer().fd
+    }
+
+    public func acceptPeer() throws -> (fd: Int32, address: PeerAddress) {
         try descriptor.use { fd in
             while true {
                 _ = try descriptor.wait(fd: fd, events: POLLIN, timeout: nil)
-                let (client, _) = BSD.withMutableSockaddr { Darwin.accept(fd, $0, $1) }
+                let (client, remote) = BSD.withMutableSockaddr { Darwin.accept(fd, $0, $1) }
                 if client >= 0 {
                     _ = fcntl(client, F_SETFL, 0)
-                    return client
+                    return (client, PeerAddress(socketAddress: remote))
                 }
                 guard errno == EAGAIN || errno == EINTR || errno == ECONNABORTED else { throw SocketError.accept(errno) }
             }

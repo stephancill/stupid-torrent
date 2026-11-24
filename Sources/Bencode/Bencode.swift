@@ -9,7 +9,6 @@ public enum BencodeError: Error, Equatable, Sendable {
     case depthExceeded
     case notDictionary
     case keyNotFound(String)
-    case notAString
 }
 
 public enum BValue: Sendable, Equatable {
@@ -38,11 +37,6 @@ public enum BValue: Sendable, Equatable {
         return nil
     }
 
-    public var dictionaryValue: [String: BValue]? {
-        if case .dictionary(let value) = self { return value }
-        return nil
-    }
-
     public subscript(key: String) -> BValue? {
         guard case .dictionary(let dict) = self else { return nil }
         return dict[key]
@@ -55,9 +49,6 @@ public enum Bencode {
         return try parser.parse()
     }
 
-    /// Decodes a single value from the start of `data`, returning the value and the number of
-    /// bytes consumed. Does not require the whole input to be consumed (useful for framing
-    /// protocols like ut_metadata where a dict is followed by a raw byte chunk).
     public static func decodeFirst(_ data: Data) throws -> (value: BValue, consumed: Int) {
         var parser = Parser(bytes: [UInt8](data))
         let value = try parser.parseValue(depth: 0)
@@ -93,80 +84,21 @@ public enum Bencode {
         }
     }
 
-    /// Returns the raw bytes of the value for `key` inside a top-level dictionary,
-    /// preserving the exact byte sequence (needed to compute an info-hash).
     public static func rawValue(forKey key: String, in data: Data) throws -> Data {
-        let bytes = [UInt8](data)
-        var index = 0
-        guard index < bytes.count, bytes[index] == UInt8(ascii: "d") else {
+        var parser = Parser(bytes: [UInt8](data))
+        guard parser.index < parser.bytes.count, parser.bytes[parser.index] == UInt8(ascii: "d") else {
             throw BencodeError.notDictionary
         }
-        index += 1
-        let keyData = Data(key.utf8)
-        while index < bytes.count {
-            let keyBytes = try readLengthPrefixed(bytes: bytes, index: &index)
-            let valueStart = index
-            try skipValue(bytes: bytes, index: &index)
-            if keyBytes == keyData {
-                return Data(bytes[valueStart..<index])
+        parser.index += 1
+        while parser.index < parser.bytes.count, parser.bytes[parser.index] != UInt8(ascii: "e") {
+            let keyData = try parser.parseString()
+            let valueStart = parser.index
+            _ = try parser.parseValue(depth: 1)
+            if keyData == Data(key.utf8) {
+                return Data(parser.bytes[valueStart..<parser.index])
             }
         }
         throw BencodeError.keyNotFound(key)
-    }
-}
-
-private func readLengthPrefixed(bytes: [UInt8], index: inout Int) throws -> Data {
-    var lengthBytes: [UInt8] = []
-    while index < bytes.count, bytes[index] != UInt8(ascii: ":") {
-        lengthBytes.append(bytes[index])
-        index += 1
-    }
-    guard index < bytes.count else { throw BencodeError.truncated }
-    index += 1
-    let token = String(decoding: lengthBytes, as: UTF8.self)
-    guard isValidNumberToken(token), let length = Int(token) else {
-        throw BencodeError.invalidLength(token)
-    }
-    guard index + length <= bytes.count else { throw BencodeError.truncated }
-    let result = Data(bytes[index..<index + length])
-    index += length
-    return result
-}
-
-private func skipValue(bytes: [UInt8], index: inout Int) throws {
-    guard index < bytes.count else { throw BencodeError.truncated }
-    let byte = bytes[index]
-    switch byte {
-    case UInt8(ascii: "i"):
-        index += 1
-        while index < bytes.count, bytes[index] != UInt8(ascii: "e") { index += 1 }
-        guard index < bytes.count else { throw BencodeError.truncated }
-        index += 1
-    case UInt8(ascii: "l"):
-        index += 1
-        while index < bytes.count {
-            if bytes[index] == UInt8(ascii: "e") {
-                index += 1
-                return
-            }
-            try skipValue(bytes: bytes, index: &index)
-        }
-        throw BencodeError.truncated
-    case UInt8(ascii: "d"):
-        index += 1
-        while index < bytes.count {
-            if bytes[index] == UInt8(ascii: "e") {
-                index += 1
-                return
-            }
-            _ = try readLengthPrefixed(bytes: bytes, index: &index)
-            try skipValue(bytes: bytes, index: &index)
-        }
-        throw BencodeError.truncated
-    case UInt8(ascii: "0")...UInt8(ascii: "9"):
-        _ = try readLengthPrefixed(bytes: bytes, index: &index)
-    default:
-        throw BencodeError.invalidToken(byte)
     }
 }
 

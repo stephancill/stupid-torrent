@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 public enum PieceVerifier {
     public struct Result: Sendable {
@@ -15,17 +14,10 @@ public enum PieceVerifier {
         var bad: [Int] = []
         var missing: [Int] = []
         for piece in 0..<metainfo.pieceCount {
-            let start = piece * metainfo.pieceLength
-            let length = min(metainfo.pieceLength, metainfo.totalLength - start)
-            guard let data = try? await storage.read(piece: piece, offset: 0, length: length),
-                  data.count == length else {
-                missing.append(piece)
-                continue
-            }
-            if Data(Insecure.SHA1.hash(data: data)) == metainfo.pieceHashes[piece] {
-                ok.append(piece)
-            } else {
-                bad.append(piece)
+            switch try? await storage.verify(piece: piece) {
+            case true?: ok.append(piece)
+            case false?: bad.append(piece)
+            case nil: missing.append(piece)
             }
         }
         await storage.close()

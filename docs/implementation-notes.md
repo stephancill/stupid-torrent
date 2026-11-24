@@ -4,6 +4,83 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-11-24 — Refactor: engine orchestration
+
+Audit-driven cleanup of `Torrent` and the peer/metadata paths, with five bug fixes.
+
+- **Fix: banning bad peers did nothing.** `outstanding` and `blockSenders` were the same
+  map, cleared before verification, and bans stored per-connection UUIDs, so a banned
+  address simply reconnected. `BlockScheduler` now records each active piece's contributors
+  by `PeerAddress` when a new block is accepted; a failed hash strikes those addresses and
+  `PeerPool` bans an address on its second strike (dials, reconnects and inbound accepts
+  all check it). Per-block requesters are a `Set<UUID>`, so redundancy counts no longer
+  drift when several peers request the same block.
+- **Fix: we never seeded.** A session now sends our bitfield after the handshake, `have` to
+  every connected peer when a piece verifies, unchokes interested peers (up to 8, refilled
+  when an unchoked peer leaves) and serves requests for verified pieces (blocks up to
+  128 KiB). Completed torrents still go fully idle (2026-08-08 decision), so seeding
+  happens while a torrent is downloading. The `.seeding` state name for an idle complete
+  torrent is unchanged because the tvOS views switch over it.
+- **Fix: `addPeer` before `run()` dialed immediately**, bypassing the startup gate,
+  `storage.prepare()` and the resume-state load. Peers are only queued until the network
+  starts; this removes `ensureUTPTransport`, the retired µTP transports and the nil branch
+  in µTP connect.
+- **Fix: teardown.** `run()`, `pause()` and `stop()` share `teardownNetwork(announcing:)`,
+  which closes the listener and µTP transport and announces only when the network had
+  started (`stop()` used to announce `.stopped` unconditionally; the end of `run()` leaked
+  the listener). The accept loop runs on `BlockingIO.spawn`. `stop()` no longer writes an
+  empty sidecar over a torrent that never loaded its resume state.
+- **Fix: tracker `left` once complete** went negative with a short last piece; it now uses
+  `Metainfo.verifiedByteCount(pieceCount:)`, as does the `stopAfterBytes` check. Also fixed
+  the `?? 0 + 1` precedence bug in the verify-failure log.
+- `BlockScheduler` (struct, no awaits) owns the picker, `[Int: ActivePiece]` (received
+  offsets, byte coverage, cursor, last progress, contributors), requesters, per-peer
+  in-flight sets, stall requeue and redundancy caps. The cursor skips received offsets, so
+  rewinding it after a disconnect no longer re-requests blocks we have. Stalls clear
+  requesters but keep the stalled peer's in-flight set, so it is not asked again for the
+  same block. `PeerPool` (struct) owns the dial queue, backoff, strikes and bans.
+- `PeerSession` is a `Sendable` struct that only does I/O: it registers with the torrent,
+  drains an `AsyncStream` outbox (so bitfield, `have` and requests keep their order) and
+  forwards each decoded message to `Torrent.handle(_:from:)`. Peer state (choke/interest,
+  bitfield, last message time) lives in the actor as `PeerLink`, which removes the
+  `@unchecked Sendable` data race. Requests are scheduled synchronously in the actor
+  instead of one actor hop per block. Unknown message ids are ignored rather than dropping
+  the peer; frames over 4 MiB are rejected. The 30 s idle timeout is checked by the 1 s
+  ticker against `lastReceived` instead of a task group per read.
+- `PeerConnector` is the single connect ladder for downloads and magnet metadata: race
+  µTP and encrypted TCP, keep the first completed BitTorrent handshake and close the
+  other, and retry plaintext TCP only when TCP connected but the encrypted handshake
+  failed. Handshakes are bounded by `withTimeout` (TCP handshakes had no limit before),
+  and the duplicate connect-timeout race is gone. `MetadataFetcher` is a struct that runs
+  the BEP 9/10 exchange over a `PeerConnection`; the bootstrap sweep is 48 workers pulling
+  from a peer accumulator that suspends instead of polling.
+- `run()` parks on a wake signal (pause, resume, stop, cancellation, a finished download,
+  a streaming invalidation) instead of 250/500 ms sleeps, and loops again if a piece is
+  invalidated during teardown; `ensureStreamingRepair`'s 600×250 ms spin is gone.
+- `Storage` no longer keeps a verified bitfield: `loadVerified(directory:metainfo:)` and
+  `saveVerified(_:)` with one static `sidecarURL`. `Torrent.initialStatus` (nonisolated)
+  replaces the separate sidecar reads in `TorrentStore` and the duplicated status in
+  `TorrentItem` (which used `displayName` while the engine used `name`; both use
+  `displayName` now). `verify(piece:)` throws on a short read, and `PieceVerifier` uses it.
+- `Metainfo.totalLength`/`fileOffsets` are stored and `length(ofPiece:)` is the one piece
+  length helper. `Bitfield` caches its set count. Only ENOSPC maps to
+  `StorageError.diskFull`. `Bencode.rawValue(forKey:)` uses the validating parser.
+- Removed unused knobs and API: `Torrent.init` `peerID`/`maxActivePeers`,
+  `Handshake.make` flags and `supportsDHT`, `PiecePicker` `pieceCount`/`requested`
+  parameters, `MetadataFetcher.clientPort`, `MagnetBootstrapper.metainfo(from:)`,
+  `MagnetLink.exactSources`, `BValue.dictionaryValue`, `BencodeError.notAString`. Private
+  torrents skip the DHT.
+- The magnet bootstrap no longer announces itself to the DHT (nothing listens). Tracker
+  announces still send port 6881: a live tracker rejected port 0 with "Port can't be 0".
+- `TorrentLog` writes through `NSLog` only; the extra stderr write printed every CLI line
+  twice.
+
+Tests: `BlockSchedulerTests` (redundancy cap and urgent cap, failure attribution, failure
+limit, stall requeue, urgent stall, disconnect release, completion), `PeerPoolTests`
+(ban, capacity and backoff), a hermetic `SeedingTests` case where one engine with two
+verified pieces serves them to a second engine over loopback, and a Bencode case for
+validation inside `rawValue`.
+
 ### 2026-11-24 — Refactor: streaming
 
 HLS is now the only Matroska pipeline, and the dead resource-loader transmux paths are gone.

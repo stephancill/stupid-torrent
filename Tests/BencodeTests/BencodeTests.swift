@@ -64,4 +64,10 @@ import Bencode
         let raw = try Bencode.rawValue(forKey: "info", in: data)
         #expect(String(decoding: raw, as: UTF8.self) == "d3:keyi1e4:name6:foobar6:lengthi123ee")
     }
+
+    @Test func rawValueValidatesValuesItSkips() {
+        #expect(throws: BencodeError.self) { try Bencode.rawValue(forKey: "info", in: Data("d1:ai01e4:infoi1ee".utf8)) }
+        #expect(throws: BencodeError.self) { try Bencode.rawValue(forKey: "info", in: Data("d4:infoi1e".utf8).dropLast()) }
+        #expect(throws: BencodeError.keyNotFound("info")) { try Bencode.rawValue(forKey: "info", in: Data("d1:ai1ee".utf8)) }
+    }
 }

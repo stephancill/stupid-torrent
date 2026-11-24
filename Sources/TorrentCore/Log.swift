@@ -44,10 +44,6 @@ public enum TorrentLog {
             fileBytes += line.count
         }
         lock.unlock()
-        FileHandle.standardError.write(Data((text + "\n").utf8))
-        // Unified logging (Foundation-only, preserves TorrentCore's dependency light
-        // footprint): captured on device/simulator and retrievable via log show/Console,
-        // unlike raw stderr which is lost when a process is killed.
         NSLog("torrent: %@", text)
     }
 }

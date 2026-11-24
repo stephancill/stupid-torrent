@@ -69,6 +69,7 @@ public enum PeerMessage: Equatable, Sendable {
     }
 
     public static let blockSize = 16 * 1024
+    public static let maxFrameLength = 4 * 1024 * 1024
 
     public func encode() -> Data {
         var payload = Data()
@@ -153,20 +154,15 @@ public struct Handshake: Equatable, Sendable {
         reserved.count == 8 && (reserved[5] & 0x10) != 0
     }
 
-    public var supportsDHT: Bool {
-        reserved.count == 8 && (reserved[7] & 0x01) != 0
-    }
-
     public init(reserved: Data, infoHash: Data, peerID: Data) {
         self.reserved = reserved
         self.infoHash = infoHash
         self.peerID = peerID
     }
 
-    public static func make(extensionEnabled: Bool = true, dhtEnabled: Bool = false, infoHash: Data, peerID: Data) -> Handshake {
+    public static func make(infoHash: Data, peerID: Data) -> Handshake {
         var reserved = Data(repeating: 0, count: 8)
-        if extensionEnabled { reserved[5] |= 0x10 }
-        if dhtEnabled { reserved[7] |= 0x01 }
+        reserved[5] |= 0x10
         return Handshake(reserved: reserved, infoHash: infoHash, peerID: peerID)
     }
 

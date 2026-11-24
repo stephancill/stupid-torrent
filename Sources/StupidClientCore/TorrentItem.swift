@@ -19,7 +19,7 @@ public final class TorrentItem: Identifiable, Hashable {
     private var playbackAvailability: [Int: Bool] = [:]
     private var playbackAvailabilityTasks: [Int: Task<Void, Never>] = [:]
 
-    init(torrent: Torrent, initialVerifiedCount: Int, isPaused: Bool, addedAt: Date) {
+    init(torrent: Torrent, isPaused: Bool, addedAt: Date) {
         let metainfo = torrent.metainfo
         self.torrent = torrent
         id = metainfo.infoHash.hexString
@@ -27,19 +27,7 @@ public final class TorrentItem: Identifiable, Hashable {
         fileIndicesBySize = metainfo.files.indices.sorted {
             metainfo.files[$0].length > metainfo.files[$1].length
         }
-        let status = TorrentStatus(
-            name: metainfo.displayName,
-            infoHash: metainfo.infoHash,
-            state: initialVerifiedCount == metainfo.pieceCount ? .seeding : .downloading,
-            verifiedCount: initialVerifiedCount,
-            pieceCount: metainfo.pieceCount,
-            peers: 0,
-            seeds: 0,
-            downloadRate: 0,
-            uploadRate: 0,
-            downloadedBytes: 0,
-            uploadedBytes: 0
-        )
+        let status = torrent.initialStatus
         self.status = status
         self.isPaused = isPaused
         isComplete = status.isComplete

@@ -26,26 +26,18 @@ public struct Metainfo: Sendable, Equatable {
     public let files: [TorrentFile]
     public let trackerTiers: [[URL]]
     public let isPrivate: Bool
+    public let totalLength: Int
+    public let fileOffsets: [Int]
 
     public var pieceCount: Int { pieceHashes.count }
 
-    public var totalLength: Int {
-        files.reduce(0) { $0 + $1.length }
+    public func length(ofPiece piece: Int) -> Int {
+        min(pieceLength, totalLength - piece * pieceLength)
     }
 
     public func verifiedByteCount(pieceCount: Int) -> Int64 {
         let verifiedPieces = min(max(pieceCount, 0), self.pieceCount)
         return min(Int64(totalLength), Int64(verifiedPieces) * Int64(pieceLength))
-    }
-
-    public var fileOffsets: [Int] {
-        var offsets: [Int] = []
-        var offset = 0
-        for file in files {
-            offsets.append(offset)
-            offset += file.length
-        }
-        return offsets
     }
 
     public var flattenedTrackers: [URL] {
@@ -96,11 +88,8 @@ public struct Metainfo: Sendable, Equatable {
     public func location(piece: Int, pieceOffset: Int) -> (fileIndex: Int, fileOffset: Int)? {
         let absolute = piece * pieceLength + pieceOffset
         guard absolute >= 0, absolute < totalLength else { return nil }
-        let offsets = fileOffsets
-        for index in offsets.indices {
-            if absolute < offsets[index] + files[index].length {
-                return (index, absolute - offsets[index])
-            }
+        for index in fileOffsets.indices where absolute < fileOffsets[index] + files[index].length {
+            return (index, absolute - fileOffsets[index])
         }
         return nil
     }
@@ -197,6 +186,14 @@ extension Metainfo {
         }
         guard !files.isEmpty else { throw MetainfoError.invalidValue("files") }
         self.files = files
+        var offsets: [Int] = []
+        var offset = 0
+        for file in files {
+            offsets.append(offset)
+            offset += file.length
+        }
+        self.fileOffsets = offsets
+        self.totalLength = offset
 
         self.trackerTiers = trackers
     }
