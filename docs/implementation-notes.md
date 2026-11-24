@@ -4,6 +4,38 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-11-24 — Gapless MKV audio across HLS segments (phase 5)
+
+A real 7.1 E-AC-3 stream (FFmpeg's `7_pt_1.eac3` sample, one 256-sample independent frame plus
+one dependent frame per block) muxed into an MKV with ffmpeg played on an iPhone, but audio
+chopped every segment. Three causes, all fixed:
+
+- **Audio dropped at every boundary.** ffmpeg (and other muxers) write audio slightly behind
+  video, so the cluster that starts with a keyframe also holds the audio for the ~30–70 ms
+  before it. `generateSegment` dropped every block before the segment start, and the previous
+  segment ends where that cluster begins, so that audio was lost (64 ms at the 10 s boundary of
+  `eac3-long.mkv`, 27 ms every 2 s in the test file). Audio blocks up to 100 ms before the
+  segment start are now kept; video before the keyframe is still dropped.
+- **Decoder reset at every segment.** Each segment had its own local timeline (`tfdt` 0) behind
+  an `EXT-X-DISCONTINUITY`, so AVFoundation restarted the audio decoder every segment, which is
+  audible with overlapped-transform codecs. Segments now carry global decode times (video `tfdt`
+  = cue time) and the playlist has no discontinuities. This reverses the local-timeline decision
+  from the replacement-item era; `planning.md` and `mkv-avplayer-transmuxer.md` are updated.
+  Segments are still generated independently from the cue index.
+- **Jittered sample durations.** Durations came from Matroska timestamp deltas, which are rounded
+  to 1 ms: 5.33 ms Dolby frames became 240 or 288 samples. AC-3/E-AC-3 durations now come from
+  the bitstream (`DolbyAudioConfig.sampleCount`: 1536 for AC-3, `numblkscod` × 256 per
+  independent substream-0 frame for E-AC-3), like AAC's fixed 1024. Audio has no composition
+  offset, and each segment's first audio decode time is snapped to the codec frame grid so
+  independently generated segments join sample-exactly.
+
+Verification: `swift test` 122 tests green (new: all audio frames of `eac3-long.mkv` survive
+segmentation, which fails on the old code; Dolby sample counts; the timeline tests now assert no
+discontinuities and global `tfdt`). A dump of the generated HLS for the 7.1 test file showed all
+17,718 audio frames in 48 segments with zero audio gaps or overlaps. On an iPhone over a LAN
+seeder, the 7.1 file plays through and the periodic chop is much reduced (listened to on the
+phone; a 7.1 receiver was not available, so the 8-channel layout itself is not confirmed by ear).
+
 ### 2026-11-24 — Playback errors, faster Dolby startup, 7.1 E-AC-3
 
 - Both apps now call `TorrentStreamSession.preparePlayer()` through the shared

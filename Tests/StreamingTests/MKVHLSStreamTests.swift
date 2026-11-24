@@ -22,7 +22,7 @@ import TorrentTestingSupport
         #expect(segments.first?.startTimeTicks == 0)
         #expect(playlist.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
         #expect(playlist.contains("#EXT-X-MAP:URI=\"init.mp4\""))
-        #expect(playlist.components(separatedBy: "#EXT-X-DISCONTINUITY").count - 1 == 3)
+        #expect(!playlist.contains("#EXT-X-DISCONTINUITY"))
         #expect(playlist.contains("#EXT-X-ENDLIST"))
     }
 
@@ -48,8 +48,10 @@ import TorrentTestingSupport
             range.overlaps(skipped) && !range.overlaps(0..<300 * 1024) && !range.overlaps(cuesRange)
         })
         let decodeTimes = tfdtValues(data: media)
+        let info = try MatroskaParser.parseHead(bytes: data)
+        let videoStart = UInt64((Double(target.startTimeTicks) * Double(info.timestampScaleNs) * 16000 / 1e9).rounded())
         #expect(decodeTimes.count >= 2)
-        #expect(decodeTimes.prefix(2).allSatisfy { $0 == 0 })
+        #expect(decodeTimes.first == videoStart)
     }
 
     @Test @MainActor func avFoundationLoadsGlobalTimelineAndSeeks() async throws {
@@ -250,6 +252,30 @@ import TorrentTestingSupport
         player.pause()
     }
 
+    @Test func segmentsKeepAudioMuxedAfterTheNextKeyframe() async throws {
+        let data = try Fixtures.data(named: "mkv/eac3-long.mkv")
+        let info = try MatroskaParser.parseHead(bytes: data)
+        let audioTrack = try #require(info.tracks.first { $0.isAudio })
+        let clustersStart = try #require(info.clustersStart)
+        let clustersEnd = info.cuesOffset.flatMap { $0 > clustersStart ? $0 : nil } ?? data.count
+        let fileAudioFrames = try MatroskaParser.clusters(in: data, range: clustersStart..<clustersEnd)
+            .flatMap(\.blocks)
+            .filter { $0.trackNumber == audioTrack.number }
+            .count
+        let source = FakeMKVSource(data)
+        await source.verify(0..<data.count)
+        let stream = MKVHLSStream(source: source, fileIndex: 0)
+        let segments = try await stream.segments()
+        #expect(segments.count > 1)
+
+        var segmentAudioFrames = 0
+        for segment in segments {
+            segmentAudioFrames += sampleCount(data: try await stream.mediaSegment(id: segment.id), trackID: 2)
+        }
+
+        #expect(segmentAudioFrames == fileAudioFrames)
+    }
+
     @Test func concurrentSegmentRequestsShareOneGeneration() async throws {
         let data = try Fixtures.data(named: "mkv/long30.mkv")
         let source = FakeMKVSource(data)
@@ -311,6 +337,38 @@ import TorrentTestingSupport
         let header = try #require(EBML.readHeader(in: data, offset: offset))
         let size = try #require(header.size)
         return offset..<offset + header.length + Int(size)
+    }
+
+    private func sampleCount(data: Data, trackID: UInt32) -> Int {
+        var total = 0
+        for moof in boxes(in: data, range: 0..<data.count) where moof.type == "moof" {
+            for traf in boxes(in: data, range: moof.payload) where traf.type == "traf" {
+                let children = boxes(in: data, range: traf.payload)
+                guard let tfhd = children.first(where: { $0.type == "tfhd" }),
+                      uint32(data, at: tfhd.payload.lowerBound + 4) == trackID else { continue }
+                for trun in children where trun.type == "trun" {
+                    total += Int(uint32(data, at: trun.payload.lowerBound + 4))
+                }
+            }
+        }
+        return total
+    }
+
+    private func boxes(in data: Data, range: Range<Int>) -> [(type: String, payload: Range<Int>)] {
+        var result: [(type: String, payload: Range<Int>)] = []
+        var offset = range.lowerBound
+        while offset + 8 <= range.upperBound {
+            let size = Int(uint32(data, at: offset))
+            guard size >= 8, offset + size <= range.upperBound else { break }
+            let type = String(decoding: data[offset + 4..<offset + 8], as: UTF8.self)
+            result.append((type, offset + 8..<offset + size))
+            offset += size
+        }
+        return result
+    }
+
+    private func uint32(_ data: Data, at offset: Int) -> UInt32 {
+        data[offset..<offset + 4].reduce(0) { ($0 << 8) | UInt32($1) }
     }
 
     private func tfdtValues(data: Data) -> [UInt64] {

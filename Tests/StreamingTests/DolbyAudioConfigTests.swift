@@ -24,14 +24,31 @@ import Testing
         #expect(dec3.count == 5)
     }
 
-    private static func eac3Frame(frameType: Int, frameBytes: Int, acmod: Int, lfeon: Int, chanmap: Int?) -> Data {
+    @Test func sampleCountUsesIndependentFrameBlocks() throws {
+        let sixBlocks = Self.eac3Frame(frameType: 0, frameBytes: 64, acmod: 7, lfeon: 1, chanmap: nil)
+        let oneBlock = Self.eac3Frame(frameType: 0, frameBytes: 64, acmod: 7, lfeon: 1, chanmap: nil, blockCode: 0)
+        let dependent = Self.eac3Frame(frameType: 1, frameBytes: 32, acmod: 2, lfeon: 0, chanmap: 0x0200, blockCode: 0)
+        #expect(DolbyAudioConfig.sampleCount(frame: sixBlocks) == 1536)
+        #expect(DolbyAudioConfig.sampleCount(frame: oneBlock + dependent) == 256)
+        #expect(DolbyAudioConfig.sampleCount(frame: oneBlock + dependent + oneBlock + dependent) == 512)
+        #expect(DolbyAudioConfig.sampleCount(frame: Data([0, 1, 2, 3, 4, 5, 6])) == nil)
+    }
+
+    private static func eac3Frame(
+        frameType: Int,
+        frameBytes: Int,
+        acmod: Int,
+        lfeon: Int,
+        chanmap: Int?,
+        blockCode: Int = 3
+    ) -> Data {
         var writer = BitWriter()
         writer.write(0x0B77, bits: 16)
         writer.write(frameType, bits: 2)
         writer.write(0, bits: 3)
         writer.write(frameBytes / 2 - 1, bits: 11)
         writer.write(0, bits: 2)
-        writer.write(3, bits: 2)
+        writer.write(blockCode, bits: 2)
         writer.write(acmod, bits: 3)
         writer.write(lfeon, bits: 1)
         writer.write(16, bits: 5)

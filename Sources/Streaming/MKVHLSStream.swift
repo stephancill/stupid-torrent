@@ -29,6 +29,7 @@ struct MKVHLSSegment: Sendable, Equatable {
 actor MKVHLSStream {
     static let maximumSegmentSize = 32 * 1024 * 1024
     private static let clusterProbeSize = 16 * 1024
+    private static let maximumLeadingAudioNs: UInt64 = 100_000_000
 
     private struct Prepared: Sendable {
         let remuxer: MKVRemuxer
@@ -37,6 +38,7 @@ actor MKVHLSStream {
         let segments: [MKVHLSSegment]
         let primaryTrackNumber: UInt64
         let primaryTrackIsVideo: Bool
+        let timestampScaleNs: UInt64
     }
 
     private struct InFlight {
@@ -146,7 +148,8 @@ actor MKVHLSStream {
             playlist: Data(playlist.utf8),
             segments: segments,
             primaryTrackNumber: primaryTrack.number,
-            primaryTrackIsVideo: primaryTrack.isVideo
+            primaryTrackIsVideo: primaryTrack.isVideo,
+            timestampScaleNs: info.timestampScaleNs
         )
         prepared = result
         return result
@@ -304,6 +307,8 @@ actor MKVHLSStream {
         let bytes = try await readExact(range: segment.sourceRange)
         var remuxer = prepared.remuxer.starting(atTimelineTicks: Int64(segment.startTimeTicks))
         let selectedTrackNumbers = Set(prepared.remuxer.selectedTrackNumbers)
+        let earliestAudioTicks = Int64(segment.startTimeTicks)
+            - Int64(Self.maximumLeadingAudioNs / prepared.timestampScaleNs)
         var foundPrimaryKeyframe = !prepared.primaryTrackIsVideo
         var output = Data()
         for (index, var cluster) in try MatroskaParser.clusters(in: bytes, range: 0..<bytes.count).enumerated() {
@@ -312,8 +317,10 @@ actor MKVHLSStream {
                 let clusterTimestamp = Int64(cluster.timestamp)
                 cluster.blocks = cluster.blocks.filter { block in
                     guard selectedTrackNumbers.contains(block.trackNumber) else { return true }
-                    guard clusterTimestamp + block.relativeTimestamp >= Int64(segment.startTimeTicks) else { return false }
-                    if block.trackNumber == prepared.primaryTrackNumber, prepared.primaryTrackIsVideo {
+                    let isPrimaryVideo = block.trackNumber == prepared.primaryTrackNumber && prepared.primaryTrackIsVideo
+                    let earliest = isPrimaryVideo ? Int64(segment.startTimeTicks) : earliestAudioTicks
+                    guard clusterTimestamp + block.relativeTimestamp >= earliest else { return false }
+                    if isPrimaryVideo {
                         if block.isKeyframe { foundPrimaryKeyframe = true }
                         return foundPrimaryKeyframe
                     }
@@ -386,7 +393,6 @@ actor MKVHLSStream {
             "#EXT-X-MAP:URI=\"init.mp4\"",
         ]
         for (index, duration) in durations.enumerated() {
-            if index > 0 { lines.append("#EXT-X-DISCONTINUITY") }
             lines.append(String(format: "#EXTINF:%.6f,", duration))
             lines.append("segments/\(index).m4s")
         }

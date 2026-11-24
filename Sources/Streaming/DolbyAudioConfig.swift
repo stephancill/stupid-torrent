@@ -72,6 +72,27 @@ enum DolbyAudioConfig {
         return writer.bytes
     }
 
+    static func sampleCount(frame: Data) -> Int? {
+        var total = 0
+        var cursor = 0
+        while cursor + 6 <= frame.count {
+            let syncframe = frame.dropFirst(cursor)
+            var bsidReader = BitReader(data: syncframe)
+            guard bsidReader.read(bits: 16) == 0x0B77 else { break }
+            bsidReader.skip(bits: 24)
+            guard bsidReader.read(bits: 5) > 10 else { return total + 1536 }
+            var reader = BitReader(data: syncframe)
+            reader.skip(bits: 16)
+            let strmtyp = reader.read(bits: 2)
+            let substreamID = reader.read(bits: 3)
+            let frameBytes = 2 * (reader.read(bits: 11) + 1)
+            let blocks = reader.read(bits: 2) == 3 ? 6 : [1, 2, 3, 6][reader.read(bits: 2)]
+            if strmtyp != 1, substreamID == 0 { total += blocks * 256 }
+            cursor += frameBytes
+        }
+        return total > 0 ? total : nil
+    }
+
     private static func dependentSubstreams(in frame: Data, after offset: Int) -> (count: Int, channelLocations: Int) {
         var count = 0
         var channelLocations = 0

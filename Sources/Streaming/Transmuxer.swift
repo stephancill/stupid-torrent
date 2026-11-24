@@ -62,8 +62,7 @@ struct MKVRemuxer {
                 timestampScaleNs: info.timestampScaleNs,
                 defaultDurationNs: mkvTrack.defaultDurationNs,
                 isVideo: mkvTrack.isVideo,
-                hasFixedFrameDuration: codec == .aac,
-                presentationTimeOffset: 0
+                codec: codec
             )
         }
         self.tracks = tracks
@@ -87,7 +86,7 @@ struct MKVRemuxer {
         remuxer.sequence = 0
         remuxer.states = initialStates.mapValues { state in
             var state = state
-            state.presentationTimeOffset = Int64(
+            state.nextDecodeTime = Int64(
                 (Double(ticks) * Double(state.timestampScaleNs) * Double(state.timescale) / 1e9).rounded()
             )
             return state
@@ -140,19 +139,26 @@ struct MKVRemuxer {
         let timestampScaleNs: UInt64
         let defaultDurationNs: UInt64?
         let isVideo: Bool
-        let hasFixedFrameDuration: Bool
-        var presentationTimeOffset: Int64
+        let codec: TransmuxCodec
         var nextDecodeTime: Int64 = 0
         var lastDelta: Int64?
         var hasReorder: Bool?
+        var hasStarted = false
 
         private var defaultDurationTicks: Int64? {
             defaultDurationNs.map { Int64((Double($0) * Double(timescale) / 1e9).rounded()) }
         }
 
+        private func bitstreamDuration(of frame: Data) -> Int64? {
+            switch codec {
+            case .aac: 1024
+            case .ac3, .eac3: DolbyAudioConfig.sampleCount(frame: frame).map(Int64.init)
+            case .h264, .hevc, .alac: nil
+            }
+        }
+
         private func presentationTicks(_ mkvTicks: Int64) -> Int64 {
             Int64((Double(mkvTicks) * Double(timestampScaleNs) * Double(timescale) / 1e9).rounded())
-                - presentationTimeOffset
         }
 
         mutating func samples(from blocks: [MKVBlock], clusterTimestamp: UInt64) throws -> [TransmuxSample] {
@@ -172,13 +178,22 @@ struct MKVRemuxer {
             if hasReorder == nil {
                 hasReorder = frames.indices.dropFirst().contains { frames[$0].pts < frames[$0 - 1].pts }
             }
+            if !isVideo, !hasStarted {
+                let start = max(0, frames[0].pts)
+                if let frameTicks = bitstreamDuration(of: frames[0].data), frameTicks > 0 {
+                    nextDecodeTime = (start + frameTicks / 2) / frameTicks * frameTicks
+                } else {
+                    nextDecodeTime = start
+                }
+            }
+            hasStarted = true
             let defaultDuration = defaultDurationTicks
             var result: [TransmuxSample] = []
             result.reserveCapacity(frames.count)
             for (index, frame) in frames.enumerated() {
                 let duration: Int64
-                if hasFixedFrameDuration {
-                    duration = 1024
+                if let bitstreamDuration = bitstreamDuration(of: frame.data) {
+                    duration = bitstreamDuration
                 } else if hasReorder == true && isVideo {
                     duration = defaultDuration ?? lastDelta ?? 0
                 } else if index + 1 < frames.count {
@@ -192,7 +207,7 @@ struct MKVRemuxer {
                     data: frame.data,
                     durationTicks: duration,
                     decodeTimeTicks: nextDecodeTime,
-                    compositionOffsetTicks: frame.pts - nextDecodeTime,
+                    compositionOffsetTicks: isVideo ? frame.pts - nextDecodeTime : 0,
                     isKeyframe: isVideo ? frame.isKeyframe : true
                 ))
                 nextDecodeTime += duration
