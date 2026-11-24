@@ -1,7 +1,7 @@
 import Foundation
 import Bencode
 
-public final class HTTPTrackerClient: TrackerClient, @unchecked Sendable {
+public struct HTTPTrackerClient: TrackerClient {
     private let url: URL
     private let session: URLSession
 
@@ -69,36 +69,26 @@ public final class HTTPTrackerClient: TrackerClient, @unchecked Sendable {
             throw TrackerError.malformedResponse("not a dict")
         }
         if let failure = dict["failure reason"]?.stringValueUTF8 {
-            return AnnounceResponse(interval: 0, peers: [], seeders: nil, leechers: nil, failureReason: failure)
+            throw TrackerError.failureReason(failure)
         }
-        let interval = dict["interval"]?.intValue ?? dict["min interval"]?.intValue ?? 0
-        let seeders = dict["complete"]?.intValue
-        let leechers = dict["incomplete"]?.intValue
-
         var peers: [PeerAddress] = []
-        if case .string(let compact)? = dict["peers"], compact.count % 6 == 0 {
-            var offset = 0
-            while offset < compact.count {
-                let ip = [UInt8](compact[offset..<(offset + 4)])
-                let port = (UInt16(compact[offset + 4]) << 8) | UInt16(compact[offset + 5])
-                peers.append(PeerAddress(ipv4Bytes: ip, port: port))
-                offset += 6
-            }
+        if case .string(let compact)? = dict["peers"] {
+            peers = PeerAddress.parseCompact(compact)
         } else if case .list(let list)? = dict["peers"] {
             for case .dictionary(let peerDict) in list {
-                guard let ip = peerDict["ip"]?.stringValueUTF8, let port = peerDict["port"]?.intValue else { continue }
-                peers.append(PeerAddress(host: ip, port: UInt16(port)))
+                guard let ip = peerDict["ip"]?.stringValueUTF8, let port = peerDict["port"]?.intValue,
+                      let peerPort = UInt16(exactly: port), peerPort != 0 else { continue }
+                peers.append(PeerAddress(host: ip, port: peerPort))
             }
         }
-        if case .string(let compact6)? = dict["peers6"], compact6.count % 18 == 0 {
-            var offset = 0
-            while offset < compact6.count {
-                let ip = [UInt8](compact6[offset..<(offset + 16)])
-                let port = (UInt16(compact6[offset + 16]) << 8) | UInt16(compact6[offset + 17])
-                peers.append(PeerAddress(ipv6Bytes: ip, port: port))
-                offset += 18
-            }
+        if case .string(let compact6)? = dict["peers6"] {
+            peers += PeerAddress.parseCompactIPv6(compact6)
         }
-        return AnnounceResponse(interval: interval, peers: peers, seeders: seeders, leechers: leechers, failureReason: nil)
+        return AnnounceResponse(
+            interval: dict["interval"]?.intValue ?? dict["min interval"]?.intValue ?? 0,
+            peers: peers,
+            seeders: dict["complete"]?.intValue,
+            leechers: dict["incomplete"]?.intValue
+        )
     }
 }

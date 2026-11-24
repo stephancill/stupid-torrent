@@ -43,6 +43,66 @@ Running on an Apple TV HD (2 cores) exposed engine work that only held on phones
 - `TorrentLog.logToFile(at:)` mirrors the engine log into a 20 MB-capped file so the Apple TV app
   can pull diagnostics from its container, where the unified log is hard to reach.
 
+### 2026-11-24 — Refactor: transport layer cleanup (sockets, PeerStream, MSE, DH, DHT, µTP, trackers)
+
+Audit-driven cleanup of the transport layer, with three bug fixes.
+
+- **Fix: descriptor reuse race.** `TCPSocket`/`UDPSocket`/`TCPListener` share a
+  `SocketDescriptor` that counts in-flight syscalls. `close()` marks it closed and, while a
+  syscall is running, only calls `shutdown(SHUT_RDWR)`; the last user closes the fd, so it is
+  closed exactly once and no syscall can run on a closed or reused descriptor. On Darwin
+  `shutdown` wakes blocked TCP `read`/`write` but not `accept` or UDP `recvfrom` (both return
+  `ENOTCONN` without waking), so those wait in `poll` slices of 250 ms that re-check the closed
+  flag; `TCPSocket.connect` polls the same way. The EBADF workarounds (thread-per-send, the
+  comment in `MetadataExchange.fetch`) are gone.
+- **Fix: DHT tokens broke node identity.** `KRPCNodeInfo` no longer carries the mutable
+  `token` (it was part of the synthesized `Hashable`, so `queried` sets missed re-seen nodes and
+  the announce fast path never matched). Tokens live in a per-infohash map filled by `lookup`
+  and used by `announce`; equality stays id+host+port because bootstrap routers all share the
+  zero id.
+- **Fix: DHT peer cache evicted good peers.** The three merge paths are one
+  `mergedPeerCache`: good peers first, then newly added peers, then older unconfirmed ones,
+  capped at 500. Fresh peers outrank stale ones so new `get_peers`/`announce_peer` results
+  survive a full cache.
+- `PeerStream`: one `NSCondition` guards the buffer, pending read, outbox and ciphers. A
+  per-stream writer thread drains a FIFO outbox; payloads are RC4-encrypted when they are
+  enqueued under the lock, so ciphertext order always matches write order. `connect(host:port:)`
+  runs through `BlockingIO.run`; accepted streams start I/O in `init(fd:)`. Buffered bytes are
+  still delivered after the peer closes.
+- `BlockingIO` is public and gains `spawn(name:)` for long-lived loops.
+  `UDPSocket.datagrams(name:)` is the single receive loop (an `AsyncStream<Datagram>` fed by
+  a dedicated thread, reusing one 64 KiB buffer) for both DHT and µTP. `receive(timeout:)`
+  returns a `Datagram` with a `PeerAddress` sender and is used by the UDP tracker.
+- `DHTClient` is an actor (binds in `init`, default port 0, receive loop starts at once),
+  `RoutingTable` is a struct, and pending transactions are keyed by `Data`. Transaction ids
+  stay 4 bytes and re-roll on collision: 2-byte ids collided under sustained load and
+  orphaned continuations. Cache files share one `cacheFile(named:)`.
+- `PeerAddress` owns IPv4/IPv6 compact peer parsing and encoding (port-0 peers are dropped
+  everywhere) and dotted-quad formatting. HTTP and UDP tracker clients are structs. Both throw
+  `TrackerError.failureReason`, and `AnnounceResponse.failureReason` is removed.
+- Byte-order helpers live only in `Data+ByteOrder` and index from `startIndex`, so they work
+  on slices. PeerWire, µTP and KRPC use them.
+- `BigUInt` is replaced by a private fixed-width (12×64-bit) Montgomery field in `DH.swift`:
+  R² and m' are computed once for the BEP 10 prime, and the exponent is scanned bit by bit
+  without shifting. Private keys are `Data`, and outputs are exactly 96 bytes, so no padding
+  step is needed.
+- `MSEHandshake` is an enum with `initiate`/`respond` that returns the negotiated method. It
+  uses local ciphers and a shared key derivation and sync scan, and enables stream encryption
+  only for RC4. The responder now enables decryption before putting the decrypted IA back at
+  the front of the buffer. Before, decryption was enabled afterwards, so IA bytes were
+  decrypted twice.
+- µTP: `UTPConnection` conforms to `PeerTransport` itself (`UTPStream` is deleted), and its
+  `close()` also unregisters it from the transport. Removed dead states, extensions, the
+  extension-bits path, `sendFIN` and `lastAcked`; decoding still skips unknown extensions.
+  The receive buffer is one `Data`. `UTPTransport.send` is nonisolated, so connections no
+  longer hop through the transport actor for every packet. Accept handlers still run in their
+  own task so a long-lived session never blocks demuxing.
+
+Tests: new `TransportTests` (slice-safe byte order, compact peers, tracker failure reason,
+listener and datagram loops unblock on close, pending read fails on close, an MSE loopback
+handshake with 64 concurrent encrypted sends), DHT lookup→announce and peer-cache merge tests,
+and an unknown-extension µTP decode test.
+
 ### 2026-08-30 — Fix: player dismiss returns the app to portrait
 
 Follow-up to the always-landscape player: dismissing the player (AVKit's native X) was

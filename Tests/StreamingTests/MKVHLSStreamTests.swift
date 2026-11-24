@@ -70,6 +70,7 @@ import TorrentTestingSupport
         #expect(abs(CMTimeGetSeconds(duration) - 30.023) < 0.1)
 
         let player = AVPlayer(playerItem: AVPlayerItem(asset: asset))
+        player.isMuted = true
         let itemID = ObjectIdentifier(try #require(player.currentItem))
         await player.seek(
             to: CMTime(seconds: 20, preferredTimescale: 600),

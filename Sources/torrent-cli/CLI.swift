@@ -62,11 +62,10 @@ struct TorrentCLI {
             let socket = try UDPSocket()
             try socket.bind(port: port)
             let transport = UTPTransport(socket: socket) { connection, remote in
-                let stream = UTPStream(connection: connection)
                 print("UTP accepted from \(remote.host):\(remote.port)")
-                if let data = try? await stream.read(exactly: 5) {
+                if let data = try? await connection.read(exactly: 5) {
                     print("UTP responder got: \(String(decoding: data, as: UTF8.self))")
-                    try? await stream.send(data)
+                    try? await connection.send(data)
                     print("UTP responder echoed")
                 }
             }
@@ -96,7 +95,7 @@ struct TorrentCLI {
             let connection = await transport.connect(to: PeerAddress(host: host, port: port))
             try await connection.startAsInitiator(timeout: .seconds(5))
             print("UTP connected to \(host):\(port)")
-            _ = try await connection.write(Data(payload.utf8))
+            try await connection.send(Data(payload.utf8))
             let echo = try await connection.read(exactly: payload.utf8.count)
             print("ECHO: \(String(decoding: echo, as: UTF8.self))")
         } catch {
@@ -130,7 +129,7 @@ struct TorrentCLI {
             try? await dht.announce(infoHash: infoHash, port: UInt16(port))
             print("announced; idling \(idle)s to observe inbound queries...")
             try await Task.sleep(for: .seconds(idle))
-            print("done (node table \(dht.nodeCount))")
+            print("done (node table \(await dht.nodeCount))")
         } catch {
             print("error: \(error)")
         }
@@ -506,9 +505,6 @@ struct TorrentCLI {
             print("interval: \(response.interval)")
             print("seeders: \(response.seeders ?? -1) leechers: \(response.leechers ?? -1)")
             print("peers (\(response.peers.count)): \(response.peers.map { "\($0.host):\($0.port)" }.joined(separator: ", "))")
-            if let failure = response.failureReason {
-                print("failure: \(failure)")
-            }
         } catch {
             print("error: \(error)")
         }

@@ -328,6 +328,7 @@ actor FakeMKVSource: TorrentStreamSource {
             return PreparedTorrentSeek(item: seekItem, timelineOffset: seconds - 1)
         }
 
+        player.isMuted = true
         player.play()
         let firstSeek = Task { @MainActor in
             await player.seek(

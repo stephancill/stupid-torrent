@@ -45,7 +45,6 @@ public struct AnnounceResponse: Sendable {
     public let peers: [PeerAddress]
     public let seeders: Int?
     public let leechers: Int?
-    public let failureReason: String?
 }
 
 public enum TrackerError: Error, Sendable {

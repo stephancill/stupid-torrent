@@ -1,36 +1,30 @@
 import Foundation
 
-public final class UDPTrackerClient: TrackerClient, @unchecked Sendable {
-    private let host: String
-    private let port: UInt16
+public struct UDPTrackerClient: TrackerClient {
+    private let tracker: PeerAddress
 
     public init(host: String, port: UInt16) {
-        self.host = host
-        self.port = port
+        tracker = PeerAddress(host: host, port: port)
     }
 
     public func announce(_ request: AnnounceRequest) async throws -> AnnounceResponse {
-        let host = host
-        let port = port
-        // The exchange blocks on `receive(timeout:)` for up to 5 s per message.
+        let tracker = tracker
         return try await BlockingIO.run(name: "udp-tracker") {
-            try Self.announceBlocking(request, host: host, port: port)
+            try Self.announceBlocking(request, tracker: tracker)
         }
     }
 
-    private static func announceBlocking(
-        _ request: AnnounceRequest, host: String, port: UInt16
-    ) throws -> AnnounceResponse {
+    private static func announceBlocking(_ request: AnnounceRequest, tracker: PeerAddress) throws -> AnnounceResponse {
         let socket = try UDPSocket()
         defer { socket.close() }
 
         let connectTxn = randomTransactionID()
         var connectRequest = Data()
         connectRequest.appendUInt64BE(0x4172_7101_980)
-        connectRequest.appendUInt32BE(0) // action connect
+        connectRequest.appendUInt32BE(0)
         connectRequest.appendUInt32BE(UInt32(bitPattern: connectTxn))
-        try socket.send(connectRequest, to: host, port: port)
-        guard let connectResponse = try socket.receive(timeout: 5), connectResponse.count >= 16,
+        try socket.send(connectRequest, to: tracker)
+        guard let connectResponse = try socket.receive(timeout: 5)?.data, connectResponse.count >= 16,
               connectResponse.readUInt32BE(at: 0) == 0,
               connectResponse.readInt32BE(at: 4) == connectTxn else {
             throw TrackerError.malformedResponse("bad UDP connect response")
@@ -40,7 +34,7 @@ public final class UDPTrackerClient: TrackerClient, @unchecked Sendable {
         let announceTxn = randomTransactionID()
         var announce = Data()
         announce.appendUInt64BE(connectionID)
-        announce.appendUInt32BE(1) // action announce
+        announce.appendUInt32BE(1)
         announce.appendUInt32BE(UInt32(bitPattern: announceTxn))
         announce.append(request.infoHash)
         announce.append(request.peerID)
@@ -48,13 +42,13 @@ public final class UDPTrackerClient: TrackerClient, @unchecked Sendable {
         announce.appendInt64BE(request.left)
         announce.appendInt64BE(request.uploaded)
         announce.appendUInt32BE(UInt32(request.event.rawValue))
-        announce.appendUInt32BE(0) // ip address
+        announce.appendUInt32BE(0)
         announce.appendUInt32BE(UInt32(bitPattern: request.key))
         announce.appendUInt32BE(UInt32(request.numWant))
         announce.appendUInt16BE(request.port)
 
-        try socket.send(announce, to: host, port: port)
-        guard let response = try socket.receive(timeout: 5), response.count >= 20 else {
+        try socket.send(announce, to: tracker)
+        guard let response = try socket.receive(timeout: 5)?.data, response.count >= 20 else {
             throw TrackerError.malformedResponse("bad UDP announce response")
         }
 
@@ -66,19 +60,12 @@ public final class UDPTrackerClient: TrackerClient, @unchecked Sendable {
         guard action == 1, response.readInt32BE(at: 4) == announceTxn else {
             throw TrackerError.malformedResponse("bad UDP announce response")
         }
-        let interval = Int(response.readInt32BE(at: 8))
-        let leechers = Int(response.readInt32BE(at: 12))
-        let seeders = Int(response.readInt32BE(at: 16))
-
-        var peers: [PeerAddress] = []
-        var offset = 20
-        while offset + 6 <= response.count {
-            let ip = [UInt8](response[offset..<(offset + 4)])
-            let port = response.readUInt16BE(at: offset + 4)
-            peers.append(PeerAddress(ipv4Bytes: ip, port: port))
-            offset += 6
-        }
-        return AnnounceResponse(interval: interval, peers: peers, seeders: seeders, leechers: leechers, failureReason: nil)
+        return AnnounceResponse(
+            interval: Int(response.readInt32BE(at: 8)),
+            peers: PeerAddress.parseCompact(response.dropFirst(20)),
+            seeders: Int(response.readInt32BE(at: 16)),
+            leechers: Int(response.readInt32BE(at: 12))
+        )
     }
 
     private static func randomTransactionID() -> Int32 {

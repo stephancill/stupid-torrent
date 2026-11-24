@@ -4,12 +4,8 @@ import Bencode
 public enum KRPCError: Error, Sendable {
     case malformed(String)
     case errorResponse(code: Int, message: String)
-    case timeout
-    case closed
 }
 
-/// A single KRPC message on the wire (BEP 5). `args`/`reply` are the `a`/`r` dictionaries;
-/// binary fields (id, info_hash, target, token, nodes, values) are `.string(Data)` values.
 public enum KRPC: Sendable {
     case query(transaction: Data, name: String, args: [String: BValue])
     case response(transaction: Data, reply: [String: BValue])
@@ -115,74 +111,21 @@ public enum KRPCWire {
     }
 }
 
-/// Compact node info (BEP 5): 20-byte node id + 4-byte IPv4 + 2-byte port.
 public enum CompactNode {
     public static func encode(_ nodes: [KRPCNodeInfo]) -> Data {
-        var out = Data()
-        for node in nodes {
+        nodes.reduce(into: Data()) { out, node in
+            guard let bytes = node.address.ipv4Bytes else { return }
             out.append(node.id)
-            if let bytes = ipv4Bytes(node.host) {
-                out.append(bytes)
-                out.appendUInt16BE(node.port)
-            }
+            out.append(bytes)
+            out.appendUInt16BE(node.port)
         }
-        return out
     }
 
     public static func parse(_ data: Data) -> [KRPCNodeInfo] {
-        var nodes: [KRPCNodeInfo] = []
-        var offset = 0
-        while offset + 26 <= data.count {
-            let id = Data(data[offset..<(offset + 20)])
-            let ip = [UInt8](data[(offset + 20)..<(offset + 24)])
-            let port = data.readUInt16BE(at: offset + 24)
-            if port != 0 {
-                nodes.append(KRPCNodeInfo(id: id, host: ipv4String(ip), port: port))
-            }
-            offset += 26
+        stride(from: 0, through: data.count - 26, by: 26).compactMap { offset in
+            let start = data.startIndex + offset
+            guard let peer = PeerAddress.parseCompact(data[(start + 20)..<(start + 26)]).first else { return nil }
+            return KRPCNodeInfo(id: Data(data[start..<(start + 20)]), host: peer.host, port: peer.port)
         }
-        return nodes
     }
-}
-
-/// Compact peer info (BEP 5): 4-byte IPv4 + 2-byte port.
-public enum CompactPeer {
-    public static func encode(_ peers: [PeerAddress]) -> Data {
-        var out = Data()
-        for peer in peers {
-            if let bytes = ipv4Bytes(peer.host) {
-                out.append(bytes)
-                out.appendUInt16BE(peer.port)
-            }
-        }
-        return out
-    }
-
-    public static func parse(_ data: Data) -> [PeerAddress] {
-        var peers: [PeerAddress] = []
-        var offset = 0
-        while offset + 6 <= data.count {
-            let ip = [UInt8](data[offset..<(offset + 4)])
-            let port = data.readUInt16BE(at: offset + 4)
-            if port != 0 {
-                peers.append(PeerAddress(ipv4Bytes: ip, port: port))
-            }
-            offset += 6
-        }
-        return peers
-    }
-}
-
-private func ipv4Bytes(_ host: String) -> Data? {
-    var parts: [UInt8] = []
-    for part in host.split(separator: ".") {
-        guard let value = UInt8(part) else { return nil }
-        parts.append(value)
-    }
-    guard parts.count == 4 else { return nil }
-    return Data(parts)
-}
-
-private func ipv4String(_ bytes: [UInt8]) -> String {
-    bytes.map(String.init).joined(separator: ".")
 }

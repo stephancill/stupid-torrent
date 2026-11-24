@@ -802,13 +802,12 @@ public actor Torrent {
         let connection = await transport.connect(to: address)
         do {
             try await connection.startAsInitiator(timeout: .seconds(2))
-            let stream = UTPStream(connection: connection)
             let session = PeerSession(
                 torrent: self,
                 address: address,
                 infoHash: metainfo.infoHash,
                 peerID: peerID,
-                stream: stream,
+                stream: connection,
                 isInitiator: true,
                 supportsMSE: false,
                 pieceCount: metainfo.pieceCount
@@ -823,7 +822,7 @@ public actor Torrent {
             return session.completedHandshake
         } catch {
             TorrentLog.log("µTP connect to \(address.host):\(address.port) failed: \(error)")
-            await connection.unregister()
+            connection.close()
             pendingPeerAddresses.remove(address)
             return false
         }
@@ -861,9 +860,9 @@ public actor Torrent {
 
     private func connectTCP(to address: PeerAddress, supportsMSE: Bool) async -> Bool {
         do {
-            let stream = try PeerStream(host: address.host, port: address.port)
+            let stream = try PeerStream()
             try await withThrowingTaskGroup(of: Void.self) { group in
-                group.addTask { try await stream.connect(timeout: 5) }
+                group.addTask { try await stream.connect(host: address.host, port: address.port, timeout: 5) }
                 group.addTask {
                     try await Task.sleep(for: .seconds(5))
                     stream.close()
@@ -909,7 +908,6 @@ public actor Torrent {
                 while !Thread.current.isCancelled {
                     guard let fd = try? listener.accept() else { break }
                     let stream = PeerStream(fd: fd)
-                    stream.start()
                     let torrent = self
                     Task {
                         await torrent.runAccepted(stream)
@@ -946,16 +944,15 @@ public actor Torrent {
 
     private func runAcceptedUTP(_ connection: UTPConnection, remote: PeerAddress) async {
         guard activePeerIDs.count < maxActivePeers else {
-            await connection.close()
+            connection.close()
             return
         }
-        let stream = UTPStream(connection: connection)
         let session = PeerSession(
             torrent: self,
             address: remote,
             infoHash: metainfo.infoHash,
             peerID: peerID,
-            stream: stream,
+            stream: connection,
             isInitiator: false,
             supportsMSE: false,
             pieceCount: metainfo.pieceCount

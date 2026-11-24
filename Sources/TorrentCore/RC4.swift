@@ -1,14 +1,11 @@
 import Foundation
 
-/// RC4 stream cipher (used by MSE/PE, BEP 10). KSA then PRGA; the first 1024 bytes of
-/// keystream are discarded per spec. The same object is used for both directions; state
-/// advances as `update(_:)` is called.
-public final class RC4: @unchecked Sendable {
+final class RC4: @unchecked Sendable {
     private var s: [UInt8] = Array(0...255)
     private var i: UInt8 = 0
     private var j: UInt8 = 0
 
-    public init(key: Data) {
+    init(key: Data) {
         let keyBytes = [UInt8](key)
         var ksaJ: UInt8 = 0
         for index in 0..<256 {
@@ -19,12 +16,11 @@ public final class RC4: @unchecked Sendable {
         }
         i = 0
         j = 0
-        // Discard the first 1024 bytes of keystream (per BEP 10).
         let discard = Data(repeating: 0, count: 1024)
         _ = crypt(discard)
     }
 
-    public func update(_ data: Data) -> Data {
+    func update(_ data: Data) -> Data {
         crypt(data)
     }
 

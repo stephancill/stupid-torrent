@@ -99,23 +99,18 @@ public final class MetadataFetcher: @unchecked Sendable {
     /// Fetches the info dict over TCP with MSE/PE encryption (BEP 10), falling back to plaintext
     /// for peers that don't speak MSE. The transport-level path used for injected peers and tests.
     public func fetch(from address: PeerAddress, timeout: Duration = .seconds(3), connectTimeout: Duration = .seconds(2)) async throws -> Data {
-        let stream = try PeerStream(host: address.host, port: address.port)
+        let stream = try PeerStream()
         return try await withTaskCancellationHandler {
-            // Connect is bounded by its own `connectTimeout`, so arm the overall timeout only
-            // AFTER the connection is up. Arming it before lets a 3s timeout close the stream
-            // while a slow/queued connect() is still in flight -> connect() runs on a closed fd
-            // (EBADF), and every peer in a slow sweep dies with errno 9 instead of being swept.
             let seconds = TimeInterval(connectTimeout.components.seconds) + TimeInterval(connectTimeout.components.attoseconds) / 1e18
-            try await stream.connect(timeout: seconds)
+            try await stream.connect(host: address.host, port: address.port, timeout: seconds)
             TorrentLog.log("metadata: connected to \(address.host)")
 
             // MSE/PE (BEP 10): obfuscate the handshake + payload. Many metadata servers (and most of
             // this swarm) close plaintext connections, so encrypt first; peers without MSE answer in
             // plaintext, which falls back and continues unencrypted.
-            let mse = MSEHandshake(stream: stream)
             do {
-                try await mse.performAsInitiator(infoHash: infoHash)
-                TorrentLog.log("metadata: MSE handshake ok (method \(mse.method == .rc4 ? "rc4" : "plaintext"))")
+                let method = try await MSEHandshake.initiate(stream: stream, infoHash: infoHash)
+                TorrentLog.log("metadata: MSE handshake ok (method \(method))")
             } catch MSEError.plaintextFallback {
                 TorrentLog.log("metadata: peer doesn't support MSE, using plaintext")
             }
@@ -141,14 +136,13 @@ public final class MetadataFetcher: @unchecked Sendable {
     /// sessions). Reaches µTP-only peers (transmission/deluge/webtorrent) that close TCP metadata
     /// connections.
     public func fetchUTP(from address: PeerAddress, transport: UTPTransport, timeout: Duration = .seconds(3), connectTimeout: Duration = .seconds(2)) async throws -> Data {
-        let connection = await transport.connect(to: address)
+        let stream = await transport.connect(to: address)
         do {
-            try await connection.startAsInitiator(timeout: connectTimeout)
+            try await stream.startAsInitiator(timeout: connectTimeout)
         } catch {
-            await connection.unregister()
+            stream.close()
             throw error
         }
-        let stream = UTPStream(connection: connection)
         return try await withTaskCancellationHandler {
             TorrentLog.log("metadata: µTP connected to \(address.host)")
             let timeoutTask = Task {
@@ -284,7 +278,7 @@ public enum MagnetBootstrapper {
             guard let dhtClient else { return }
             // Emit cached live peers for this infohash immediately, before any network query
             // (webtorrent's DHT peer store, emitted at next-tick).
-            let cached = dhtClient.cachedPeers(infoHash: magnet.infoHash)
+            let cached = await dhtClient.cachedPeers(infoHash: magnet.infoHash)
             TorrentLog.log("bootstrap: DHT cache has \(cached.count) cached peers")
             for peer in cached {
                 await pool.add(peer)
@@ -323,7 +317,7 @@ public enum MagnetBootstrapper {
                                     numWant: 200,
                                     key: Int32.random(in: .min ... .max)
                                 ))
-                                TorrentLog.log("bootstrap: announce got \(response.peers.count) peers (failure: \(response.failureReason ?? "none"))")
+                                TorrentLog.log("bootstrap: announce got \(response.peers.count) peers")
                                 for peer in response.peers {
                                     await pool.add(peer)
                                 }
@@ -373,7 +367,7 @@ public enum MagnetBootstrapper {
                 // Remember the peer that actually served metadata as confirmed-reachable, so the
                 // next resolution for this infohash retries it first instead of re-draining stale
                 // get_peers records.
-                dhtClient?.cacheKnownGood([result.metadataPeer], for: magnet.infoHash)
+                await dhtClient?.cacheKnownGood([result.metadataPeer], for: magnet.infoHash)
                 trackerTask.cancel()
                 return result
             }

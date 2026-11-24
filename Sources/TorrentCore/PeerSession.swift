@@ -101,14 +101,11 @@ public final class PeerSession: @unchecked Sendable {
         // MSE/PE (BEP 10): obfuscate the handshake + payload. Some peers answer in plaintext
         // (they don't support MSE) — fall back and continue unencrypted. µTP is plaintext.
         if supportsMSE, let stream = stream as? PeerStream {
-            let mse = MSEHandshake(stream: stream)
             do {
-                if isInitiator {
-                    try await mse.performAsInitiator(infoHash: infoHash)
-                } else {
-                    try await mse.performAsResponder(infoHash: infoHash)
-                }
-                TorrentLog.log("\(address.host): MSE handshake ok (method \(mse.method == .rc4 ? "rc4" : "plaintext"))")
+                let method = isInitiator
+                    ? try await MSEHandshake.initiate(stream: stream, infoHash: infoHash)
+                    : try await MSEHandshake.respond(stream: stream, infoHash: infoHash)
+                TorrentLog.log("\(address.host): MSE handshake ok (method \(method))")
             } catch MSEError.plaintextFallback {
                 TorrentLog.log("\(address.host): peer doesn't support MSE, using plaintext")
             }

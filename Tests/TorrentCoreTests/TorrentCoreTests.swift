@@ -400,7 +400,7 @@ extension Data {
             Issue.record("missing values")
             return
         }
-        #expect(CompactPeer.parse(first) == [PeerAddress(host: "192.168.1.10", port: 6881)])
+        #expect(PeerAddress.parseCompact(first) == [PeerAddress(host: "192.168.1.10", port: 6881)])
     }
 
     @Test func compactNodeRoundTrip() {
@@ -411,7 +411,7 @@ extension Data {
 
     @Test func routingTableClosestByXorDistance() {
         let localID = Data(repeating: 0x00, count: 20)
-        let table = RoutingTable(localID: localID, k: 2)
+        var table = RoutingTable(localID: localID, k: 2)
         let far = KRPCNodeInfo(id: Data([0x80] + Array(repeating: 0x00, count: 19)), host: "a", port: 1)
         let near = KRPCNodeInfo(id: Data([0x01] + Array(repeating: 0x00, count: 19)), host: "b", port: 2)
         table.add(far)
@@ -426,15 +426,11 @@ extension Data {
     @Test func nodeAnswersQueriesAndStoresAnnouncedPeers() async throws {
         let (nodeCache, peerCache) = tempEmptyCacheURLs()
         let nodeA = try DHTClient(nodeID: Data(repeating: 0xAA, count: 20), cacheURL: nodeCache, peerCacheURL: peerCache)
-        nodeA.startListening(port: 0)
-        defer { nodeA.stop() }
         #expect(nodeA.localPort != 0)
         let nodeAInfo = KRPCNodeInfo(id: nodeA.nodeID, host: "127.0.0.1", port: nodeA.localPort)
 
         let clientB = try DHTClient(nodeID: Data(repeating: 0xBB, count: 20), cacheURL: nodeCache, peerCacheURL: peerCache)
-        clientB.startListening()
-        defer { clientB.stop() }
-        clientB.addNode(nodeAInfo)
+        await clientB.addNode(nodeAInfo)
 
         // ping is answered with the node's id.
         let pingReply = try await clientB.query(.ping(id: clientB.nodeID), to: nodeAInfo)
@@ -457,31 +453,62 @@ extension Data {
 
         let getReply2 = try await clientB.query(.getPeers(id: clientB.nodeID, infoHash: infoHash), to: nodeAInfo)
         let expected = PeerAddress(host: "127.0.0.1", port: announcePort)
-        #expect(CompactPeer.parse(getReply2["values"]?.stringValue ?? Data()) == [expected])
-        #expect(nodeA.cachedPeers(infoHash: infoHash) == [expected])
+        #expect(PeerAddress.parseCompact(getReply2["values"]?.stringValue ?? Data()) == [expected])
+        #expect(await nodeA.cachedPeers(infoHash: infoHash) == [expected])
 
         // announce_peer with a bad token is rejected.
         let badReply = try? await clientB.query(.announcePeer(id: clientB.nodeID, infoHash: infoHash, port: announcePort, token: Data([0x00])), to: nodeAInfo)
         #expect(badReply == nil)
+        await nodeA.stop()
+        await clientB.stop()
     }
 
     /// A self-announce (get_peers for a token, then announce_peer back) stores us at the node.
     @Test func nodeSelfAnnounce() async throws {
         let (nodeCache, peerCache) = tempEmptyCacheURLs()
         let nodeA = try DHTClient(nodeID: Data(repeating: 0x11, count: 20), cacheURL: nodeCache, peerCacheURL: peerCache)
-        nodeA.startListening(port: 0)
-        defer { nodeA.stop() }
         let nodeAInfo = KRPCNodeInfo(id: nodeA.nodeID, host: "127.0.0.1", port: nodeA.localPort)
 
         let clientB = try DHTClient(nodeID: Data(repeating: 0x22, count: 20), cacheURL: nodeCache, peerCacheURL: peerCache)
-        clientB.startListening()
-        defer { clientB.stop() }
-        clientB.addNode(nodeAInfo)
+        await clientB.addNode(nodeAInfo)
 
         let infoHash = Data(repeating: 0x33, count: 20)
         try await clientB.announce(infoHash: infoHash, port: 6881)
-        // nodeA stored us as a live peer for the infohash.
-        #expect(nodeA.cachedPeers(infoHash: infoHash) == [PeerAddress(host: "127.0.0.1", port: 6881)])
+        #expect(await nodeA.cachedPeers(infoHash: infoHash) == [PeerAddress(host: "127.0.0.1", port: 6881)])
+        await nodeA.stop()
+        await clientB.stop()
+    }
+
+    @Test func lookupThenAnnounceReachesNode() async throws {
+        let (nodeCache, peerCache) = tempEmptyCacheURLs()
+        let nodeA = try DHTClient(nodeID: Data(repeating: 0x44, count: 20), cacheURL: nodeCache, peerCacheURL: peerCache)
+        let clientB = try DHTClient(nodeID: Data(repeating: 0x55, count: 20), cacheURL: nodeCache, peerCacheURL: peerCache)
+        await clientB.addNode(KRPCNodeInfo(id: nodeA.nodeID, host: "127.0.0.1", port: nodeA.localPort))
+        let infoHash = Data(repeating: 0x66, count: 20)
+        _ = try await clientB.lookup(infoHash: infoHash, timeout: 3)
+        try await clientB.announce(infoHash: infoHash, port: 7000)
+        #expect(await nodeA.cachedPeers(infoHash: infoHash) == [PeerAddress(host: "127.0.0.1", port: 7000)])
+        await nodeA.stop()
+        await clientB.stop()
+    }
+
+    @Test func peerCacheMergeKeepsGoodPeersFirstAndFreshPeersOverStale() {
+        let stale = (1...DHTClient.maxCachedPeers).map { DHTClient.PeerCacheEntry(peer: PeerAddress(host: "10.0.0.1", port: UInt16($0)), good: false) }
+        let good = PeerAddress(host: "10.0.0.2", port: 1)
+        let withGood = DHTClient.mergedPeerCache(stale, adding: [good], good: true)
+        #expect(withGood.count == DHTClient.maxCachedPeers)
+        #expect(withGood.first == DHTClient.PeerCacheEntry(peer: good, good: true))
+
+        let fresh = PeerAddress(host: "10.0.0.3", port: 1)
+        let merged = DHTClient.mergedPeerCache(withGood, adding: [fresh, fresh], good: false)
+        #expect(merged.count == DHTClient.maxCachedPeers)
+        #expect(merged[0].peer == good)
+        #expect(merged[1].peer == fresh)
+        #expect(merged.filter { $0.peer == fresh }.count == 1)
+
+        let upgraded = DHTClient.mergedPeerCache(merged, adding: [stale[5].peer], good: true)
+        #expect(upgraded.prefix(2).allSatisfy { $0.good })
+        #expect(upgraded.contains { $0.peer == stale[5].peer && $0.good })
     }
 
     /// Empty per-test DHT caches so the shared real-node/peer caches don't leak into loopback tests.
@@ -513,19 +540,17 @@ extension Data {
     @Test func dhPublicKeyMatchesPython() {
         // priv = 0x0123456789abcdef0123456789abcdef01234567
         let privateBytes: [UInt8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67]
-        let priv = BigUInt(bytes: Data(privateBytes.reversed()))
-        let pub = DH.publicKey(for: priv)
+        let pub = DH.publicKey(privateKey: Data(privateBytes))
         let expected = "6fd4bc7aa649593205ec30348a3ccc737b61fa01e9e1762c2c53eb69033afecbdf7c13b8ac3643af78d0760b0f42db009f2b96c970f009d060faf617f117d0f1c221cea0561b9a86e852fc70a6f09ad0f82378603aa5e56b811deb3f534bf276"
         #expect(pub.map { String(format: "%02x", $0) }.joined() == expected)
     }
 
     @Test func dhSharedSecretMatchesPython() {
         let privateBytes: [UInt8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67]
-        let priv = BigUInt(bytes: Data(privateBytes.reversed()))
         let peerPublic: [UInt8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44]
         var peerBytes = Data(repeating: 0, count: 76)
         peerBytes.append(contentsOf: peerPublic)
-        let shared = DH.sharedSecret(privateKey: priv, peerPublic: peerBytes)
+        let shared = DH.sharedSecret(privateKey: Data(privateBytes), peerPublic: peerBytes)
         let expected = "4d51a0f2a2454332ddc6b13a082f1aae8befbba7342d9286c93eb72bfefad8d52e9d3571227ac05325d52e3e4194d0ad8ff76ec40293c860479072880c57b369237a2a587c5bf19ea4fc64d14e4d57e7cdcb6487f7fc452d757019daee1c9682"
         #expect(shared.map { String(format: "%02x", $0) }.joined() == expected)
     }
@@ -568,14 +593,13 @@ extension Data {
         #expect(decoded?.ackNr == 10)
     }
 
-    @Test func extensionBitsThenSackRoundTrips() {
-        let bits: [UInt8] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02]
-        var packet = UTP.Packet(type: .state, connectionID: 5, timestamp: 0, replyMicro: 0, windowSize: 10, seqNr: 1, ackNr: 2)
-        packet.extensionBits = bits
-        packet.sack = [0x03]
-        let decoded = UTP.decode(UTP.encode(packet))
-        #expect(decoded?.extensionBits == bits)
+    @Test func decodeSkipsUnknownExtensionBeforeSack() {
+        var raw = UTP.encode(UTP.Packet(type: .state, connectionID: 5, timestamp: 0, replyMicro: 0, windowSize: 10, seqNr: 1, ackNr: 2, payload: Data([0x42])))
+        raw[1] = 2
+        raw.insert(contentsOf: [1, 8, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02, 0, 1, 0x03], at: UTP.headerSize)
+        let decoded = UTP.decode(raw)
         #expect(decoded?.sack == [0x03])
+        #expect(decoded?.payload == Data([0x42]))
     }
 
     @Test func seqWrapAround() {
@@ -589,20 +613,19 @@ extension Data {
         #expect(!UTPConnection.seqGT(0xFF00, 0x0010))
     }
 
-    @Test func receiveFromReportsLoopbackAddress() throws {
+    @Test func receiveReportsLoopbackSender() throws {
         let receiver = try UDPSocket()
         try receiver.bind(port: 0)
         let port = receiver.localPort
         let sender = try UDPSocket()
         try sender.bind(port: 0)
-        try sender.send(Data([1, 2, 3]), to: "127.0.0.1", port: port)
-        guard let received = try receiver.receiveFrom(timeout: 2) else {
+        try sender.send(Data([1, 2, 3]), to: PeerAddress(host: "127.0.0.1", port: port))
+        guard let received = try receiver.receive(timeout: 2) else {
             Issue.record("no datagram received")
             return
         }
         #expect(received.data == Data([1, 2, 3]))
-        #expect(received.host == "127.0.0.1")
-        #expect(received.port == sender.localPort)
+        #expect(received.sender == PeerAddress(host: "127.0.0.1", port: sender.localPort))
     }
 
     @Test func loopbackHandshakeEcho() async throws {
@@ -611,9 +634,8 @@ extension Data {
         let serverPort = serverSocket.localPort
 
         let serverTransport = UTPTransport(socket: serverSocket) { connection, _ in
-            let stream = UTPStream(connection: connection)
-            if let data = try? await stream.read(exactly: 5) {
-                try? await stream.send(data)
+            if let data = try? await connection.read(exactly: 5) {
+                try? await connection.send(data)
             }
         }
         await serverTransport.start()
@@ -628,7 +650,7 @@ extension Data {
         // Initiator: recv = seed, send = seed + 1.
         #expect(connection.sendID == connection.recvID &+ 1)
         try await connection.startAsInitiator(timeout: .seconds(3))
-        _ = try await connection.write(Data("hello".utf8))
+        try await connection.send(Data("hello".utf8))
         let echo = try await connection.read(exactly: 5)
         #expect(String(decoding: echo, as: UTF8.self) == "hello")
     }
@@ -652,7 +674,7 @@ extension Data {
                 // Tell the continuation the initiator's recvID (the seed carried in the SYN).
                 // The responder's callback already fired with (recvID, sendID, 0).
                 _ = connection
-                await connection.close()
+                connection.close()
                 await clientTransport.stop()
                 await transport.stop()
             }
@@ -908,5 +930,106 @@ private actor StartupGateProbe {
             }
         }
         #expect(threw)
+    }
+}
+
+@Suite struct TransportTests {
+    @Test func byteOrderReadsRespectSliceStartIndex() {
+        let slice = Data([0xFF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0])[1...]
+        #expect(slice.readUInt16BE(at: 0) == 0x1234)
+        #expect(slice.readUInt32BE(at: 0) == 0x1234_5678)
+        #expect(slice.readUInt64BE(at: 0) == 0x1234_5678_9ABC_DEF0)
+    }
+
+    @Test func compactPeersParseSlicesAndDropPortZero() {
+        let data = Data([0xAA, 10, 0, 0, 1, 0x1A, 0xE1, 10, 0, 0, 2, 0, 0, 10, 0, 0, 3])
+        let peers = PeerAddress.parseCompact(data.dropFirst())
+        #expect(peers == [PeerAddress(host: "10.0.0.1", port: 6881)])
+        #expect(PeerAddress.encodeCompact(peers + [PeerAddress(host: "not-an-ip", port: 1)]) == Data([10, 0, 0, 1, 0x1A, 0xE1]))
+    }
+
+    @Test func httpTrackerFailureReasonThrows() {
+        let body = Bencode.encode(.dictionary(["failure reason": .string(Data("unregistered torrent".utf8))]))
+        #expect(throws: TrackerError.self) { try HTTPTrackerClient.parseResponse(body) }
+    }
+
+    @Test func httpTrackerParsesCompactPeers() throws {
+        let body = Bencode.encode(.dictionary([
+            "interval": .int(900),
+            "peers": .string(Data([127, 0, 0, 1, 0x1A, 0xE1, 127, 0, 0, 2, 0, 0])),
+        ]))
+        let response = try HTTPTrackerClient.parseResponse(body)
+        #expect(response.interval == 900)
+        #expect(response.peers == [PeerAddress(host: "127.0.0.1", port: 6881)])
+    }
+
+    @Test func listenerAcceptUnblocksOnClose() async throws {
+        let listener = try TCPListener(port: 0, loopbackOnly: true)
+        let accepting = Task { try await BlockingIO.run(name: "test-accept") { try listener.accept() } }
+        try await Task.sleep(for: .milliseconds(100))
+        listener.close()
+        await #expect(throws: SocketError.self) { try await accepting.value }
+    }
+
+    @Test func datagramStreamFinishesOnClose() async throws {
+        let socket = try UDPSocket()
+        try socket.bind(port: 0)
+        let receiving = Task {
+            var count = 0
+            for await _ in socket.datagrams(name: "test-datagrams") { count += 1 }
+            return count
+        }
+        let sender = try UDPSocket()
+        try sender.send(Data([1]), to: PeerAddress(host: "127.0.0.1", port: socket.localPort))
+        try await Task.sleep(for: .milliseconds(200))
+        socket.close()
+        #expect(await receiving.value == 1)
+    }
+
+    @Test func peerStreamCloseFailsPendingRead() async throws {
+        let listener = try TCPListener(port: 0, loopbackOnly: true)
+        defer { listener.close() }
+        let stream = try PeerStream()
+        try await stream.connect(host: "127.0.0.1", port: listener.port, timeout: 2)
+        let server = PeerStream(fd: try listener.accept())
+        defer { server.close() }
+        let reading = Task { try await stream.read(exactly: 4) }
+        try await Task.sleep(for: .milliseconds(100))
+        stream.close()
+        await #expect(throws: PeerStreamError.self) { try await reading.value }
+    }
+
+    @Test func mseHandshakeEncryptsConcurrentSendsInOrder() async throws {
+        let listener = try TCPListener(port: 0, loopbackOnly: true)
+        defer { listener.close() }
+        let infoHash = Data(repeating: 0x5A, count: 20)
+        let initiator = try PeerStream()
+        try await initiator.connect(host: "127.0.0.1", port: listener.port, timeout: 2)
+        let responder = PeerStream(fd: try listener.accept())
+        defer {
+            initiator.close()
+            responder.close()
+        }
+
+        async let initiatorMethod = MSEHandshake.initiate(stream: initiator, infoHash: infoHash)
+        async let responderMethod = MSEHandshake.respond(stream: responder, infoHash: infoHash)
+        #expect(try await initiatorMethod == .rc4)
+        #expect(try await responderMethod == .rc4)
+
+        let messages = (0..<64).map { Data(repeating: UInt8($0), count: 300) }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for message in messages {
+                group.addTask { try await initiator.send(message) }
+            }
+            try await group.waitForAll()
+        }
+        var received = Set<Data>()
+        for _ in messages {
+            received.insert(try await responder.read(exactly: 300))
+        }
+        #expect(received == Set(messages))
+
+        try await responder.send(Data("pong".utf8))
+        #expect(try await initiator.read(exactly: 4) == Data("pong".utf8))
     }
 }

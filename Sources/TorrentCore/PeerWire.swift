@@ -77,34 +77,32 @@ public enum PeerMessage: Equatable, Sendable {
         case .choke, .unchoke, .interested, .notInterested, .haveAll, .haveNone:
             break
         case .have(let index):
-            payload.appendInt32(index)
+            payload.appendUInt32BE(UInt32(truncatingIfNeeded: index))
         case .bitfield(let bits):
             payload.append(bits)
         case .request(let block), .cancel(let block):
-            payload.appendInt32(block.index)
-            payload.appendInt32(block.begin)
-            payload.appendInt32(block.length)
+            payload.appendUInt32BE(UInt32(truncatingIfNeeded: block.index))
+            payload.appendUInt32BE(UInt32(truncatingIfNeeded: block.begin))
+            payload.appendUInt32BE(UInt32(truncatingIfNeeded: block.length))
         case .piece(let block, let data):
-            payload.appendInt32(block.index)
-            payload.appendInt32(block.begin)
+            payload.appendUInt32BE(UInt32(truncatingIfNeeded: block.index))
+            payload.appendUInt32BE(UInt32(truncatingIfNeeded: block.begin))
             payload.append(data)
         case .port(let port):
-            payload.append(contentsOf: [UInt8(port >> 8), UInt8(port & 0xFF)])
+            payload.appendUInt16BE(port)
         case .extended(let extendedID, let data):
             payload.append(extendedID)
             payload.append(data)
         }
         var frame = Data()
-        frame.appendUInt32(UInt32(payload.count))
+        frame.appendUInt32BE(UInt32(payload.count))
         frame.append(payload)
         return frame
     }
 
-    /// Decodes one message from a length-prefixed frame. `length` is the 4-byte big-endian
-    /// prefix (the payload byte count); `body` must contain exactly `length` bytes.
     public static func decode(length: Int, body: Data) throws -> PeerMessage {
         guard body.count == length else { throw PeerWireError.wrongLength }
-        guard length > 0 else { throw PeerWireError.unknownMessage } // keepalive
+        guard length > 0 else { throw PeerWireError.unknownMessage }
         guard let id = PeerMessageID(rawValue: body[0]) else {
             throw PeerWireError.unknownMessage
         }
@@ -116,7 +114,7 @@ public enum PeerMessage: Equatable, Sendable {
         case .notInterested: return .notInterested
         case .have:
             guard payload.count == 4 else { throw PeerWireError.unknownMessage }
-            return .have(payload.int32(at: 0))
+            return .have(Int(payload.readUInt32BE(at: 0)))
         case .bitfield:
             return .bitfield(Data(payload))
         case .haveAll:
@@ -127,16 +125,15 @@ public enum PeerMessage: Equatable, Sendable {
             return .haveNone
         case .request, .cancel:
             guard payload.count == 12 else { throw PeerWireError.unknownMessage }
-            let block = Block(index: payload.int32(at: 0), begin: payload.int32(at: 4), length: payload.int32(at: 8))
+            let block = Block(index: Int(payload.readUInt32BE(at: 0)), begin: Int(payload.readUInt32BE(at: 4)), length: Int(payload.readUInt32BE(at: 8)))
             return id == .request ? .request(block) : .cancel(block)
         case .piece:
             guard payload.count >= 8 else { throw PeerWireError.unknownMessage }
-            let block = Block(index: payload.int32(at: 0), begin: payload.int32(at: 4), length: payload.count - 8)
+            let block = Block(index: Int(payload.readUInt32BE(at: 0)), begin: Int(payload.readUInt32BE(at: 4)), length: payload.count - 8)
             return .piece(block, Data(payload.dropFirst(8)))
         case .port:
             guard payload.count == 2 else { throw PeerWireError.unknownMessage }
-            let port = (UInt16(payload[0]) << 8) | UInt16(payload[1])
-            return .port(port)
+            return .port(payload.readUInt16BE(at: 0))
         case .extended:
             guard payload.count >= 1 else { throw PeerWireError.unknownMessage }
             return .extended(payload[0], Data(payload.dropFirst()))
@@ -150,7 +147,7 @@ public struct Handshake: Equatable, Sendable {
     public let peerID: Data
 
     public static let protocolString = "BitTorrent protocol"
-    public static let length = 1 + 19 + 8 + 20 + 20 // 68
+    public static let length = 1 + 19 + 8 + 20 + 20
 
     public var supportsExtensions: Bool {
         reserved.count == 8 && (reserved[5] & 0x10) != 0
@@ -195,26 +192,5 @@ public struct Handshake: Equatable, Sendable {
         let infoHash = data.subdata(in: (1 + pstrlen + 8)..<(1 + pstrlen + 8 + 20))
         let peerID = data.subdata(in: (1 + pstrlen + 8 + 20)..<(1 + pstrlen + 8 + 20 + 20))
         return Handshake(reserved: reserved, infoHash: infoHash, peerID: peerID)
-    }
-}
-
-extension Data {
-    mutating func appendInt32(_ value: Int) {
-        appendUInt32(UInt32(truncatingIfNeeded: value))
-    }
-
-    mutating func appendUInt32(_ value: UInt32) {
-        var big = value.bigEndian
-        Swift.withUnsafeBytes(of: &big) { append(contentsOf: $0) }
-    }
-}
-
-extension Data {
-    /// Big-endian int32 at `offset`, safe for Data slices (uses `startIndex`-relative indexing).
-    func int32(at offset: Int) -> Int {
-        guard offset >= 0, offset + 4 <= count else { return 0 }
-        let base = startIndex + offset
-        let b0 = self[base], b1 = self[base + 1], b2 = self[base + 2], b3 = self[base + 3]
-        return Int(UInt32(b0) << 24 | UInt32(b1) << 16 | UInt32(b2) << 8 | UInt32(b3))
     }
 }
