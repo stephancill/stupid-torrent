@@ -22,6 +22,11 @@ let package = Package(
             name: "StupidClientCore",
             targets: ["StupidClientCore"]
         ),
+        // SwiftUI screens shared by the iOS and tvOS apps (search, delete confirmation).
+        .library(
+            name: "StupidClientUI",
+            targets: ["StupidClientUI"]
+        ),
         .executable(
             name: "torrent-cli",
             targets: ["torrent-cli"]
@@ -44,9 +49,14 @@ let package = Package(
             dependencies: ["TorrentCore", "Streaming"]
         ),
         .target(
+            name: "StupidClientUI",
+            dependencies: ["StupidClientCore"]
+        ),
+        .target(
             name: "stupid_torrent_client",
             dependencies: [
                 "StupidClientCore",
+                "StupidClientUI",
             ]
         ),
         .executableTarget(

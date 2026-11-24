@@ -4,6 +4,7 @@ import AVFoundation
 import TorrentCore
 import Streaming
 import StupidClientCore
+import StupidClientUI
 
 struct ContentView: View {
     @State private var store = TorrentStore()
@@ -83,7 +84,9 @@ struct ContentView: View {
                     TorrentLibraryView(store: store)
                 }
                 Tab("Search", systemImage: "magnifyingglass", role: .search) {
-                    TorrentSearchView(store: store)
+                    TorrentSearchView(store: store) { item in
+                        TorrentDetailView(item: item, store: store)
+                    }
                 }
             }
         } else {
@@ -92,7 +95,9 @@ struct ContentView: View {
                     .tabItem {
                         Label("Torrents", systemImage: "arrow.down.circle")
                     }
-                TorrentSearchView(store: store)
+                TorrentSearchView(store: store) { item in
+                    TorrentDetailView(item: item, store: store)
+                }
                     .tabItem {
                         Label("Search", systemImage: "magnifyingglass")
                     }
@@ -501,26 +506,6 @@ private struct TorrentDetailMenu: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(magnet, forType: .string)
         #endif
-    }
-}
-
-extension View {
-    func deleteTorrentAlert(item: Binding<TorrentItem?>, onDelete: @escaping (TorrentItem) -> Void) -> some View {
-        alert(
-            "Delete \u{201C}\(item.wrappedValue?.name ?? "")\u{201D}?",
-            isPresented: Binding(
-                get: { item.wrappedValue != nil },
-                set: { if !$0 { item.wrappedValue = nil } }
-            ),
-            presenting: item.wrappedValue
-        ) { pending in
-            Button("Cancel", role: .cancel) {}
-            Button("Delete Torrent", role: .destructive) {
-                onDelete(pending)
-            }
-        } message: { _ in
-            Text("This stops the torrent and deletes its downloaded files from this device.")
-        }
     }
 }
 

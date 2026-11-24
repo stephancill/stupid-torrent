@@ -23,6 +23,7 @@ let package = Package(
             name: "StupidTorrentTV",
             dependencies: [
                 .product(name: "StupidClientCore", package: "stupid-torrent-client"),
+                .product(name: "StupidClientUI", package: "stupid-torrent-client"),
             ]
         ),
     ]

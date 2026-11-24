@@ -1,5 +1,5 @@
-import SwiftUI
 import StupidClientCore
+import SwiftUI
 
 struct TorrentStreamsRequest: Hashable {
     let title: String
@@ -8,24 +8,59 @@ struct TorrentStreamsRequest: Hashable {
     let mediaID: String
 }
 
-struct TorrentSearchView: View {
+#if DEBUG
+/// Launch arguments for screenshotting without input: `-SearchQuery <text>` prefills the query and
+/// `-SearchOpenFirst` opens the first result; `-SearchOpenEpisode` also opens a show's first episode.
+private enum SearchDebug {
+    static var query: String {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-SearchQuery"), index + 1 < arguments.count else { return "" }
+        return arguments[index + 1]
+    }
+
+    static var opensFirst: Bool { opensEpisode || ProcessInfo.processInfo.arguments.contains("-SearchOpenFirst") }
+
+    static var opensEpisode: Bool { ProcessInfo.processInfo.arguments.contains("-SearchOpenEpisode") }
+}
+#endif
+
+#if os(tvOS)
+private let resultPosterWidth: CGFloat = 240
+private let headerPosterWidth: CGFloat = 120
+#else
+private let resultPosterWidth: CGFloat = 44
+private let headerPosterWidth: CGFloat = 72
+#endif
+
+/// Searches Cinemeta for movies and shows, then lists Torrentio streams to add. `detail` builds the
+/// screen pushed when an already-added stream is selected.
+public struct TorrentSearchView<Detail: View>: View {
     let store: TorrentStore
+    let detail: (TorrentItem) -> Detail
 
     @State private var query = ""
+    @State private var path = NavigationPath()
     @State private var results = MediaSearchResults.empty
     @State private var isSearching = false
     @State private var searchError: String?
 
     private let cinemeta = CinemetaClient()
 
+    public init(store: TorrentStore, @ViewBuilder detail: @escaping (TorrentItem) -> Detail) {
+        self.store = store
+        self.detail = detail
+    }
+
     private var trimmedQuery: String {
         query.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    var body: some View {
-        NavigationStack {
+    public var body: some View {
+        NavigationStack(path: $path) {
             content
+                #if !os(tvOS)
                 .navigationTitle("Search")
+                #endif
                 .navigationDestination(for: MediaSearchResult.self) { result in
                     if result.kind == .series {
                         SeriesEpisodesView(result: result, store: store)
@@ -45,9 +80,10 @@ struct TorrentSearchView: View {
                     TorrentStreamsView(request: request, store: store)
                 }
                 .navigationDestination(for: TorrentItem.self) { item in
-                    TorrentDetailView(item: item, store: store)
+                    detail(item)
                 }
                 .searchable(text: $query, prompt: "Movies and TV shows")
+                #if !os(tvOS)
                 .toolbar {
                     if isSearching && !results.isEmpty {
                         ToolbarItem {
@@ -55,9 +91,21 @@ struct TorrentSearchView: View {
                         }
                     }
                 }
+                #endif
                 .task(id: trimmedQuery) {
                     await search()
                 }
+                #if DEBUG
+                .onAppear {
+                    if query.isEmpty { query = SearchDebug.query }
+                }
+                .onChange(of: results) { _, results in
+                    if SearchDebug.opensFirst, path.isEmpty,
+                       let first = results.sections(query: trimmedQuery).first?.results.first {
+                        path.append(first)
+                    }
+                }
+                #endif
         }
     }
 
@@ -80,25 +128,56 @@ struct TorrentSearchView: View {
                 }
             }
         } else if isSearching && results.isEmpty {
-            ProgressView()
-                .controlSize(.large)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            LoadingView()
         } else if results.isEmpty {
             ContentUnavailableView.search(text: trimmedQuery)
         } else {
-            List {
+            resultsView
+        }
+    }
+
+    #if os(tvOS)
+    private var resultsView: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 48) {
                 ForEach(results.sections(query: trimmedQuery)) { section in
-                    Section(section.title) {
-                        ForEach(section.results) { result in
-                            NavigationLink(value: result) {
-                                MediaResultRow(result: result)
+                    VStack(alignment: .leading, spacing: 24) {
+                        Text(section.title)
+                            .font(.headline)
+                            .foregroundStyle(.secondary)
+                        ScrollView(.horizontal) {
+                            LazyHStack(alignment: .top, spacing: 48) {
+                                ForEach(section.results) { result in
+                                    NavigationLink(value: result) {
+                                        MediaLockup(result: result)
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
                             }
+                            .padding(.vertical, 32)
+                        }
+                        .scrollClipDisabled()
+                    }
+                }
+            }
+            .padding(.horizontal, 80)
+        }
+    }
+    #else
+    private var resultsView: some View {
+        List {
+            ForEach(results.sections(query: trimmedQuery)) { section in
+                Section(section.title) {
+                    ForEach(section.results) { result in
+                        NavigationLink(value: result) {
+                            MediaResultRow(result: result)
                         }
                     }
                 }
             }
         }
     }
+    #endif
 
     private func search(debounce: Bool = true) async {
         let query = trimmedQuery
@@ -129,6 +208,16 @@ struct TorrentSearchView: View {
     }
 }
 
+private struct LoadingView: View {
+    var body: some View {
+        ProgressView()
+            #if !os(tvOS)
+            .controlSize(.large)
+            #endif
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
 private struct PosterImage: View {
     let url: URL?
     let width: CGFloat
@@ -143,16 +232,36 @@ private struct PosterImage: View {
                 .fill(.quaternary)
         }
         .frame(width: width, height: width * 1.5)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .clipShape(RoundedRectangle(cornerRadius: width > 100 ? 12 : 6))
     }
 }
 
+#if os(tvOS)
+private struct MediaLockup: View {
+    let result: MediaSearchResult
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            PosterImage(url: result.posterURL, width: resultPosterWidth)
+                .hoverEffect(.highlight)
+            Text(result.name)
+                .lineLimit(1)
+            if let year = result.year, !year.isEmpty {
+                Text(year)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: resultPosterWidth, alignment: .leading)
+    }
+}
+#else
 private struct MediaResultRow: View {
     let result: MediaSearchResult
 
     var body: some View {
         HStack(spacing: 12) {
-            PosterImage(url: result.posterURL, width: 44)
+            PosterImage(url: result.posterURL, width: resultPosterWidth)
             VStack(alignment: .leading, spacing: 3) {
                 Text(result.name)
                 if let year = result.year, !year.isEmpty {
@@ -164,6 +273,7 @@ private struct MediaResultRow: View {
         }
     }
 }
+#endif
 
 private struct SeriesEpisodesView: View {
     let result: MediaSearchResult
@@ -171,6 +281,7 @@ private struct SeriesEpisodesView: View {
 
     @State private var info: SeriesInfo?
     @State private var seasonNumber = 1
+    @State private var debugEpisode: TorrentStreamsRequest?
     @State private var isLoading = true
     @State private var error: String?
 
@@ -181,9 +292,7 @@ private struct SeriesEpisodesView: View {
             if let info {
                 episodesList(info)
             } else if isLoading {
-                ProgressView()
-                    .controlSize(.large)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                LoadingView()
             } else {
                 ContentUnavailableView {
                     Label("Could Not Load Episodes", systemImage: "exclamationmark.triangle")
@@ -200,20 +309,31 @@ private struct SeriesEpisodesView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
+        #if !os(tvOS)
         .toolbar {
             if let info, info.seasons.count > 1 {
                 ToolbarItem {
-                    Picker("Season", selection: $seasonNumber) {
-                        ForEach(info.seasons) { season in
-                            Text(season.title).tag(season.number)
-                        }
-                    }
-                    .pickerStyle(.menu)
+                    seasonPicker(info)
+                        .pickerStyle(.menu)
                 }
             }
         }
+        #endif
         .task {
             await load()
+        }
+        #if DEBUG
+        .navigationDestination(item: $debugEpisode) { request in
+            TorrentStreamsView(request: request, store: store)
+        }
+        #endif
+    }
+
+    private func seasonPicker(_ info: SeriesInfo) -> some View {
+        Picker("Season", selection: $seasonNumber) {
+            ForEach(info.seasons) { season in
+                Text(season.title).tag(season.number)
+            }
         }
     }
 
@@ -221,16 +341,16 @@ private struct SeriesEpisodesView: View {
         List {
             Section {
                 SeriesHeader(info: info)
+                #if os(tvOS)
+                if info.seasons.count > 1 {
+                    seasonPicker(info)
+                }
+                #endif
             }
             if let season = info.seasons.first(where: { $0.number == seasonNumber }) {
                 Section(season.title) {
                     ForEach(season.episodes) { episode in
-                        NavigationLink(value: TorrentStreamsRequest(
-                            title: episode.name,
-                            subtitle: "\(info.name) · S\(season.number)E\(episode.number)",
-                            kind: .series,
-                            mediaID: episode.id
-                        )) {
+                        NavigationLink(value: streamsRequest(show: info, season: season, episode: episode)) {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("\(episode.number). \(episode.name)")
                                     .lineLimit(1)
@@ -248,6 +368,15 @@ private struct SeriesEpisodesView: View {
         }
     }
 
+    private func streamsRequest(show: SeriesInfo, season: SeriesSeason, episode: SeriesEpisode) -> TorrentStreamsRequest {
+        TorrentStreamsRequest(
+            title: episode.name,
+            subtitle: "\(show.name) · S\(season.number)E\(episode.number)",
+            kind: .series,
+            mediaID: episode.id
+        )
+    }
+
     private func load() async {
         guard info == nil else { return }
         isLoading = true
@@ -261,6 +390,11 @@ private struct SeriesEpisodesView: View {
             } else {
                 info = fetched
                 seasonNumber = fetched.seasons.first?.number ?? 1
+                #if DEBUG
+                if SearchDebug.opensEpisode, let season = fetched.seasons.first, let episode = season.episodes.first {
+                    debugEpisode = streamsRequest(show: fetched, season: season, episode: episode)
+                }
+                #endif
             }
         } catch is CancellationError {
             return
@@ -276,7 +410,7 @@ private struct SeriesHeader: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            PosterImage(url: info.posterURL, width: 72)
+            PosterImage(url: info.posterURL, width: headerPosterWidth)
             VStack(alignment: .leading, spacing: 4) {
                 if let year = info.year, !year.isEmpty {
                     Text(year)
@@ -316,9 +450,7 @@ private struct TorrentStreamsView: View {
     var body: some View {
         Group {
             if isLoading {
-                ProgressView()
-                    .controlSize(.large)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                LoadingView()
             } else if let error {
                 ContentUnavailableView {
                     Label("Could Not Load Torrents", systemImage: "exclamationmark.triangle")
@@ -337,6 +469,12 @@ private struct TorrentStreamsView: View {
                 )
             } else {
                 List {
+                    #if os(tvOS)
+                    if let subtitle = request.subtitle {
+                        Text(subtitle)
+                            .foregroundStyle(.secondary)
+                    }
+                    #endif
                     let groups = groups
                     if groups.count > 1 {
                         ForEach(groups, id: \.resolution) { group in
@@ -355,15 +493,15 @@ private struct TorrentStreamsView: View {
             }
         }
         .navigationTitle(request.title)
-        .navigationSubtitle(request.subtitle ?? "")
         #if os(iOS)
+        .navigationSubtitle(request.subtitle ?? "")
         .navigationBarTitleDisplayMode(.inline)
+        .sensoryFeedback(.success, trigger: addedCount)
         #endif
         .task {
             guard !hasLoaded else { return }
             await load()
         }
-        .sensoryFeedback(.success, trigger: addedCount)
         .alert("Could Not Add Torrent", isPresented: Binding(
             get: { addError != nil },
             set: { if !$0 { addError = nil } }
@@ -389,9 +527,12 @@ private struct TorrentStreamsView: View {
                 } label: {
                     TorrentioStreamRow(stream: stream, request: request, state: .available)
                 }
+                #if !os(tvOS)
                 .buttonStyle(.plain)
+                #endif
             }
         }
+        #if !os(tvOS)
         .contextMenu {
             Button {
                 copyToClipboard(stream.magnetLink())
@@ -399,6 +540,7 @@ private struct TorrentStreamsView: View {
                 Label("Copy Magnet", systemImage: "link")
             }
         }
+        #endif
     }
 
     private func add(_ stream: TorrentioStream) {
@@ -472,7 +614,9 @@ private struct TorrentioStreamRow: View {
                         .lineLimit(1)
                 }
             }
+            #if !os(tvOS)
             .alignmentGuide(.listRowSeparatorLeading) { _ in 0 }
+            #endif
             Spacer(minLength: 8)
             switch state {
             case .available:
@@ -502,6 +646,7 @@ private struct TorrentioStreamRow: View {
     }
 }
 
+#if !os(tvOS)
 private func copyToClipboard(_ string: String) {
     #if os(iOS)
     UIPasteboard.general.string = string
@@ -510,3 +655,4 @@ private func copyToClipboard(_ string: String) {
     NSPasteboard.general.setString(string, forType: .string)
     #endif
 }
+#endif

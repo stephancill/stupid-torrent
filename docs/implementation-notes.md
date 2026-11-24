@@ -1205,3 +1205,32 @@ Most of these edits were already swept into `f91f47a`; this entry documents them
 - `TorrentioStream.magnetName` is the magnet `dn`. Multi-episode packs use the release name (with a
   trailing "…" stripped). Other streams keep the file name. Because `dn` becomes
   `Metainfo.displayName`, a pack used to appear in the library under a single episode's file name.
+
+## 2026-11-24 — Search on Apple TV and tvOS design fixes
+
+- New `StupidClientUI` target and library product, which the iOS app and `TV/` both depend on. It
+  holds the search screens (moved from the app target) and `deleteTorrentAlert`. The search view is
+  now `TorrentSearchView(store:detail:)`; the host passes the torrent detail screen that an
+  already-added stream opens.
+- On tvOS, results are horizontal poster rows (`MediaLockup`: borderless `NavigationLink`, poster
+  with `.hoverEffect(.highlight)`), one row each for "TV Shows" and "Movies". The season picker is
+  inline (it renders as a segmented control) instead of a toolbar menu. The streams list shows the
+  show/episode line as a row, since tvOS has no navigation subtitle. Copy Magnet, haptics, row
+  separators and `controlSize` are iOS-only.
+- The TV app is a `TabView` with Torrents and Search (`role: .search`) tabs. Library changes:
+  - An empty state with an "Add Magnet Link" action.
+  - "In Progress" and "Completed" sections.
+  - Row status reads "12% · ETA 4m", "Paused · 12%", "Connecting" or the total size, instead of
+    four double-spaced values.
+  - Add Magnet Link is pushed in the library stack instead of being a full-screen cover, which
+    rendered transparent over the tab bar. It is a standard list (field, Add Torrent, an iPhone
+    keyboard footer and "Free Films"), with no echoed link and one size per group.
+- TV detail: Files come first, then Status (whole-number progress, no piece count), then a separate
+  actions section. Delete uses the shared centered alert instead of an action sheet.
+- DEBUG launch arguments for screenshots without a remote: `-SearchQuery <text>` (the TV app opens
+  the Search tab), `-SearchOpenFirst` and `-SearchOpenEpisode`. On Xcode 27, `stupidsim` cannot
+  send remote input to tvOS simulators, and there is no Simulator.app to drive.
+
+Verified on a temporary Apple TV simulator: empty library, search results, series with season
+picker, streams, Add Magnet Link, library and detail. The delete alert and focus states were not
+exercised, because there is no remote input. The iOS search flow was re-checked after the move.

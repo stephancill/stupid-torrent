@@ -59,6 +59,8 @@ Package.swift (swift-tools 6.0; platforms: iOS 26 / macOS 14)
 ├─ target   Bencode                    (pure Swift)
 ├─ target   TorrentCore                (pure Swift; the engine, dependency-free)
 ├─ target   Streaming                  (AVFoundation/AVKit; player feeding)
+├─ target   StupidClientCore           (store, search clients, formatting; shared with TV/)
+├─ target   StupidClientUI             (SwiftUI screens shared by iOS and tvOS: search, delete alert)
 ├─ target   StupidTorrentClientApp     (SwiftUI @main)
 └─ target   torrent-cli                (Swift, macOS harness)
 ```
