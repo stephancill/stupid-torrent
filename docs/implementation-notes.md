@@ -1106,3 +1106,33 @@ up in the library; "the matrix" lists movie streams with seeders/size/provider.
 
 Known limitation: a season-pack stream adds the whole torrent (the engine has no per-file
 selection yet); the row names the file Torrentio would play.
+
+## 2026-11-24 — Search and library design audit fixes
+
+Audited the Search tab and library against the Stupid iOS design rules and fixed what it found.
+Most of these edits were already swept into `f91f47a`; this entry documents them.
+
+- Streams list: file names render on one line with middle truncation (iOS was hyphenating dotted
+  release names), row separators run full width, and each row is one accessibility element (VoiceOver
+  had read the seeder count three times). Each row has a trailing download icon. While the magnet
+  resolves the row shows a spinner; once added it links to `TorrentDetailView`, pushed in the Search
+  stack. Adding plays a success haptic. Rows are grouped by resolution (4K / 1080p / 720p / 480p /
+  Other) when there is more than one. The title is the episode name, with show and SxEy as the
+  navigation subtitle. Streams load once, so popping back from the detail view does not refetch.
+- `TorrentioStream.size` (raw string) became `sizeBytes` (Torrentio uses 1024-based units, so
+  "263.34 MB" is 276,134,947 B) and is formatted with `byteString`, the same as the library.
+  `releaseName`, `resolution`, `isEpisodePack` and `isMultiSeasonPack` were added. A pack is a
+  release whose name has no SxxEyy marker while its listed file has one. Rows label these
+  "Season pack" / "Multi-season pack" because adding one downloads the whole torrent.
+- Search results: `CinemetaClient.search` returns `MediaSearchResults`, shown as "TV Shows" and
+  "Movies" sections instead of interleaved. The section whose top result best matches the query
+  comes first. Rows show name and year. A toolbar spinner shows while a query is refined. The empty
+  state is "Find Movies & TV".
+- Series: a poster/year/overview header, and the season picker moved to a toolbar menu.
+- Tabs use `Tab(role: .search)` on iOS 18+/macOS 15+. The iOS 27 simulator still renders it as an
+  ordinary tab with a top search field.
+- Library: swipe-to-delete and the detail menu both confirm with a centered `.alert`
+  (`deleteTorrentAlert`, "Delete Torrent", stating the downloaded files are deleted). This replaces
+  the unconfirmed swipe and the action-sheet `confirmationDialog`. "Completed" uses the native
+  `Section(isExpanded:)` with `.listStyle(.sidebar)`. The Add sheet is titled "Add Torrent" and has a
+  Cancel button. `PieProgressView` fills with the tint instead of hard-coded blue.

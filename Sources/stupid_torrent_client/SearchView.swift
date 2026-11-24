@@ -442,7 +442,7 @@ private struct TorrentioStreamRow: View {
     private var details: String {
         var parts: [String] = []
         if request.kind == .series && stream.isEpisodePack {
-            parts.append("Season pack")
+            parts.append(stream.isMultiSeasonPack ? "Multi-season pack" : "Season pack")
         }
         if let seeders = stream.seeders {
             parts.append(seeders == 1 ? "1 seeder" : "\(seeders) seeders")

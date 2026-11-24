@@ -180,6 +180,12 @@ public struct TorrentioStream: Identifiable, Hashable, Sendable {
         return !Self.hasEpisodeMarker(releaseName) && Self.hasEpisodeMarker(displayName)
     }
 
+    /// True for packs spanning several seasons, e.g. "S01-S09" or "Season 1-9".
+    public var isMultiSeasonPack: Bool {
+        guard isEpisodePack, let releaseName else { return false }
+        return releaseName.firstMatch(of: /(?i)\bs\d{1,2}\s?-\s?s?\d{1,2}\b|\bseasons?\s?\d{1,2}\s?-\s?\d{1,2}\b|complete series/) != nil
+    }
+
     private static func hasEpisodeMarker(_ value: String) -> Bool {
         value.firstMatch(of: /(?i)s\d{1,2}\s?e\d{1,3}|\b\d{1,2}x\d{2,3}\b/) != nil
     }

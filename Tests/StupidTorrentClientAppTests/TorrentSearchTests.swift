@@ -50,6 +50,7 @@ struct TorrentSearchTests {
         #expect(first.releaseName == "Severance.S01.2160p.WEB-DL")
         #expect(first.resolution == .uhd)
         #expect(first.isEpisodePack)
+        #expect(!first.isMultiSeasonPack)
 
         let second = try #require(streams.last)
         #expect(second.titleLine == "Big Buck Bunny 1080p 30fps")
@@ -155,6 +156,15 @@ struct TorrentSearchTests {
         #expect(!stream.isEpisodePack)
         #expect(stream.sizeBytes == 524_288)
         #expect(stream.resolution == .hd)
+    }
+
+    @Test func detectsMultiSeasonPacks() throws {
+        let json = #"""
+        {"streams":[{"name":"Torrentio\n1080p","title":"The Office (US) (2005) Season 1-9 S01-S09 (1080p BluRay x265)\nSeason 1/The Office (US) (2005) - S01E01 - Pilot.mkv\n👤 399 💾 725.19 MB ⚙️ 1337x","infoHash":"88594aaacbde40ef3e2510c47374ec0aa396c08e","fileIdx":0,"behaviorHints":{"filename":"The Office (US) (2005) - S01E01 - Pilot.mkv"}}]}
+        """#
+        let stream = try #require(try TorrentioClient.parseStreams(from: Data(json.utf8)).first)
+        #expect(stream.isEpisodePack)
+        #expect(stream.isMultiSeasonPack)
     }
 
     @Test func searchSectionsPutTheBestTopMatchFirst() {
