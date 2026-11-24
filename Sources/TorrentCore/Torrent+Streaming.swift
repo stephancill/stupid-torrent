@@ -24,6 +24,11 @@ public extension Torrent {
         let absolute = (fileStart + range.lowerBound)..<(fileStart + range.upperBound)
         let pieces = metainfo.pieceRange(forByteRange: absolute)
         guard !pieces.isEmpty else { return }
+        // The first unverified piece of the window is what the player is blocked on.
+        if let head = pieces.first(where: { !picker.verified[$0] }) {
+            urgentPieces = [head]
+            picker.setPriority(head, level: 20)
+        }
         var progress = 0
         while progress < picker.pieceCount && picker.verified[progress] { progress += 1 }
         let isJump = pieces.lowerBound > progress
@@ -33,6 +38,7 @@ public extension Torrent {
             // older stream windows so sequential seeks do not keep downloading obsolete targets.
             picker.cursor = pieces.lowerBound
             picker.replacePriorities(with: pieces, level: 10)
+            if let head = urgentPieces.first { picker.setPriority(head, level: 20) }
             return
         }
         for piece in pieces {

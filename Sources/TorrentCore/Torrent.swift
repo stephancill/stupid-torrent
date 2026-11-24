@@ -54,12 +54,18 @@ public actor Torrent {
     /// dead peer can serve from flooding every peer's pipeline (which stalls the download).
     private var outstandingCounts: [BlockKey: Int] = [:]
     private let maxMissingRedundancy = 2
+    /// Redundancy for the piece a stream is blocked on: a slow peer holding its blocks must not
+    /// keep playback waiting, so several peers race for its missing blocks.
+    private let maxUrgentRedundancy = 4
     private var pieceFailures: [Int: Int] = [:]
     private let maxPieceFailures = 5
     /// When each active piece last received a block. Pieces that stop making progress are
     /// requeued (stall detection) so their never-arriving blocks get re-requested.
     private var pieceLastProgress: [Int: ContinuousClock.Instant] = [:]
     private let stallTimeout = Duration.seconds(20)
+    /// The stream-blocking piece is requeued much sooner; a trickling peer resets the normal
+    /// 20 s timer indefinitely.
+    private let urgentStallTimeout = Duration.seconds(3)
 
     private var activePeerIDs: Set<UUID> = []
     private var peerSessions: [UUID: PeerSession] = [:]
@@ -101,6 +107,9 @@ public actor Torrent {
     private var firstAnnounce = true
     private var verifiedDirty = false
     var streamingValidatedPieces: Set<Int> = []
+    /// Pieces a stream read is waiting on right now (the first unverified piece of the player's
+    /// window). Served with endgame-style redundancy and a short stall timeout.
+    var urgentPieces: Set<Int> = []
 
     private var downloadedBytes: Int64 = 0
     private var uploadedBytes: Int64 = 0
@@ -377,7 +386,8 @@ public actor Torrent {
             guard !received.contains(offset) else { continue }
             let key = BlockKey(index: piece, begin: offset)
             guard !excluding.contains(key) else { continue }
-            if (outstandingCounts[key] ?? 0) < maxMissingRedundancy {
+            let limit = urgentPieces.contains(piece) ? maxUrgentRedundancy : maxMissingRedundancy
+            if (outstandingCounts[key] ?? 0) < limit {
                 return Block(index: piece, begin: offset, length: min(PeerMessage.blockSize, pieceLength - offset))
             }
         }
@@ -498,6 +508,7 @@ public actor Torrent {
         picker.markVerified(piece)
         await storage.markVerified(piece)
         activePieces.remove(piece)
+        urgentPieces.remove(piece)
         receivedBlocks.removeValue(forKey: piece)
         pieceReceivedBytes.removeValue(forKey: piece)
         pieceBlockCursor.removeValue(forKey: piece)
@@ -1032,7 +1043,8 @@ public actor Torrent {
                 pieceLastProgress[piece] = now
                 continue
             }
-            if now - lastProgress >= stallTimeout {
+            let timeout = urgentPieces.contains(piece) ? urgentStallTimeout : stallTimeout
+            if now - lastProgress >= timeout {
                 TorrentLog.log("piece \(piece) stalled (\(now - lastProgress) no progress); requeueing")
                 requeueStalledPiece(piece)
             }

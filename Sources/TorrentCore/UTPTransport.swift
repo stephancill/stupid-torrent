@@ -2,14 +2,15 @@ import Foundation
 
 /// Shared UDP transport for all µTP connections. Demuxes incoming datagrams to the right
 /// `UTPConnection` by (remote address, connid), runs a retransmit ticker, and provides the raw
-/// `send` primitive connections use. The receive loop runs on a detached task (not a raw `Thread`)
-/// so it can hop into the actor to dispatch packets — the `UDPSocket` is `@unchecked Sendable`, so
-/// the blocking socket read lives outside the actor's executor.
+/// `send` primitive connections use. The blocking socket read runs on a dedicated `Thread` (never
+/// the cooperative pool, which a permanent blocking loop would starve on a 2-core device) and
+/// hands datagrams, in order, to a task that dispatches them into the actor.
 public actor UTPTransport {
     public let socket: UDPSocket
     private var connections: [UTPConnectionKey: UTPConnection] = [:]
     private var isListening = false
     private var receiveTask: Task<Void, Never>?
+    private var receiveThread: Thread?
     private var tickerTask: Task<Void, Never>?
     /// Called when a remote peer initiates a connection (SYN received). The connection is
     /// pre-registered and the SYNACK already sent; it becomes `.connected` on the first DATA.
@@ -34,8 +35,26 @@ public actor UTPTransport {
     public func start() {
         guard !isListening else { return }
         isListening = true
-        receiveTask = Task.detached(priority: .utility) { [weak self] in
-            await self?.runReceiveLoop()
+        let (datagrams, continuation) = AsyncStream<(data: Data, host: String, port: UInt16)>.makeStream()
+        let socket = socket
+        let thread = Thread {
+            while !Thread.current.isCancelled {
+                do {
+                    guard let received = try socket.receiveFrom(timeout: 1) else { continue }
+                    continuation.yield(received)
+                } catch {
+                    break
+                }
+            }
+            continuation.finish()
+        }
+        thread.name = "utp-receive"
+        receiveThread = thread
+        thread.start()
+        receiveTask = Task { [weak self] in
+            for await received in datagrams {
+                await self?.handleIncoming(received.data, fromHost: received.host, port: received.port)
+            }
         }
         startTicker()
     }
@@ -44,6 +63,8 @@ public actor UTPTransport {
         isListening = false
         tickerTask?.cancel()
         tickerTask = nil
+        receiveThread?.cancel()
+        receiveThread = nil
         receiveTask?.cancel()
         receiveTask = nil
         socket.close()
@@ -87,18 +108,6 @@ public actor UTPTransport {
     private func tick() async {
         for connection in connections.values {
             await connection.nudge()
-        }
-    }
-
-    /// Nonisolated so the blocking `socket.receiveFrom` runs on the detached task, not the actor.
-    private nonisolated func runReceiveLoop() async {
-        while true {
-            do {
-                guard let received = try socket.receiveFrom(timeout: 1) else { continue }
-                await handleIncoming(received.data, fromHost: received.host, port: received.port)
-            } catch {
-                return
-            }
         }
     }
 

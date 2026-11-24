@@ -10,10 +10,21 @@ public final class UDPTrackerClient: TrackerClient, @unchecked Sendable {
     }
 
     public func announce(_ request: AnnounceRequest) async throws -> AnnounceResponse {
+        let host = host
+        let port = port
+        // The exchange blocks on `receive(timeout:)` for up to 5 s per message.
+        return try await BlockingIO.run(name: "udp-tracker") {
+            try Self.announceBlocking(request, host: host, port: port)
+        }
+    }
+
+    private static func announceBlocking(
+        _ request: AnnounceRequest, host: String, port: UInt16
+    ) throws -> AnnounceResponse {
         let socket = try UDPSocket()
         defer { socket.close() }
 
-        let connectTxn = Self.randomTransactionID()
+        let connectTxn = randomTransactionID()
         var connectRequest = Data()
         connectRequest.appendUInt64BE(0x4172_7101_980)
         connectRequest.appendUInt32BE(0) // action connect
@@ -26,7 +37,7 @@ public final class UDPTrackerClient: TrackerClient, @unchecked Sendable {
         }
         let connectionID = connectResponse.readUInt64BE(at: 8)
 
-        let announceTxn = Self.randomTransactionID()
+        let announceTxn = randomTransactionID()
         var announce = Data()
         announce.appendUInt64BE(connectionID)
         announce.appendUInt32BE(1) // action announce
