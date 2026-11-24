@@ -14,7 +14,7 @@ DerivedData/
 /third-party/
 /seeder-cache/
 
-# MobileVLCKit XCFramework (see docs/mkv-streaming.md) — download + repack step
+# MobileVLCKit XCFramework (legacy, VLCKit was removed)
 /Vendor/
 .release/
 

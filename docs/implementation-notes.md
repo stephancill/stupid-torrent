@@ -4,6 +4,60 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-11-24 — Refactor: streaming
+
+HLS is now the only Matroska pipeline, and the dead resource-loader transmux paths are gone.
+
+- **Complete files without usable Cues play through HLS.** When the Cues are missing or invalid
+  and the file is fully verified, `MKVHLSStream` walks the cluster headers (a 16 KiB probe per
+  cluster, grown only when the first primary-track block is further in) and starts a segment at
+  each cluster whose first primary-track block is a keyframe. Duration comes from Info, or from
+  the last cluster's final frame when Info has none. Segments stay capped at 32 MiB. Partial files
+  still need Cues.
+- **Fail loudly.** `TorrentStreamSession.preparePlayer()` throws when a file cannot play (for
+  example a partial MKV without Cues). `makePlayer()` keeps its non-throwing signature for the
+  apps, logs the error and returns an empty `AVPlayer`; the apps should move to `preparePlayer()`
+  and show the error.
+- **Deleted:** `TransmuxStreamSource` (sequential and precomputed sidx modes),
+  `TorrentSeekingPlayer`/`LockedSeekTime`/`PreparedTorrentSeek`, `DeclaredDurationPlayerItem`,
+  `makePlayerItem`, the sidx writer and cluster-layout sizing, `reachesEOF` and
+  `finishesAllToEndAtFrontier`, `Streaming.version`, and the superseded VLCKit/handover docs.
+  The resource loader serves raw bytes for Apple containers only and no longer logs every chunk.
+- **Fix: E-AC-3 and AC-3 audio never decoded.** Every audio track was written as `mp4a`, and
+  Matroska Dolby tracks carry no CodecPrivate, so there was no `dec3`/`dac3` either. AVAssetReader
+  reported `Cannot Decode` for both fixtures. Sample entries are now `ec-3`+`dec3`, `ac-3`+`dac3`
+  and `alac`+`alac` (ETSI TS 102 366 Annex F, ISO/IEC 14496-12), with channel count 2 and sample
+  size 16 for Dolby entries. The config boxes come from CodecPrivate or, when it is absent, from
+  the first audio frame of the first segment (read once during preparation). The syncframe parsers
+  also had bugs: E-AC-3 skipped `numblkscod` (misreading acmod/lfeon/bsid at 48 kHz) and assumed
+  6 blocks per frame for the data rate; AC-3 read `lfeon` without skipping cmixlev/surmixlev/dsurmod
+  and wrote `frmsizecod` instead of `frmsizecod >> 1` as `bit_rate_code`. `bsmod` stays 0 for
+  E-AC-3 (ffmpeg does the same; parsing it needs the full mixing-metadata walk), and dependent
+  substreams (7.1) are not described in `dec3`. New test: both fixtures decode to LPCM with the
+  right channel count.
+- **Parser hardening.** One `EBML.forEachChild(in:range:)` replaces about ten copied element loops
+  and rejects children that overrun their parent. Integer reads check bounds and length (at most 8
+  bytes), and the 8-byte undefined-size marker is now `2^56 - 1`. Undefined-size clusters are
+  measured by walking child sizes until a level-1 ID, in one `MatroskaParser.clusterEnd` (the old
+  byte-by-byte scan could match inside block payloads, and it treated Void as level-1, so a Void
+  inside a cluster ended it). Malformed lacing throws instead of falling back to one frame. An
+  uppercase track language no longer traps the `mdhd` writer.
+- `MKVRemuxer` is a struct with `mutating consume`; per-segment remuxers come from
+  `starting(atTimelineTicks:)` on the prepared one. `TorrentStreamSession` is a `@MainActor`
+  class. `MKVHLSStream.mediaSegment` shares one in-flight task per segment id (cancelled when its
+  last waiter goes away) and keeps the last segment, instead of a 50 ms poll mutex and an LRU.
+  A stream prepared by `isPlaybackAvailable` is cached by info hash and file index, so the session
+  reuses it instead of loading the head and Cues again. `HLSLoopbackServer` accepts on a dedicated
+  thread via `BlockingIO.spawn` and does blocking socket I/O through `BlockingIO.run`.
+- Matroska, MP4 and transmux types are internal; tests use `@testable import`.
+- `torrent-cli stream-test`/`stream-play` use `preparePlayer()`, so they test what ships.
+
+Verification: `swift build`, `swift build --product torrent-cli` and `swift test` (102 tests:
+the 9 transmux-source tests went away; added cue-less complete-file playback through the
+session, partial cue-less failure, segment-request dedupe, Dolby decoding, raw resource-loader
+playback, and corrupt-size parsing). The tvOS app compiles against the new API
+(`swift build --triple arm64-apple-tvos26.0` in `TV/`).
+
 ### 2026-11-24 — Feat: Apple TV app (`TV/`)
 
 A tvOS app on the same engine, so torrents stream on an Apple TV.

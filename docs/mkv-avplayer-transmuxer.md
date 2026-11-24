@@ -1,6 +1,12 @@
 # Scope — Matroska → fMP4 transmuxer (AVPlayer-native MKV playback)
 
-Status: **implemented (2026-08-09).** Gates 0-4 landed: EBML/Matroska parsing, init segment + fragments, streaming through `TorrentStreamSession`'s resource loader, and live/partial playback (streamed a 30 s MKV at 5/11 pieces). VLCKit is removed (app back to ~3 MB). Remaining: precise far seeks (sidx), and full device validation. This doc is now the design record for the shipped approach.
+Status: **shipped as a local HLS pipeline (2026-11-24).** The resource-loader "virtual fMP4" design below (Component 4, sidx far seeks, replacement-item seeking) was built first and then retired; it is kept here as the design record. What ships:
+
+- `MKVHLSStream` parses the MKV head (`MatroskaParser`), builds a VOD HLS playlist with one `EXT-X-DISCONTINUITY` segment per keyframe cluster run, and generates each segment on demand as an independent local-timeline fMP4 (`MKVRemuxer` + `MP4Muxer`). `HLSLoopbackServer` serves `index.m3u8`, `init.mp4` and `segments/<n>.m4s` on 127.0.0.1 because AVFoundation does not accept HLS media through `AVAssetResourceLoaderDelegate`.
+- Segment boundaries come from the Cues (partial or complete files). When the Cues are missing or unusable and the file is complete, the segment list is built by walking cluster headers of the verified file (boundary at each cluster whose first primary-track block is a keyframe; duration from Info, or from the last cluster when Info has none), still capped at 32 MiB per segment.
+- A partial MKV without usable Cues is not playable: `TorrentStreamSession.preparePlayer()` throws, and the file row keeps play disabled until the download completes.
+- Audio sample entries follow ISO/IEC 14496-12 and ETSI TS 102 366 Annex F: `mp4a`+`esds` (AAC), `ac-3`+`dac3`, `ec-3`+`dec3`, `alac`+`alac`. Dolby config boxes are built from CodecPrivate when present, otherwise from the first audio frame's syncframe (Matroska `A_AC3`/`A_EAC3` tracks normally carry no CodecPrivate). `bsmod` is written as 0 for E-AC-3 (as ffmpeg does) and dependent substreams are not described in `dec3`.
+- Non-Matroska files are still served raw through `TorrentResourceLoaderDelegate`.
 
 ## TL;DR
 
@@ -108,7 +114,7 @@ Verified 2026-08-09 against ffmpeg-generated fixtures (dumped raw `Tracks` `Code
 - **AAC**: `A_AAC` CodecPrivate is already `AudioSpecificConfig` (`12 08 56 e5 00` = 2 bytes ASC). Wrap in `esds`/`mp4a`.
 - **E-AC-3 / AC-3 (the actual new work)**: `A_EAC3`/`A_AC3` CodecPrivate is a raw **syncframe**, not a config record. The muxer must parse the syncframe header (`bsid`, `fscod`, `acmod`, `lfeon`, …) to build the `dec3`/`dac3` box and to frame each sample as exactly one syncframe. Well-documented, verifiable against `ffprobe`; adds ~1-2 pts vs the original plan.
 - Lenient fallback: non-compliant muxers that store Annex-B NALs for AVC/HEVC (recognized by the leading `00 00 00 01` start code) → assemble the record; log loudly otherwise.
-- Follow `docs/mkv-streaming.md`'s Cues-tail precedent: prioritize the `Tracks` region at session start so extradata is available immediately.
+- Prioritize the `Tracks` region and the Cues tail at session start so extradata and the seek index are available immediately.
 
 ## Files & targets (rough)
 
@@ -122,7 +128,7 @@ Verified 2026-08-09 against ffmpeg-generated fixtures (dumped raw `Tracks` `Code
 | `Sources/TorrentCore/Torrent+Streaming.swift` | `PlaybackKind` mkv → `.avPlayer` (or new `.transmux`), or keep `.vlc` until migration done |
 | `Sources/stupid_torrent_client/Views.swift` | mkv rows open `PlayerView` (AVPlayer) instead of `MKVPlayerView` |
 | `Tests/EBMLParserTests.swift`, `Tests/MatroskaReaderTests.swift`, `Tests/fMP4WriterTests.swift`, `Tests/TransmuxTests.swift` | Hermetic fixtures |
-| Delete (after migration) | `VLCBridge`, `MKVPlayerView`, `MKVStreamSession`, `TorrentHTTPServer` usage, `Vendor/MobileVLCKit.xcframework` refs, `docs/mkv-streaming.md` → supersede |
+| Delete (after migration) | `VLCBridge`, `MKVPlayerView`, `MKVStreamSession`, `TorrentHTTPServer` usage, `Vendor/MobileVLCKit.xcframework` refs |
 
 `Streaming` stays Foundation/AVFoundation-only (it already imports AVFoundation), so `swift build`/`swift test`/`torrent-cli` stay green with no VLC.
 
@@ -179,7 +185,6 @@ Recommendation: **keep VLCKit as primary** unless its app-size/LGPL cost or a ha
 
 ## References
 
-- `docs/mkv-streaming.md` — the VLCKit plan this would replace; Decisions §1 (transmux rejection rationale), Architecture, Verification.
 - `Sources/Streaming/TorrentStreamSession.swift` — the loader to extend (resource-loader delegate, byte-range serving, all-to-end/bounded/probe request shapes).
 - `Sources/Streaming/StreamDataSource.swift` — `TorrentStreamSource` abstraction the reader/writer consume.
 - `Sources/TorrentCore/Torrent+Streaming.swift` — `streamPriority` jump/window, `streamingAvailability`/`streamingRead`, `PlaybackKind`.

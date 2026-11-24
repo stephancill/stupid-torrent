@@ -11,12 +11,10 @@ final class HLSLoopbackServer: @unchecked Sendable {
     private let listener: TCPListener
     private let token = UUID().uuidString
     private let lock = NSLock()
-    private var acceptTask: Task<Void, Never>?
+    private var isStarted = false
     private var sockets: [ObjectIdentifier: TCPSocket] = [:]
 
     let playlistURL: URL
-
-    var port: UInt16 { listener.port }
 
     init(stream: MKVHLSStream) throws {
         self.stream = stream
@@ -29,49 +27,46 @@ final class HLSLoopbackServer: @unchecked Sendable {
     }
 
     func start() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard acceptTask == nil else { return }
-        acceptTask = Task { [weak self] in await self?.acceptLoop() }
-    }
-
-    func stop() {
-        lock.lock()
-        let task = acceptTask
-        acceptTask = nil
-        let activeSockets = Array(sockets.values)
-        sockets.removeAll()
-        lock.unlock()
-        task?.cancel()
-        listener.close()
-        activeSockets.forEach { $0.close() }
-    }
-
-    private func acceptLoop() async {
-        while !Task.isCancelled {
-            do {
-                let descriptor = try await Self.blocking { [listener] in try listener.accept() }
-                let socket = TCPSocket(fd: descriptor)
-                if Task.isCancelled {
-                    socket.close()
+        let shouldStart = lock.withLock {
+            defer { isStarted = true }
+            return !isStarted
+        }
+        guard shouldStart else { return }
+        BlockingIO.spawn(name: "hls-accept") { [weak self, listener] in
+            while true {
+                do {
+                    let socket = TCPSocket(fd: try listener.accept())
+                    guard let self else {
+                        socket.close()
+                        return
+                    }
+                    self.register(socket)
+                    Task { [weak self] in
+                        await self?.serve(socket)
+                        self?.unregister(socket)
+                        socket.close()
+                    }
+                } catch SocketError.closed {
                     return
+                } catch {
+                    Thread.sleep(forTimeInterval: 0.05)
                 }
-                register(socket)
-                Task { [weak self] in
-                    await self?.serve(socket)
-                    self?.unregister(socket)
-                    socket.close()
-                }
-            } catch {
-                if Task.isCancelled { return }
-                try? await Task.sleep(for: .milliseconds(50))
             }
         }
     }
 
+    func stop() {
+        let activeSockets = lock.withLock {
+            defer { sockets.removeAll() }
+            return Array(sockets.values)
+        }
+        listener.close()
+        activeSockets.forEach { $0.close() }
+    }
+
     private func serve(_ socket: TCPSocket) async {
         do {
-            let request = try await Self.blocking { try HTTPRequest.read(from: socket) }
+            let request = try await BlockingIO.run(name: "hls-request") { try HTTPRequest.read(from: socket) }
             guard request.method == "GET" || request.method == "HEAD" else {
                 try await send(status: 405, reason: "Method Not Allowed", data: Data(), contentType: "text/plain", request: request, socket: socket)
                 return
@@ -135,7 +130,7 @@ final class HLSLoopbackServer: @unchecked Sendable {
             var response = Data("HTTP/1.1 416 Range Not Satisfiable\r\n".utf8)
             response.append(Data("Content-Range: bytes */\(data.count)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
             let responseData = response
-            try await Self.blocking { try socket.send(responseData) }
+            try await BlockingIO.run(name: "hls-send") { try socket.send(responseData) }
             return
         }
         let bodyRange = range ?? 0..<data.count
@@ -149,16 +144,16 @@ final class HLSLoopbackServer: @unchecked Sendable {
         }
         headers.append(Data("Connection: close\r\n\r\n".utf8))
         let headerData = headers
-        try await Self.blocking { try socket.send(headerData) }
+        try await BlockingIO.run(name: "hls-send") { try socket.send(headerData) }
         if request.method != "HEAD", !bodyRange.isEmpty {
             let body = bodyRange == 0..<data.count ? data : data.subdata(in: bodyRange)
-            try await Self.blocking { try socket.send(body) }
+            try await BlockingIO.run(name: "hls-send") { try socket.send(body) }
         }
     }
 
     private func sendSimple(status: Int, reason: String, socket: TCPSocket) async throws {
         let data = Data("HTTP/1.1 \(status) \(reason)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
-        try await Self.blocking { try socket.send(data) }
+        try await BlockingIO.run(name: "hls-send") { try socket.send(data) }
     }
 
     private func register(_ socket: TCPSocket) {
@@ -171,18 +166,6 @@ final class HLSLoopbackServer: @unchecked Sendable {
         lock.lock()
         sockets.removeValue(forKey: ObjectIdentifier(socket))
         lock.unlock()
-    }
-
-    private static func blocking<T: Sendable>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                do {
-                    continuation.resume(returning: try operation())
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
     }
 }
 

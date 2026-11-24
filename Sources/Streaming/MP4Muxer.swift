@@ -1,117 +1,49 @@
 import Foundation
 
-/// The codecs the transmuxer can carry into fragmented MP4.
-public enum TransmuxCodec: Equatable, Sendable {
+enum TransmuxCodec: Equatable, Sendable {
     case h264
     case hevc
     case aac
     case eac3
     case ac3
     case alac
-    case unknown
 }
 
-/// A track the fMP4 muxer emits. `timescale` is ticks per second of the virtual movie; for MKV
-/// input it is `1_000_000_000 / timestampScaleNs` so MKV timestamp ticks map 1:1 (no rounding).
-public struct TransmuxTrack: Sendable {
-    public var trackId: Int
-    public var timescale: Int
-    public var codec: TransmuxCodec
-    /// The ISO decoder-config record (`avcC`/`hvcC`/AudioSpecificConfig/alac cookie).
-    public var codecPrivate: Data?
-    /// Pre-built `dec3`/`dac3` box payload for E-AC-3/AC-3 tracks.
-    public var audioConfig: Data?
-    public var width: Int?
-    public var height: Int?
-    public var channels: Int
-    public var sampleRate: Double
-    public var bitDepth: Int
-    public var language: String?
-    /// Total duration in this track's timescale ticks (drives mvhd/mdhd/tkhd).
-    public var durationTicks: Int64
+struct TransmuxTrack: Sendable {
+    var trackId: Int
+    var timescale: Int
+    var codec: TransmuxCodec
+    var codecPrivate: Data?
+    var audioConfig: Data?
+    var width: Int?
+    var height: Int?
+    var channels: Int
+    var sampleRate: Double
+    var bitDepth: Int
+    var language: String?
 
-    public var isVideo: Bool {
+    var isVideo: Bool {
         codec == .h264 || codec == .hevc
     }
-
-    public init(
-        trackId: Int,
-        timescale: Int,
-        codec: TransmuxCodec,
-        codecPrivate: Data?,
-        audioConfig: Data? = nil,
-        width: Int? = nil,
-        height: Int? = nil,
-        channels: Int = 2,
-        sampleRate: Double = 48000,
-        bitDepth: Int = 16,
-        language: String? = nil,
-        durationTicks: Int64 = 0
-    ) {
-        self.trackId = trackId
-        self.timescale = timescale
-        self.codec = codec
-        self.codecPrivate = codecPrivate
-        self.audioConfig = audioConfig
-        self.width = width
-        self.height = height
-        self.channels = channels
-        self.sampleRate = sampleRate
-        self.bitDepth = bitDepth
-        self.language = language
-        self.durationTicks = durationTicks
-    }
 }
 
-/// One muxed sample in a fragment.
-public struct TransmuxSample: Sendable {
-    public var data: Data
-    public var durationTicks: Int64
-    public var decodeTimeTicks: Int64
-    /// Presentation time minus decode time, in track ticks (usually 0 for audio).
-    public var compositionOffsetTicks: Int64
-    public var isKeyframe: Bool
-
-    public init(
-        data: Data,
-        durationTicks: Int64,
-        decodeTimeTicks: Int64,
-        compositionOffsetTicks: Int64 = 0,
-        isKeyframe: Bool = true
-    ) {
-        self.data = data
-        self.durationTicks = durationTicks
-        self.decodeTimeTicks = decodeTimeTicks
-        self.compositionOffsetTicks = compositionOffsetTicks
-        self.isKeyframe = isKeyframe
-    }
+struct TransmuxSample: Sendable {
+    var data: Data
+    var durationTicks: Int64
+    var decodeTimeTicks: Int64
+    var compositionOffsetTicks: Int64
+    var isKeyframe: Bool
 }
 
-public enum MP4Error: Error, CustomStringConvertible {
-    case unsupportedCodec(String)
-    case invalidState(String)
-
-    public var description: String {
-        switch self {
-        case .unsupportedCodec(let c): "unsupported codec: \(c)"
-        case .invalidState(let s): "invalid state: \(s)"
-        }
-    }
-}
-
-/// ISO/IEC 14496-12 box writer for fragmented MP4, sufficient for AVPlayer playback.
-public enum MP4Muxer {
-
-    // MARK: - Init segment
-
-    public static func initSegment(tracks: [TransmuxTrack]) -> Data {
+enum MP4Muxer {
+    static func initSegment(tracks: [TransmuxTrack]) -> Data {
         var data = Data()
         data.append(ftyp())
         data.append(moov(tracks: tracks))
         return data
     }
 
-    public static func ftyp() -> Data {
+    private static func ftyp() -> Data {
         var payload = Data()
         payload.append(contentsOf: "isom".utf8)
         payload.append(u32(0))
@@ -121,13 +53,9 @@ public enum MP4Muxer {
         return box("ftyp", payload)
     }
 
-    public static func moov(tracks: [TransmuxTrack]) -> Data {
-        // mvhd uses its own timescale (1000); per-track mdhd carries the media timescales.
-        let timescale = 1000
-        let duration = tracks.map { Int($0.durationTicks) }.max() ?? 0
-
+    private static func moov(tracks: [TransmuxTrack]) -> Data {
         var payload = Data()
-        payload.append(mvhd(timescale: timescale, duration: duration, nextTrackId: (tracks.map(\.trackId).max() ?? 0) + 1))
+        payload.append(mvhd(nextTrackId: (tracks.map(\.trackId).max() ?? 0) + 1))
         for track in tracks {
             payload.append(trak(track: track))
         }
@@ -135,17 +63,17 @@ public enum MP4Muxer {
         return box("moov", payload)
     }
 
-    private static func mvhd(timescale: Int, duration: Int, nextTrackId: Int) -> Data {
+    private static func mvhd(nextTrackId: Int) -> Data {
         var payload = Data()
-        payload.append(u32(0)) // creation time
-        payload.append(u32(0)) // modification time
-        payload.append(u32(UInt32(timescale)))
-        payload.append(u32(UInt32(duration)))
-        payload.append(u32(0x00010000)) // rate 1.0 (16.16)
-        payload.append(u16(0x0100)) // volume 1.0 (8.8)
-        payload.append(Data(repeating: 0, count: 10)) // reserved
+        payload.append(u32(0))
+        payload.append(u32(0))
+        payload.append(u32(1000))
+        payload.append(u32(0))
+        payload.append(u32(0x00010000))
+        payload.append(u16(0x0100))
+        payload.append(Data(repeating: 0, count: 10))
         payload.append(identityMatrix())
-        payload.append(Data(repeating: 0, count: 24)) // pre_defined
+        payload.append(Data(repeating: 0, count: 24))
         payload.append(u32(UInt32(nextTrackId)))
         return fullBox("mvhd", version: 0, flags: 0, payload)
     }
@@ -159,20 +87,20 @@ public enum MP4Muxer {
 
     private static func tkhd(track: TransmuxTrack) -> Data {
         var payload = Data()
-        payload.append(u32(0)) // creation
-        payload.append(u32(0)) // modification
+        payload.append(u32(0))
+        payload.append(u32(0))
         payload.append(u32(UInt32(track.trackId)))
-        payload.append(u32(0)) // reserved
-        payload.append(u32(UInt32(track.durationTicks)))
-        payload.append(Data(repeating: 0, count: 8)) // reserved
-        payload.append(u16(0)) // layer
-        payload.append(u16(0)) // alternate group
-        payload.append(u16(track.isVideo ? 0 : 0x0100)) // volume
-        payload.append(u16(0)) // reserved
+        payload.append(u32(0))
+        payload.append(u32(0))
+        payload.append(Data(repeating: 0, count: 8))
+        payload.append(u16(0))
+        payload.append(u16(0))
+        payload.append(u16(track.isVideo ? 0 : 0x0100))
+        payload.append(u16(0))
         payload.append(identityMatrix())
         if let width = track.width, let height = track.height {
-            payload.append(u32(UInt32(width) << 16)) // width 16.16
-            payload.append(u32(UInt32(height) << 16))
+            payload.append(u32(UInt32(clamping: width) << 16))
+            payload.append(u32(UInt32(clamping: height) << 16))
         } else {
             payload.append(u32(0))
             payload.append(u32(0))
@@ -190,20 +118,20 @@ public enum MP4Muxer {
 
     private static func mdhd(track: TransmuxTrack) -> Data {
         var payload = Data()
-        payload.append(u32(0)) // creation
-        payload.append(u32(0)) // modification
+        payload.append(u32(0))
+        payload.append(u32(0))
         payload.append(u32(UInt32(track.timescale)))
-        payload.append(u32(UInt32(track.durationTicks)))
+        payload.append(u32(0))
         payload.append(u16(languageCode(track.language)))
-        payload.append(u16(0)) // quality
+        payload.append(u16(0))
         return fullBox("mdhd", version: 0, flags: 0, payload)
     }
 
     private static func hdlr(handlerType: String, name: String) -> Data {
         var payload = Data()
-        payload.append(u32(0)) // pre_defined
+        payload.append(u32(0))
         payload.append(contentsOf: handlerType.utf8)
-        payload.append(Data(repeating: 0, count: 12)) // reserved
+        payload.append(Data(repeating: 0, count: 12))
         payload.append(contentsOf: name.utf8)
         payload.append(u8(0))
         return fullBox("hdlr", version: 0, flags: 0, payload)
@@ -213,13 +141,13 @@ public enum MP4Muxer {
         var payload = Data()
         if track.isVideo {
             var vmhd = Data()
-            vmhd.append(u16(0)) // graphics mode
-            vmhd.append(Data(repeating: 0, count: 6)) // opcolor
+            vmhd.append(u16(0))
+            vmhd.append(Data(repeating: 0, count: 6))
             payload.append(fullBox("vmhd", version: 0, flags: 1, vmhd))
         } else {
             var smhd = Data()
-            smhd.append(u16(0)) // balance
-            smhd.append(u16(0)) // reserved
+            smhd.append(u16(0))
+            smhd.append(u16(0))
             payload.append(fullBox("smhd", version: 0, flags: 0, smhd))
         }
         payload.append(dinf())
@@ -228,7 +156,6 @@ public enum MP4Muxer {
     }
 
     private static func dinf() -> Data {
-        // dref = fullbox(version/flags + entry count) with the self-contained url entry inside.
         let urlBox = fullBox("url ", version: 0, flags: 1, Data())
         let dref = fullBox("dref", version: 0, flags: 0, u32(1) + urlBox)
         return box("dinf", dref)
@@ -244,8 +171,6 @@ public enum MP4Muxer {
         return box("stbl", payload)
     }
 
-    /// Empty sample-table boxes: fragmented movies keep sample data in fragments.
-    /// stsz additionally carries sample_size + sample_count (not just an entry count).
     private static func emptyTable(_ type: String) -> Data {
         if type == "stsz" {
             return fullBox(type, version: 0, flags: 0, u32(0) + u32(0))
@@ -255,7 +180,7 @@ public enum MP4Muxer {
 
     private static func stsd(track: TransmuxTrack) -> Data {
         var payload = Data()
-        payload.append(u32(1)) // entry count
+        payload.append(u32(1))
         payload.append(sampleEntry(track: track))
         return fullBox("stsd", version: 0, flags: 0, payload)
     }
@@ -265,10 +190,10 @@ public enum MP4Muxer {
         for track in tracks {
             var trex = Data()
             trex.append(u32(UInt32(track.trackId)))
-            trex.append(u32(1)) // default sample description index
-            trex.append(u32(0)) // default sample duration
-            trex.append(u32(0)) // default sample size
-            trex.append(u32(0)) // default sample flags
+            trex.append(u32(1))
+            trex.append(u32(0))
+            trex.append(u32(0))
+            trex.append(u32(0))
             payload.append(fullBox("trex", version: 0, flags: 0, trex))
         }
         return box("mvex", payload)
@@ -288,35 +213,31 @@ public enum MP4Muxer {
         return data
     }
 
-    // MARK: - Sample entries
-
     private static func sampleEntry(track: TransmuxTrack) -> Data {
         switch track.codec {
         case .h264, .hevc:
             return videoSampleEntry(track: track)
         case .aac, .eac3, .ac3, .alac:
             return audioSampleEntry(track: track)
-        case .unknown:
-            return Data()
         }
     }
 
     private static func videoSampleEntry(track: TransmuxTrack) -> Data {
         var payload = Data()
-        payload.append(Data(repeating: 0, count: 6)) // reserved
-        payload.append(u16(1)) // data reference index
-        payload.append(u16(0)) // pre_defined
-        payload.append(u16(0)) // reserved
-        payload.append(Data(repeating: 0, count: 12)) // pre_defined
-        payload.append(u16(UInt16(track.width ?? 0)))
-        payload.append(u16(UInt16(track.height ?? 0)))
-        payload.append(u32(0x00480000)) // horizontal resolution
-        payload.append(u32(0x00480000)) // vertical resolution
-        payload.append(u32(0)) // reserved
-        payload.append(u16(1)) // frame count
+        payload.append(Data(repeating: 0, count: 6))
+        payload.append(u16(1))
+        payload.append(u16(0))
+        payload.append(u16(0))
+        payload.append(Data(repeating: 0, count: 12))
+        payload.append(u16(UInt16(clamping: track.width ?? 0)))
+        payload.append(u16(UInt16(clamping: track.height ?? 0)))
+        payload.append(u32(0x00480000))
+        payload.append(u32(0x00480000))
+        payload.append(u32(0))
+        payload.append(u16(1))
         payload.append(compressorname(""))
-        payload.append(u16(0x0018)) // depth
-        payload.append(u16(0xFFFF)) // pre_defined
+        payload.append(u16(0x0018))
+        payload.append(u16(0xFFFF))
         if let config = track.codecPrivate {
             payload.append(box(track.codec == .h264 ? "avcC" : "hvcC", config))
         }
@@ -324,36 +245,34 @@ public enum MP4Muxer {
     }
 
     private static func audioSampleEntry(track: TransmuxTrack) -> Data {
+        let isDolby = track.codec == .eac3 || track.codec == .ac3
         var payload = Data()
-        payload.append(Data(repeating: 0, count: 6)) // reserved
-        payload.append(u16(1)) // data reference index
-        payload.append(u16(0)) // version
-        payload.append(u16(0)) // revision level
-        payload.append(u32(0)) // vendor
-        payload.append(u16(UInt16(track.channels)))
-        payload.append(u16(UInt16(track.bitDepth)))
-        payload.append(u16(0)) // pre_defined (compression id)
-        payload.append(u16(0)) // packet size
-        payload.append(u32(UInt32(track.sampleRate) << 16)) // sample rate 16.16
+        payload.append(Data(repeating: 0, count: 6))
+        payload.append(u16(1))
+        payload.append(u16(0))
+        payload.append(u16(0))
+        payload.append(u32(0))
+        payload.append(u16(isDolby ? 2 : UInt16(clamping: track.channels)))
+        payload.append(u16(isDolby ? 16 : UInt16(clamping: track.bitDepth)))
+        payload.append(u16(0))
+        payload.append(u16(0))
+        payload.append(u32(UInt32(clamping: Int(track.sampleRate.rounded())) << 16))
         switch track.codec {
         case .aac:
             payload.append(esds(audioSpecificConfig: track.codecPrivate))
+            return box("mp4a", payload)
         case .eac3:
-            if let config = track.audioConfig {
-                payload.append(box("dec3", config))
-            }
+            payload.append(box("dec3", track.audioConfig ?? Data()))
+            return box("ec-3", payload)
         case .ac3:
-            if let config = track.audioConfig {
-                payload.append(box("dac3", config))
-            }
+            payload.append(box("dac3", track.audioConfig ?? Data()))
+            return box("ac-3", payload)
         case .alac:
-            if let cookie = track.codecPrivate {
-                payload.append(box("alac", Data(repeating: 0, count: 4) + cookie))
-            }
-        default:
-            break
+            payload.append(fullBox("alac", version: 0, flags: 0, track.codecPrivate ?? Data()))
+            return box("alac", payload)
+        case .h264, .hevc:
+            return Data()
         }
-        return box("mp4a", payload)
     }
 
     private static func compressorname(_ name: String) -> Data {
@@ -366,46 +285,41 @@ public enum MP4Muxer {
     }
 
     private static func languageCode(_ language: String?) -> UInt16 {
-        guard let language, language.count == 3 else { return 0x55C4 } // und
-        var value: UInt16 = 0
-        for ch in language.utf8.prefix(3) {
-            value = (value << 5) | UInt16(ch - 0x60)
-        }
-        return value
+        let letters = Array((language ?? "").lowercased().utf8)
+        guard letters.count == 3, letters.allSatisfy({ (0x61...0x7A).contains($0) }) else { return 0x55C4 }
+        return letters.reduce(0) { ($0 << 5) | UInt16($1 - 0x60) }
     }
 
-    /// `esds` box for AAC: ES_Descriptor → DecoderConfig → AudioSpecificConfig.
     static func esds(audioSpecificConfig: Data?) -> Data {
         let asc = audioSpecificConfig ?? Data()
         let slConfig: [UInt8] = [0x02]
         var decSpecific = Data()
-        decSpecific.append(0x05) // DecoderSpecificInfo tag
+        decSpecific.append(0x05)
         decSpecific.append(descriptorLength(asc.count))
         decSpecific.append(asc)
         var decoderConfig = Data()
-        decoderConfig.append(0x40) // objectTypeIndication: MPEG-4 Audio
-        decoderConfig.append(0x15) // streamType: audio (0x05 << 2 | 1)
-        decoderConfig.append(u24(0)) // buffer size DB
-        decoderConfig.append(u32(0)) // max bitrate
-        decoderConfig.append(u32(0)) // avg bitrate
+        decoderConfig.append(0x40)
+        decoderConfig.append(0x15)
+        decoderConfig.append(u24(0))
+        decoderConfig.append(u32(0))
+        decoderConfig.append(u32(0))
         decoderConfig.append(decSpecific)
         var es = Data()
-        es.append(u16(0)) // ES_ID
-        es.append(u8(0)) // flags
-        es.append(0x04) // DecoderConfig tag
+        es.append(u16(0))
+        es.append(u8(0))
+        es.append(0x04)
         es.append(descriptorLength(decoderConfig.count))
         es.append(decoderConfig)
-        es.append(0x06) // SLConfig tag
+        es.append(0x06)
         es.append(descriptorLength(slConfig.count))
         es.append(contentsOf: slConfig)
         var payload = Data()
-        payload.append(0x03) // ES_Descriptor tag
+        payload.append(0x03)
         payload.append(descriptorLength(es.count))
         payload.append(es)
         return fullBox("esds", version: 0, flags: 0, payload)
     }
 
-    /// 7-bit-group descriptor length, big-endian with continuation bits.
     static func descriptorLength(_ count: Int) -> Data {
         var bytes: [UInt8] = []
         var value = count
@@ -417,8 +331,6 @@ public enum MP4Muxer {
         } while value > 0
         return Data(bytes)
     }
-
-    // MARK: - Box primitives
 
     static func box(_ type: String, _ payload: Data) -> Data {
         var data = Data()
