@@ -1,6 +1,6 @@
 import Foundation
 
-enum MatroskaError: Error, CustomStringConvertible {
+enum MatroskaError: LocalizedError, CustomStringConvertible {
     case notMatroska
     case truncated(String)
     case undefinedSize(String)
@@ -14,6 +14,8 @@ enum MatroskaError: Error, CustomStringConvertible {
         case .corrupt(let what): "corrupt: \(what)"
         }
     }
+
+    var errorDescription: String? { "This file isn't a readable Matroska video (\(description))." }
 }
 
 enum MKVLacing: UInt8 {
@@ -288,6 +290,25 @@ enum MatroskaParser {
                 guard let size = header.size else { throw MatroskaError.undefinedSize("Segment child") }
                 end = offset + header.length + Int(size)
                 guard end <= range.upperBound else { throw MatroskaError.truncated("element at \(offset)") }
+            }
+            offset = end
+        }
+        return clusters
+    }
+
+    static func completeLeadingClusters(in bytes: Data) throws -> [MKVCluster] {
+        var clusters: [MKVCluster] = []
+        var offset = 0
+        while offset < bytes.count, let header = EBML.readHeader(in: bytes, offset: offset) {
+            let end: Int
+            if header.id == EBMLID.cluster.rawValue {
+                guard let clusterEnd = try clusterEnd(bytes: bytes, offset: offset), clusterEnd <= bytes.count else { break }
+                clusters.append(try parseCluster(bytes: bytes, range: offset..<clusterEnd))
+                end = clusterEnd
+            } else {
+                guard let size = header.size else { throw MatroskaError.undefinedSize("Segment child") }
+                end = offset + header.length + Int(size)
+                guard end <= bytes.count else { break }
             }
             offset = end
         }

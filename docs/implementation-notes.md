@@ -4,6 +4,34 @@ Running implementation log. Update **before every commit** with a concise entry 
 
 ## Unreleased
 
+### 2026-11-24 — Playback errors, faster Dolby startup, 7.1 E-AC-3
+
+- Both apps now call `TorrentStreamSession.preparePlayer()` through the shared
+  `TorrentPlayerView`, which shows "Can't Play This File" with the reason when preparation
+  throws (cancellation and stop are silent). `makePlayer()`, which logged the error and handed
+  back an empty `AVPlayer`, is gone. `MKVHLSStreamError`, `MatroskaError` and `TransmuxError`
+  carry user-facing `errorDescription`s.
+- Dolby (E-AC-3/AC-3) tracks without CodecPrivate no longer wait for the whole first HLS segment:
+  the first syncframe is looked up in growing windows (256 KiB, doubling) over complete leading
+  clusters (`MatroskaParser.completeLeadingClusters`), falling back to the full segment. This
+  matters most when resuming deep into a partial file, where segment 0 is otherwise not needed.
+- `dec3` now describes E-AC-3 dependent substreams (7.1 and similar): `num_dep_sub` and
+  `chan_loc` come from the dependent frames that follow the independent frame in the same
+  block, using ffmpeg's `movenc.c` chanmap→chan_loc mapping (chanmap bits 10…3 → chan_loc bits
+  0–7, chanmap bit 1 / LFE2 → bit 8; a dependent frame without a chanmap contributes its
+  acmod). Verified with synthetic syncframes only: ffmpeg cannot encode 7.1 E-AC-3, so no real
+  7.1 fixture exists.
+- New fixture `Fixtures/mkv/eac3-long.mkv` (20 s, H.264 + E-AC-3 5.1, 1 s clusters, 10 s GOP)
+  backs a test that preparation reads at most 256 KiB of segment 0 and a test that the file
+  plays through `AVPlayer` over HLS with an audio track.
+- Kept on purpose: `OrientationLock.playerPresented = false` runs from both the cover's
+  `onDismiss` and the player's `onDisappear`. The earlier call happens while the player view
+  controller still claims landscape and is often rejected; the later one is effectively the
+  retry that makes the device-verified portrait restore (2026-08-30) stick.
+
+Verification: `swift test` 120 tests green; iOS and tvOS `stupid-app build` green; iOS
+simulator streams the Big Buck Bunny MP4 mid-download through `preparePlayer()`.
+
 ### 2026-11-24 — Docs and state naming after the audit refactors
 
 - `TorrentStatus.State.seeding` is now `.complete`: completed torrents go idle by design

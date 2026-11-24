@@ -2,7 +2,7 @@ import Foundation
 import AVFoundation
 import TorrentCore
 
-enum TorrentStreamSessionError: Error {
+public enum TorrentStreamSessionError: Error {
     case stopped
 }
 
@@ -29,15 +29,6 @@ enum TorrentStreamSessionError: Error {
         self.fileIndex = fileIndex
         self.fileName = fileName
         self.cacheKey = cacheKey
-    }
-
-    public func makePlayer() async -> AVPlayer {
-        do {
-            return try await preparePlayer()
-        } catch {
-            TorrentLog.log("playback unavailable for \(fileName): \(error)")
-            return AVPlayer()
-        }
     }
 
     public func preparePlayer() async throws -> AVPlayer {

@@ -1,12 +1,22 @@
 import Foundation
 import TorrentCore
 
-enum MKVHLSStreamError: Error {
+enum MKVHLSStreamError: LocalizedError {
     case unavailable
     case invalidCues
     case segmentTooLarge
     case missingKeyframe
     case noPlayableTrack
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable: "The start of this file hasn't downloaded yet."
+        case .invalidCues: "This file has no usable seek index, so it can only play once the download finishes."
+        case .segmentTooLarge: "This file's video is split into chunks too large to stream."
+        case .missingKeyframe: "This file's video has no usable keyframes."
+        case .noPlayableTrack: "This file has no video or audio track that Apple devices can play."
+        }
+    }
 }
 
 struct MKVHLSSegment: Sendable, Equatable {
@@ -278,7 +288,15 @@ actor MKVHLSStream {
     private func dolbySyncframes(info: MatroskaInfo, firstSegment: MKVHLSSegment) async throws -> [UInt64: Data] {
         let needed = Set(MKVRemuxer.dolbyTrackNumbersNeedingSyncframe(info: info))
         guard !needed.isEmpty else { return [:] }
-        let bytes = try await readExact(range: firstSegment.sourceRange)
+        let range = firstSegment.sourceRange
+        var window = min(256 * 1024, range.count)
+        while window < range.count {
+            let bytes = try await readExact(range: range.lowerBound..<range.lowerBound + window)
+            let frames = try MatroskaParser.firstFrames(of: needed, in: MatroskaParser.completeLeadingClusters(in: bytes))
+            if frames.count == needed.count { return frames }
+            window = min(window * 2, range.count)
+        }
+        let bytes = try await readExact(range: range)
         return try MatroskaParser.firstFrames(of: needed, in: MatroskaParser.clusters(in: bytes, range: 0..<bytes.count))
     }
 

@@ -1,6 +1,6 @@
 import Foundation
 
-enum TransmuxError: Error, CustomStringConvertible {
+enum TransmuxError: LocalizedError, CustomStringConvertible {
     case missingAudioConfig(trackNumber: UInt64)
     case invalidSampleRate(trackNumber: UInt64)
 
@@ -10,6 +10,8 @@ enum TransmuxError: Error, CustomStringConvertible {
         case .invalidSampleRate(let trackNumber): "invalid sampling frequency on track \(trackNumber)"
         }
     }
+
+    var errorDescription: String? { "This file's audio can't be converted for playback (\(description))." }
 }
 
 struct MKVRemuxer {

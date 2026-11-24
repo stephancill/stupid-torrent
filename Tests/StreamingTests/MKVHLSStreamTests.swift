@@ -210,9 +210,44 @@ import TorrentTestingSupport
         let session = TorrentStreamSession(source: source, fileIndex: 0, fileName: "long30.mkv", cacheKey: nil)
         defer { session.stop() }
 
-        await #expect(throws: MKVHLSStreamError.invalidCues) {
+        let error = await #expect(throws: MKVHLSStreamError.invalidCues) {
             _ = try await session.preparePlayer()
         }
+        #expect(error?.localizedDescription.contains("once the download finishes") == true)
+    }
+
+    @Test func dolbyConfigReadsOnlyTheStartOfTheFirstSegment() async throws {
+        let data = try Fixtures.data(named: "mkv/eac3-long.mkv")
+        let source = FakeMKVSource(data)
+        await source.verify(0..<data.count)
+        let stream = MKVHLSStream(source: source, fileIndex: 0)
+        let first = try #require(try await stream.segments().first)
+        #expect(first.sourceRange.count > 512 * 1024)
+
+        try await stream.prepare()
+
+        let firstSegmentReads = await source.readRanges.filter { $0.lowerBound == first.sourceRange.lowerBound }
+        #expect(!firstSegmentReads.isEmpty)
+        #expect(firstSegmentReads.allSatisfy { $0.count <= 256 * 1024 })
+    }
+
+    @Test @MainActor func eac3SurroundPlaysThroughSession() async throws {
+        let data = try Fixtures.data(named: "mkv/eac3-long.mkv")
+        let source = FakeMKVSource(data)
+        await source.verify(0..<data.count)
+        let session = TorrentStreamSession(source: source, fileIndex: 0, fileName: "eac3-long.mkv", cacheKey: nil)
+        defer { session.stop() }
+        let player = try await session.preparePlayer()
+        player.isMuted = true
+        let item = try #require(player.currentItem)
+        let tracks = try await item.asset.load(.tracks)
+        #expect(tracks.contains { $0.mediaType == .audio } || item.status != .failed)
+        player.play()
+        #expect(await advancePlaying(player, beyond: 2, within: 6))
+        #expect(item.status == .readyToPlay)
+        let audioTracks = item.tracks.compactMap(\.assetTrack).filter { $0.mediaType == .audio }
+        #expect(!audioTracks.isEmpty)
+        player.pause()
     }
 
     @Test func concurrentSegmentRequestsShareOneGeneration() async throws {

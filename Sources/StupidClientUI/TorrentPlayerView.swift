@@ -10,6 +10,7 @@ public struct TorrentPlayerView: View {
 
     @State private var session: TorrentStreamSession?
     @State private var player: AVPlayer?
+    @State private var failure: String?
 
     public init(request: PlaybackRequest, store: TorrentStore) {
         self.request = request
@@ -27,6 +28,12 @@ public struct TorrentPlayerView: View {
                 PlayerController(player: player)
                     .ignoresSafeArea()
                 #endif
+            } else if let failure {
+                ContentUnavailableView(
+                    "Can't Play This File",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text(failure)
+                )
             } else {
                 ProgressView()
             }
@@ -34,7 +41,17 @@ public struct TorrentPlayerView: View {
         .task {
             let session = TorrentStreamSession(torrent: request.torrent, fileIndex: request.fileIndex)
             self.session = session
-            let prepared = await session.makePlayer()
+            let prepared: AVPlayer
+            do {
+                prepared = try await session.preparePlayer()
+            } catch is CancellationError {
+                return
+            } catch TorrentStreamSessionError.stopped {
+                return
+            } catch {
+                failure = error.localizedDescription
+                return
+            }
             guard !Task.isCancelled else {
                 prepared.pause()
                 return

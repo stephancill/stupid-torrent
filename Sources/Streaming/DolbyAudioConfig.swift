@@ -62,9 +62,45 @@ enum DolbyAudioConfig {
         writer.write(acmod, bits: 3)
         writer.write(lfeon, bits: 1)
         writer.write(0, bits: 3)
-        writer.write(0, bits: 4)
-        writer.write(0, bits: 1)
+        let dependents = dependentSubstreams(in: syncframe, after: frameBytes)
+        writer.write(dependents.count, bits: 4)
+        if dependents.count == 0 {
+            writer.write(0, bits: 1)
+        } else {
+            writer.write(dependents.channelLocations, bits: 9)
+        }
         return writer.bytes
+    }
+
+    private static func dependentSubstreams(in frame: Data, after offset: Int) -> (count: Int, channelLocations: Int) {
+        var count = 0
+        var channelLocations = 0
+        var cursor = offset
+        while count < 15, cursor + 6 <= frame.count {
+            var reader = BitReader(data: frame.dropFirst(cursor))
+            guard reader.read(bits: 16) == 0x0B77, reader.read(bits: 2) == 1 else { break }
+            reader.skip(bits: 3)
+            let frameBytes = 2 * (reader.read(bits: 11) + 1)
+            reader.skip(bits: 4)
+            let acmod = reader.read(bits: 3)
+            reader.skip(bits: 6)
+            for _ in 0..<(acmod == 0 ? 2 : 1) {
+                reader.skip(bits: 5)
+                if reader.read(bits: 1) == 1 { reader.skip(bits: 8) }
+            }
+            if reader.read(bits: 1) == 1 {
+                let chanmap = reader.read(bits: 16)
+                for bit in 0..<8 where (chanmap >> (10 - bit)) & 1 == 1 {
+                    channelLocations |= 1 << bit
+                }
+                if (chanmap >> 1) & 1 == 1 { channelLocations |= 1 << 8 }
+            } else {
+                channelLocations |= acmod
+            }
+            count += 1
+            cursor += frameBytes
+        }
+        return (count, channelLocations)
     }
 }
 
